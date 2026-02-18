@@ -25,7 +25,14 @@ digraph attractor_run {
 
     // ═══════════════════════════════════════════════════════════════════
     //  PHASE 1: PLAN & INTERVIEW (Claude Opus 4.6)
-    //  Assess the codebase, draft a plan, interview the user for clarity
+    //  Assess the codebase, draft a plan, interview the user for clarity.
+    //
+    //  Artifacts:
+    //    logs/orient/ORIENT-{N}.md   — codebase assessment and gap analysis
+    //    logs/plan/PLAN-{N}.md       — implementation plan
+    //
+    //  Resumability: orient and plan read prior artifacts from all phases
+    //  to understand what has already been attempted and completed.
     // ═══════════════════════════════════════════════════════════════════
 
     orient [
@@ -39,17 +46,30 @@ Explore:
 3. Dependencies and constraints — language version, frameworks, external services
 4. Recent changes — git log for recent commits and active areas
 
+Check for prior run artifacts:
+- If logs/orient/ORIENT-*.md exists, read the latest — you are re-orienting after a pipeline loop. Note what changed since the last orientation.
+- If logs/implement/PROGRESS-*.md exists, read the latest — these are completed work items. Do NOT re-plan work that is already done.
+- If logs/validate/VALIDATION-RUN-*.md exists, read the latest — these are known failures to address.
+
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write a structured orientation summary to logs/orient/ORIENT.md covering all of the above."
+Write a structured orientation summary to logs/orient/ORIENT-{N}.md where N is the next sequential number (start at 1). Include:
+- Codebase assessment
+- What has already been completed (from prior PROGRESS logs)
+- What remains to be done
+- What failed in prior validation (if any)"
     ]
 
     plan [
         class="opus",
         label="Plan: High-Level Implementation",
-        prompt="Read logs/orient/ORIENT.md for project context.
+        prompt="Read the latest logs/orient/ORIENT-*.md for project context.
 
-If validation results exist at logs/validate/, read the most recent VALIDATION-RUN-*.md — you are replanning to fix failures identified in that run. Focus the plan on addressing those specific failures.
+Check for prior run artifacts:
+- If logs/plan/PLAN-*.md exists, read the latest — you are replanning. Understand what was tried before.
+- If logs/implement/PROGRESS-*.md exists, read the latest — skip work items marked DONE.
+- If logs/validate/VALIDATION-RUN-*.md exists, read the latest — you are replanning to fix failures identified in that run. Focus the plan on addressing those specific failures.
+- If logs/critique/CRITIQUE-PARETO-*.md exists, read the latest — incorporate MUST FIX and SHOULD FIX items.
 
 Create a high-level implementation plan for: $goal
 
@@ -60,10 +80,11 @@ The plan must include:
 4. Risk areas and mitigations
 5. Success criteria — what does done look like?
 6. Verification strategy — how do we know it works?
+7. Prior work summary — what is already done and does NOT need reimplementation
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write the plan to logs/plan/PLAN.md."
+Write the plan to logs/plan/PLAN-{N}.md where N is the next sequential number."
     ]
 
     interview [
@@ -73,13 +94,20 @@ Write the plan to logs/plan/PLAN.md."
 
     // ═══════════════════════════════════════════════════════════════════
     //  PHASE 2: BREAK DOWN (Claude Opus 4.6)
-    //  Decompose into single-commit chunks, each with a QA plan
+    //  Decompose into single-commit chunks, each with a QA plan.
+    //
+    //  Artifacts:
+    //    logs/breakdown/BREAKDOWN-{N}.md — commit-by-commit work plan
+    //
+    //  Resumability: reads prior progress logs to exclude completed work.
     // ═══════════════════════════════════════════════════════════════════
 
     breakdown [
         class="opus",
         label="Break Down: Commit Chunks",
-        prompt="Read logs/plan/PLAN.md.
+        prompt="Read the latest logs/plan/PLAN-*.md.
+
+If logs/implement/PROGRESS-*.md exists, read the latest. Commits marked DONE in the progress log should be EXCLUDED from this breakdown — they are already implemented. Only break down remaining work.
 
 Break the implementation into single-commit chunks. Each commit must:
 1. Be independently buildable — the project compiles after this commit
@@ -98,7 +126,7 @@ Review the breakdown against the plan:
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write the breakdown to logs/breakdown/BREAKDOWN.md."
+Write the breakdown to logs/breakdown/BREAKDOWN-{N}.md where N is the next sequential number."
     ]
 
     review_breakdown [
@@ -107,32 +135,64 @@ Write the breakdown to logs/breakdown/BREAKDOWN.md."
     ]
 
     // ═══════════════════════════════════════════════════════════════════
-    //  PHASE 3: IMPLEMENT (OpenAI o3)
-    //  Execute the breakdown commit by commit
+    //  PHASE 3: IMPLEMENT (OpenAI Codex)
+    //  Execute the breakdown commit by commit. Write a progress log
+    //  after each commit so the pipeline can resume if interrupted.
+    //
+    //  Artifacts:
+    //    logs/implement/PROGRESS-{N}.md — per-commit status tracking
+    //
+    //  Resumability: reads prior progress logs to skip completed commits.
     // ═══════════════════════════════════════════════════════════════════
 
     implement [
         class="codex",
         label="Implement: Commit by Commit",
         timeout="1800s",
-        prompt="Read logs/breakdown/BREAKDOWN.md. Implement the code commit by commit.
+        prompt="Read the latest logs/breakdown/BREAKDOWN-*.md.
+
+If logs/implement/PROGRESS-*.md exists, read the latest. Skip any commits marked DONE — they are already implemented. Resume from the first commit marked TODO or FAILED.
 
 For each commit in the breakdown:
 1. Read the commit description, file list, and QA plan
 2. Implement the code changes
 3. Run the QA plan from the breakdown (build, test, verify)
 4. If the QA plan fails, fix the issue before moving on
+5. IMMEDIATELY after each commit, append its status to the progress log
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 IMPORTANT: All file references must use explicit paths — do not assume a working directory.
 
-After all commits are complete, run a final full build and test to verify everything integrates correctly."
+Progress log format — write to logs/implement/PROGRESS-{N}.md where N matches the BREAKDOWN number:
+
+```markdown
+# Implementation Progress — Run {N}
+
+## Commit 1: [title from breakdown]
+- **Status**: DONE | FAILED | SKIPPED
+- **Files modified**: [list]
+- **Build result**: PASS | FAIL (error summary if fail)
+- **Test result**: PASS | FAIL (error summary if fail)
+- **Notes**: [any issues encountered]
+
+## Commit 2: [title]
+...
+```
+
+Write the progress log incrementally — update it after EACH commit, not all at once at the end. This ensures the pipeline can resume from the last successful commit if interrupted.
+
+After all commits are complete, run a final full build and test to verify everything integrates correctly. Append a summary section to the progress log."
     ]
 
     // ═══════════════════════════════════════════════════════════════════
     //  PHASE 4: VALIDATE (Claude Opus 4.6)
-    //  Run the validation agent per VALIDATION.md
-    //  On failure, loop back to plan for fixes
+    //  Run the validation agent per VALIDATION.md.
+    //  On failure, loop back to plan for fixes.
+    //
+    //  Artifacts:
+    //    logs/validate/VALIDATION-RUN-{N}.md — test matrix and results
+    //
+    //  Resumability: reads prior validation runs to track regressions.
     // ═══════════════════════════════════════════════════════════════════
 
     validate [
@@ -141,8 +201,9 @@ After all commits are complete, run a final full build and test to verify everyt
         timeout="1800s",
         prompt="You are a validation agent. Read VALIDATION.md for your full instructions and follow them precisely.
 
-Read logs/plan/PLAN.md to understand what was planned.
-Read logs/breakdown/BREAKDOWN.md to understand what was implemented.
+Read the latest logs/plan/PLAN-*.md to understand what was planned.
+Read the latest logs/breakdown/BREAKDOWN-*.md to understand what was intended.
+Read the latest logs/implement/PROGRESS-*.md to understand what was actually completed (and what failed or was skipped).
 
 Check for existing validation runs at logs/validate/. If previous runs exist, this is a re-validation after fixes — focus on previously failing items while also checking for regressions.
 
@@ -154,6 +215,12 @@ Execute the full validation process from VALIDATION.md:
 
 Write results to logs/validate/VALIDATION-RUN-{N}.md where N is the next sequential run number.
 
+Include a comparison section if prior validation runs exist:
+- Items that were FAIL and are now PASS (fixed)
+- Items that were PASS and are now FAIL (regressions)
+- Items that remain FAIL (persistent issues)
+- New items not in prior runs
+
 Your outcome MUST be:
 - SUCCESS if all tests in the matrix pass
 - FAIL with specific failure details if any test fails"
@@ -161,7 +228,14 @@ Your outcome MUST be:
 
     // ═══════════════════════════════════════════════════════════════════
     //  PHASE 5: CRITIQUE (GPT 5.2 harsh → Opus pareto → human gate)
-    //  Adversarial review, then Pareto-optimal distillation
+    //  Adversarial review, then Pareto-optimal distillation.
+    //
+    //  Artifacts:
+    //    logs/critique/CRITIQUE-HARSH-{N}.md  — adversarial review
+    //    logs/critique/CRITIQUE-PARETO-{N}.md — filtered actionable items
+    //
+    //  Resumability: numbered so each critique loop produces new artifacts
+    //  rather than overwriting prior analysis.
     // ═══════════════════════════════════════════════════════════════════
 
     critique_harsh [
@@ -170,10 +244,13 @@ Your outcome MUST be:
         prompt="You are a harsh, adversarial code reviewer. Your job is to find every possible weakness.
 
 Read:
-- logs/plan/PLAN.md (the original plan)
-- logs/breakdown/BREAKDOWN.md (the commit breakdown)
-- logs/validate/VALIDATION-RUN-*.md (all validation results)
-- All source code files that were created or modified
+- The latest logs/plan/PLAN-*.md (the plan)
+- The latest logs/breakdown/BREAKDOWN-*.md (the commit breakdown)
+- The latest logs/implement/PROGRESS-*.md (what was actually done)
+- The latest logs/validate/VALIDATION-RUN-*.md (validation results)
+- All source code files that were created or modified (listed in the progress log)
+
+If prior critique runs exist at logs/critique/CRITIQUE-PARETO-*.md, read the latest — check whether previously identified MUST FIX and SHOULD FIX items were actually addressed.
 
 Write a brutal, thorough critique covering:
 1. Correctness — logic bugs, off-by-one errors, race conditions
@@ -185,18 +262,19 @@ Write a brutal, thorough critique covering:
 7. Performance — O(n^2) loops, unnecessary allocations, missing caching
 8. Deviations from the plan — was the plan actually followed?
 9. Maintainability — will the next developer understand this?
+10. Unresolved items — anything from prior critiques that was NOT fixed
 
 Be specific. Reference exact files, functions, and code patterns. Do not soften your language.
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write to logs/critique/CRITIQUE-HARSH.md."
+Write to logs/critique/CRITIQUE-HARSH-{N}.md where N is the next sequential number."
     ]
 
     critique_pareto [
         class="opus",
         label="Critique: Pareto Optimal Changes",
-        prompt="Read logs/critique/CRITIQUE-HARSH.md.
+        prompt="Read the latest logs/critique/CRITIQUE-HARSH-*.md.
 
 Acknowledge that this was a deliberately adversarial review — harsh by design. Your job is to extract signal from the noise.
 
@@ -212,11 +290,11 @@ For each MUST FIX and SHOULD FIX item, provide:
 2. What to change
 3. Why it matters
 
-If there are zero MUST FIX and zero SHOULD FIX items, explicitly state: 'No changes required. Ready to ship.'
+If zero MUST FIX and zero SHOULD FIX items, explicitly state: 'No changes required. Ready to ship.'
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write to logs/critique/CRITIQUE-PARETO.md."
+Write to logs/critique/CRITIQUE-PARETO-{N}.md where N matches the CRITIQUE-HARSH number."
     ]
 
     critique_gate [

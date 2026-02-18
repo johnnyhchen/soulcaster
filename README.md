@@ -71,9 +71,74 @@ The reference pipeline at [`dotfiles/reference-run.dot`](dotfiles/reference-run.
 
 1. **Plan & Interview** — Orient on the codebase, draft a plan, human reviews and clarifies
 2. **Break Down** — Decompose into single-commit chunks with QA plans, human reviews
-3. **Implement** — Execute the commits
+3. **Implement** — Execute the commits, writing a progress log after each one
 4. **Validate** — Run the validation agent ([`VALIDATION.md`](VALIDATION.md)), loop back to plan on failure
 5. **Critique** — Adversarial review, Pareto-optimal distillation, human decides ship or loop
+
+### Artifact Trail and Resumability
+
+Every phase writes numbered markdown artifacts to `output/logs/`. This serves two purposes: (1) the pipeline can resume from any point if interrupted, and (2) loop iterations (validate→plan, critique→plan) build on prior work rather than starting over.
+
+```
+output/logs/
+├── orient/
+│   ├── ORIENT-1.md          # First orientation / gap analysis
+│   └── ORIENT-2.md          # Re-orientation after a loop
+├── plan/
+│   ├── PLAN-1.md            # Initial plan
+│   └── PLAN-2.md            # Replan after validation failure
+├── breakdown/
+│   ├── BREAKDOWN-1.md       # First commit breakdown
+│   └── BREAKDOWN-2.md       # Revised breakdown (excludes completed work)
+├── implement/
+│   ├── PROGRESS-1.md        # Per-commit status log (matches BREAKDOWN-1)
+│   └── PROGRESS-2.md        # Second run (matches BREAKDOWN-2)
+├── validate/
+│   ├── VALIDATION-RUN-1.md  # First QA pass
+│   └── VALIDATION-RUN-2.md  # Re-validation (includes regression tracking)
+└── critique/
+    ├── CRITIQUE-HARSH-1.md  # Adversarial review
+    ├── CRITIQUE-PARETO-1.md # Filtered actionable items
+    ├── CRITIQUE-HARSH-2.md  # Second critique loop
+    └── CRITIQUE-PARETO-2.md
+```
+
+**How each phase uses prior artifacts:**
+
+| Phase | Reads | Writes | Resumability behavior |
+|-------|-------|--------|----------------------|
+| **Orient** | Prior ORIENT, PROGRESS, VALIDATION-RUN | `ORIENT-{N}.md` | Notes what changed since last orientation. Skips work already done per PROGRESS logs. |
+| **Plan** | Latest ORIENT, prior PLAN, PROGRESS, VALIDATION-RUN, CRITIQUE-PARETO | `PLAN-{N}.md` | Skips DONE items from progress. Incorporates MUST FIX from critique. Focuses on validation failures. |
+| **Breakdown** | Latest PLAN, PROGRESS | `BREAKDOWN-{N}.md` | Excludes commits marked DONE in progress log. Only breaks down remaining work. |
+| **Implement** | Latest BREAKDOWN, prior PROGRESS | `PROGRESS-{N}.md` | Skips DONE commits. Resumes from first TODO or FAILED. Updates log after each commit. |
+| **Validate** | Latest PLAN, BREAKDOWN, PROGRESS, prior VALIDATION-RUN | `VALIDATION-RUN-{N}.md` | Compares against prior runs: fixed, regressed, persistent, new items. |
+| **Critique** | Latest PLAN, BREAKDOWN, PROGRESS, VALIDATION-RUN, prior CRITIQUE-PARETO | `CRITIQUE-HARSH-{N}.md`, `CRITIQUE-PARETO-{N}.md` | Checks whether prior MUST FIX items were addressed. |
+
+**Progress log format** (written incrementally by the implement phase):
+
+```markdown
+# Implementation Progress — Run {N}
+
+## Commit 1: [title from breakdown]
+- **Status**: DONE | FAILED | SKIPPED
+- **Files modified**: [list]
+- **Build result**: PASS | FAIL (error summary)
+- **Test result**: PASS | FAIL (error summary)
+- **Notes**: [issues encountered]
+
+## Commit 2: [title]
+...
+
+## Summary
+- **Total commits**: X
+- **Done**: X
+- **Failed**: X
+- **Skipped**: X
+- **Final build**: PASS | FAIL
+- **Final tests**: PASS | FAIL
+```
+
+The progress log is written **incrementally** — updated after each commit, not batched at the end. If the pipeline is interrupted mid-implementation, the next run reads the progress log and resumes from the first incomplete commit.
 
 ### Prompting an Agent to Write a Dotfile
 
@@ -91,6 +156,9 @@ Rules:
 - Use the model stylesheet with `provider` and `model` keys (not llm_provider/llm_model)
 - Every codergen node (shape=box) needs an explicit `prompt` attribute
 - Prompts must use explicit file paths with `logs/` prefix
+- All artifacts must be numbered ({N}) for resumability — never overwrite prior artifacts
+- Each phase must check for and read prior artifacts before starting work
+- The implement phase must write a PROGRESS-{N}.md log incrementally (after each commit)
 - Include "use bash heredoc for files over 100 lines" in prompts that produce large output
 - Use shape=hexagon for human review gates
 - Use edge conditions like `condition="outcome=success"` for routing
