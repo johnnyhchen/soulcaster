@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:jc_attractor}/output/Coppermind",
+            "name": "Debug CoppermindMac (output/Coppermind)",
+            "target": "CoppermindMac",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CoppermindMac (output/Coppermind)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:jc_attractor}/output/Coppermind",
+            "name": "Release CoppermindMac (output/Coppermind)",
+            "target": "CoppermindMac",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CoppermindMac (output/Coppermind)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:jc_attractor}/output/Coppermind",
+            "name": "Debug CoppermindIOS (output/Coppermind)",
+            "target": "CoppermindIOS",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CoppermindIOS (output/Coppermind)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:jc_attractor}/output/Coppermind",
+            "name": "Release CoppermindIOS (output/Coppermind)",
+            "target": "CoppermindIOS",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CoppermindIOS (output/Coppermind)"
+        }
+    ]
+}

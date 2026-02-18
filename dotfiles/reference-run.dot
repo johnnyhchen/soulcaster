@@ -1,0 +1,255 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "REPLACE_WITH_YOUR_GOAL"
+    label = "Attractor Reference Run"
+    default_max_retry = 3
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    // Keys: provider, model (NOT llm_provider / llm_model)
+    // Do NOT set reasoning_effort — causes signature errors on multi-turn
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .codex { provider = \"openai\";    model = \"codex-5.2\";  reasoning_effort = \"high\" }
+        .gpt   { provider = \"openai\";    model = \"gpt-5.2\";   reasoning_effort = \"high\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box, timeout="900s"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 1: PLAN & INTERVIEW (Claude Opus 4.6)
+    //  Assess the codebase, draft a plan, interview the user for clarity
+    // ═══════════════════════════════════════════════════════════════════
+
+    orient [
+        class="opus",
+        label="Orient: Assess Codebase",
+        prompt="Read the project codebase to understand the current state relevant to this goal: $goal
+
+Explore:
+1. Project structure — key directories, entry points, build system
+2. Existing patterns and conventions — naming, architecture, testing style
+3. Dependencies and constraints — language version, frameworks, external services
+4. Recent changes — git log for recent commits and active areas
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write a structured orientation summary to logs/orient/ORIENT.md covering all of the above."
+    ]
+
+    plan [
+        class="opus",
+        label="Plan: High-Level Implementation",
+        prompt="Read logs/orient/ORIENT.md for project context.
+
+If validation results exist at logs/validate/, read the most recent VALIDATION-RUN-*.md — you are replanning to fix failures identified in that run. Focus the plan on addressing those specific failures.
+
+Create a high-level implementation plan for: $goal
+
+The plan must include:
+1. Architecture approach and rationale
+2. Files to create or modify (exact paths)
+3. Key design decisions and trade-offs
+4. Risk areas and mitigations
+5. Success criteria — what does done look like?
+6. Verification strategy — how do we know it works?
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write the plan to logs/plan/PLAN.md."
+    ]
+
+    interview [
+        shape=hexagon,
+        label="Review plan & clarify requirements"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 2: BREAK DOWN (Claude Opus 4.6)
+    //  Decompose into single-commit chunks, each with a QA plan
+    // ═══════════════════════════════════════════════════════════════════
+
+    breakdown [
+        class="opus",
+        label="Break Down: Commit Chunks",
+        prompt="Read logs/plan/PLAN.md.
+
+Break the implementation into single-commit chunks. Each commit must:
+1. Be independently buildable — the project compiles after this commit
+2. Be independently testable — there is a way to verify this commit works
+3. Have a clear, specific description of what changes and why
+4. List the exact files to create or modify
+5. Include a QA plan:
+   - Build verification command
+   - Specific tests to run or write
+   - Manual verification steps if applicable
+
+Review the breakdown against the plan:
+- Every plan item must map to at least one commit
+- Commits must be ordered by dependency (foundations first)
+- No commit should be so large that it's hard to review
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write the breakdown to logs/breakdown/BREAKDOWN.md."
+    ]
+
+    review_breakdown [
+        shape=hexagon,
+        label="Review breakdown alignment"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 3: IMPLEMENT (OpenAI o3)
+    //  Execute the breakdown commit by commit
+    // ═══════════════════════════════════════════════════════════════════
+
+    implement [
+        class="codex",
+        label="Implement: Commit by Commit",
+        timeout="1800s",
+        prompt="Read logs/breakdown/BREAKDOWN.md. Implement the code commit by commit.
+
+For each commit in the breakdown:
+1. Read the commit description, file list, and QA plan
+2. Implement the code changes
+3. Run the QA plan from the breakdown (build, test, verify)
+4. If the QA plan fails, fix the issue before moving on
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+IMPORTANT: All file references must use explicit paths — do not assume a working directory.
+
+After all commits are complete, run a final full build and test to verify everything integrates correctly."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4: VALIDATE (Claude Opus 4.6)
+    //  Run the validation agent per VALIDATION.md
+    //  On failure, loop back to plan for fixes
+    // ═══════════════════════════════════════════════════════════════════
+
+    validate [
+        class="opus",
+        label="Run Validation Agent",
+        timeout="1800s",
+        prompt="You are a validation agent. Read VALIDATION.md for your full instructions and follow them precisely.
+
+Read logs/plan/PLAN.md to understand what was planned.
+Read logs/breakdown/BREAKDOWN.md to understand what was implemented.
+
+Check for existing validation runs at logs/validate/. If previous runs exist, this is a re-validation after fixes — focus on previously failing items while also checking for regressions.
+
+Execute the full validation process from VALIDATION.md:
+1. Define Definition of Done from the plan
+2. Build a test matrix
+3. Use tools to test like a human user would
+4. Document everything
+
+Write results to logs/validate/VALIDATION-RUN-{N}.md where N is the next sequential run number.
+
+Your outcome MUST be:
+- SUCCESS if all tests in the matrix pass
+- FAIL with specific failure details if any test fails"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 5: CRITIQUE (GPT 5.2 harsh → Opus pareto → human gate)
+    //  Adversarial review, then Pareto-optimal distillation
+    // ═══════════════════════════════════════════════════════════════════
+
+    critique_harsh [
+        class="gpt",
+        label="Critique: Tear It Down",
+        prompt="You are a harsh, adversarial code reviewer. Your job is to find every possible weakness.
+
+Read:
+- logs/plan/PLAN.md (the original plan)
+- logs/breakdown/BREAKDOWN.md (the commit breakdown)
+- logs/validate/VALIDATION-RUN-*.md (all validation results)
+- All source code files that were created or modified
+
+Write a brutal, thorough critique covering:
+1. Correctness — logic bugs, off-by-one errors, race conditions
+2. Security — injection, auth bypass, data exposure, OWASP top 10
+3. Code quality — naming, duplication, complexity, dead code
+4. Missing edge cases — nulls, empty inputs, overflow, concurrency
+5. Test gaps — what is NOT tested that should be?
+6. Architecture — coupling, cohesion, separation of concerns
+7. Performance — O(n^2) loops, unnecessary allocations, missing caching
+8. Deviations from the plan — was the plan actually followed?
+9. Maintainability — will the next developer understand this?
+
+Be specific. Reference exact files, functions, and code patterns. Do not soften your language.
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write to logs/critique/CRITIQUE-HARSH.md."
+    ]
+
+    critique_pareto [
+        class="opus",
+        label="Critique: Pareto Optimal Changes",
+        prompt="Read logs/critique/CRITIQUE-HARSH.md.
+
+Acknowledge that this was a deliberately adversarial review — harsh by design. Your job is to extract signal from the noise.
+
+Apply Pareto analysis: identify the 20%% of changes that yield 80%% of improvement. Categorize every critique item:
+
+- **MUST FIX** — Genuine bugs, security vulnerabilities, correctness issues. These block shipping.
+- **SHOULD FIX** — Significant quality improvements that are worth the effort.
+- **NICE TO HAVE** — Valid observations but low-impact. Not worth a loop.
+- **REJECT** — Overly aggressive, stylistic nitpicks, or premature optimization. Explain why.
+
+For each MUST FIX and SHOULD FIX item, provide:
+1. Specific file and location
+2. What to change
+3. Why it matters
+
+If there are zero MUST FIX and zero SHOULD FIX items, explicitly state: 'No changes required. Ready to ship.'
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write to logs/critique/CRITIQUE-PARETO.md."
+    ]
+
+    critique_gate [
+        shape=hexagon,
+        label="Ship or implement changes?"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Phase 1: Orient → Plan → Interview
+    start -> orient
+    orient -> plan
+    plan -> interview
+    interview -> plan      [label="revise"]
+    interview -> breakdown  [label="approve"]
+
+    // Phase 2: Break Down → Review
+    breakdown -> review_breakdown
+    review_breakdown -> breakdown [label="revise"]
+    review_breakdown -> implement [label="approve"]
+
+    // Phase 3: Implement → Validate
+    implement -> validate
+
+    // Phase 4: Validate gates progress
+    validate -> critique_harsh [condition="outcome=success"]
+    validate -> plan           [condition="outcome=fail", label="Fix needed"]
+
+    // Phase 5: Critique pipeline → human decision
+    critique_harsh -> critique_pareto
+    critique_pareto -> critique_gate
+    critique_gate -> exit [label="ship it"]
+    critique_gate -> plan [label="implement changes"]
+}
