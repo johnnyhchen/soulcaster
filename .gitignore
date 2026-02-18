@@ -3,4 +3,6 @@ obj/
 *.user
 .vs/
 *.suo
+**/output/
+*.svg
 

@@ -20,7 +20,7 @@ public sealed class AnthropicAdapter : IProviderAdapter
     {
         _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
         _baseUrl = baseUrl.TrimEnd('/');
-        _http = httpClient ?? new HttpClient();
+        _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
     }
 
     // ── CompleteAsync ──────────────────────────────────────────────────
@@ -230,7 +230,7 @@ public sealed class AnthropicAdapter : IProviderAdapter
         if (request.MaxTokens is not null)
             body["max_tokens"] = request.MaxTokens.Value;
         else
-            body["max_tokens"] = 8192; // Anthropic requires max_tokens
+            body["max_tokens"] = request.ReasoningEffort is not null ? 65536 : 16384;
 
         if (request.Temperature is not null)
             body["temperature"] = request.Temperature.Value;

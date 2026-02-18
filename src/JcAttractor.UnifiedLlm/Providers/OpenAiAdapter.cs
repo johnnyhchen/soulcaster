@@ -382,12 +382,17 @@ public sealed class OpenAiAdapter : IProviderAdapter
                 var required = new JsonArray();
                 foreach (var param in tool.Parameters)
                 {
-                    var prop = new JsonObject { ["type"] = param.Type };
+                    var propType = param.Required
+                        ? param.Type
+                        : param.Type;
+                    var prop = new JsonObject { ["type"] = new JsonArray(param.Type, "null") };
                     if (param.Description is not null)
                         prop["description"] = param.Description;
-                    properties[param.Name] = prop;
                     if (param.Required)
-                        required.Add(param.Name);
+                        prop["type"] = param.Type;
+                    properties[param.Name] = prop;
+                    // OpenAI strict mode requires all properties in required
+                    required.Add(param.Name);
                 }
 
                 var parameters = new JsonObject

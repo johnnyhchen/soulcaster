@@ -57,13 +57,14 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         process.StartInfo = new ProcessStartInfo
         {
             FileName = "/bin/bash",
-            Arguments = $"-c {EscapeShellArgument(command)}",
             WorkingDirectory = WorkingDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        process.StartInfo.ArgumentList.Add("-c");
+        process.StartInfo.ArgumentList.Add(command);
 
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();

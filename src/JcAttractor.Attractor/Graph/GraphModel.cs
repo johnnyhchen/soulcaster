@@ -35,7 +35,7 @@ public record GraphNode
     public string? Timeout { get; init; }
     public string LlmModel { get; init; } = "";
     public string LlmProvider { get; init; } = "";
-    public string ReasoningEffort { get; init; } = "high";
+    public string ReasoningEffort { get; init; } = "";
     public bool AutoStatus { get; init; } = false;
     public bool AllowPartial { get; init; } = false;
     public Dictionary<string, string> RawAttributes { get; init; } = new();

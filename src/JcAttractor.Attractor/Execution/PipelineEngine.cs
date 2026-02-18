@@ -88,22 +88,40 @@ public class PipelineEngine
 
             if (isExitNode)
             {
-                // Goal gate enforcement: check if all goal_gate nodes have been completed
+                // Goal gate enforcement: check if all goal_gate nodes have succeeded
                 var goalGateNodes = graph.Nodes.Values.Where(n => n.GoalGate).ToList();
-                var unmetGates = goalGateNodes.Where(g => !completedNodes.Contains(g.Id)).ToList();
-
-                if (unmetGates.Count > 0)
+                var unsatisfiedGates = goalGateNodes.Where(g =>
                 {
-                    // Cannot exit yet; look for a path back
-                    var firstUnmet = unmetGates[0];
-                    var retryNodeId = !string.IsNullOrEmpty(firstUnmet.RetryTarget) ? firstUnmet.RetryTarget
-                        : !string.IsNullOrEmpty(graph.RetryTarget) ? graph.RetryTarget
-                        : firstUnmet.Id;
+                    if (!nodeOutcomes.TryGetValue(g.Id, out var gateOutcome))
+                        return true; // Never executed
+                    return gateOutcome.Status != OutcomeStatus.Success
+                        && gateOutcome.Status != OutcomeStatus.PartialSuccess;
+                }).ToList();
 
-                    if (graph.Nodes.ContainsKey(retryNodeId))
+                if (unsatisfiedGates.Count > 0)
+                {
+                    // Cannot exit yet; look for a retry path
+                    var firstUnsatisfied = unsatisfiedGates[0];
+                    var retryNodeId = !string.IsNullOrEmpty(firstUnsatisfied.RetryTarget) ? firstUnsatisfied.RetryTarget
+                        : !string.IsNullOrEmpty(firstUnsatisfied.FallbackRetryTarget) ? firstUnsatisfied.FallbackRetryTarget
+                        : !string.IsNullOrEmpty(graph.RetryTarget) ? graph.RetryTarget
+                        : !string.IsNullOrEmpty(graph.FallbackRetryTarget) ? graph.FallbackRetryTarget
+                        : null;
+
+                    if (retryNodeId != null && graph.Nodes.ContainsKey(retryNodeId))
                     {
                         currentNodeId = retryNodeId;
                         continue;
+                    }
+                    else
+                    {
+                        // No retry target available, pipeline fails
+                        return new PipelineResult(
+                            Status: OutcomeStatus.Fail,
+                            CompletedNodes: completedNodes,
+                            NodeOutcomes: nodeOutcomes,
+                            FinalContext: context
+                        );
                     }
                 }
 
@@ -149,10 +167,12 @@ public class PipelineEngine
             // Handle retry logic
             if (outcome.Status == OutcomeStatus.Retry || outcome.Status == OutcomeStatus.Fail)
             {
-                int maxRetries = currentNode.MaxRetries > 0 ? currentNode.MaxRetries : graph.DefaultMaxRetry;
+                int maxRetries = currentNode.MaxRetries > 0 ? currentNode.MaxRetries : 0;
                 int currentRetryCount = retryCounts.GetValueOrDefault(currentNodeId, 0);
 
-                if (currentRetryCount < maxRetries && outcome.Status == OutcomeStatus.Retry)
+                // Retry on RETRY or FAIL when max_retries allows it
+                if (currentRetryCount < maxRetries &&
+                    (outcome.Status == OutcomeStatus.Retry || outcome.Status == OutcomeStatus.Fail))
                 {
                     retryCounts[currentNodeId] = currentRetryCount + 1;
 
@@ -169,31 +189,81 @@ public class PipelineEngine
                     continue;
                 }
 
-                // Max retries exceeded or hard fail
-                if (outcome.Status == OutcomeStatus.Fail || currentRetryCount >= maxRetries)
+                // Max retries exceeded or no retries configured
+                // Convert exhausted RETRY to FAIL
+                if (outcome.Status == OutcomeStatus.Retry && currentRetryCount >= maxRetries && maxRetries > 0)
                 {
-                    // Check for fallback retry target
-                    string? fallbackTarget = !string.IsNullOrEmpty(currentNode.FallbackRetryTarget) ? currentNode.FallbackRetryTarget
-                        : !string.IsNullOrEmpty(graph.FallbackRetryTarget) ? graph.FallbackRetryTarget
-                        : null;
-
-                    if (fallbackTarget != null && graph.Nodes.ContainsKey(fallbackTarget))
+                    if (currentNode.AllowPartial)
                     {
-                        retryCounts[currentNodeId] = 0; // Reset retry count
-                        SaveCheckpoint(fallbackTarget, completedNodes, context, retryCounts);
-                        currentNodeId = fallbackTarget;
+                        outcome = outcome with { Status = OutcomeStatus.PartialSuccess, Notes = "Retries exhausted, partial accepted" };
+                    }
+                    else
+                    {
+                        outcome = outcome with { Status = OutcomeStatus.Fail, Notes = "Max retries exceeded" };
+                    }
+                    nodeOutcomes[currentNodeId] = outcome;
+                }
+
+                // Check for fallback retry target
+                string? fallbackTarget = !string.IsNullOrEmpty(currentNode.FallbackRetryTarget) ? currentNode.FallbackRetryTarget
+                    : !string.IsNullOrEmpty(graph.FallbackRetryTarget) ? graph.FallbackRetryTarget
+                    : null;
+
+                if (fallbackTarget != null && graph.Nodes.ContainsKey(fallbackTarget))
+                {
+                    retryCounts[currentNodeId] = 0; // Reset retry count
+                    SaveCheckpoint(fallbackTarget, completedNodes, context, retryCounts);
+                    currentNodeId = fallbackTarget;
+                    continue;
+                }
+
+                // Allow partial success if configured
+                if (currentNode.AllowPartial && outcome.Status != OutcomeStatus.Success && outcome.Status != OutcomeStatus.PartialSuccess)
+                {
+                    outcome = outcome with { Status = OutcomeStatus.PartialSuccess };
+                    nodeOutcomes[currentNodeId] = outcome;
+                }
+                // Per spec 3.7: on FAIL, failure routing order:
+                // 1. Fail edge (condition="outcome=fail")
+                // 2. retry_target
+                // 3. fallback_retry_target
+                // 4. Pipeline termination
+                else if (outcome.Status == OutcomeStatus.Fail)
+                {
+                    // Step 1: Check for explicit fail edge
+                    var hasFailEdge = graph.OutgoingEdges(currentNodeId)
+                        .Any(e => !string.IsNullOrWhiteSpace(e.Condition) &&
+                                  ConditionEvaluator.Evaluate(e.Condition, outcome, context));
+
+                    if (hasFailEdge)
+                    {
+                        // Fail edge exists; let edge selection handle routing
+                    }
+                    // Step 2: Check retry_target
+                    else if (!string.IsNullOrEmpty(currentNode.RetryTarget) && graph.Nodes.ContainsKey(currentNode.RetryTarget))
+                    {
+                        currentNodeId = currentNode.RetryTarget;
                         continue;
                     }
-
-                    // Allow partial success if configured
-                    if (currentNode.AllowPartial && outcome.Status != OutcomeStatus.Success)
+                    // Step 3: Check fallback_retry_target (node then graph)
+                    else if (!string.IsNullOrEmpty(currentNode.FallbackRetryTarget) && graph.Nodes.ContainsKey(currentNode.FallbackRetryTarget))
                     {
-                        outcome = outcome with { Status = OutcomeStatus.PartialSuccess };
-                        nodeOutcomes[currentNodeId] = outcome;
+                        currentNodeId = currentNode.FallbackRetryTarget;
+                        continue;
                     }
-                    else if (outcome.Status == OutcomeStatus.Fail)
+                    else if (!string.IsNullOrEmpty(graph.RetryTarget) && graph.Nodes.ContainsKey(graph.RetryTarget))
                     {
-                        // Pipeline fails
+                        currentNodeId = graph.RetryTarget;
+                        continue;
+                    }
+                    else if (!string.IsNullOrEmpty(graph.FallbackRetryTarget) && graph.Nodes.ContainsKey(graph.FallbackRetryTarget))
+                    {
+                        currentNodeId = graph.FallbackRetryTarget;
+                        continue;
+                    }
+                    else
+                    {
+                        // Step 4: Pipeline termination
                         completedNodes.Add(currentNodeId);
                         SaveCheckpoint(currentNodeId, completedNodes, context, retryCounts);
 

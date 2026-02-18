@@ -15,7 +15,8 @@ public record AssistantTurn(
     string? Reasoning,
     Usage Usage,
     string? ResponseId,
-    DateTimeOffset Timestamp) : ITurn;
+    DateTimeOffset Timestamp,
+    List<ThinkingData>? ThinkingParts = null) : ITurn;
 
 public record ToolResultsTurn(List<ToolResultData> Results, DateTimeOffset Timestamp) : ITurn;
 

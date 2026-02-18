@@ -4,7 +4,7 @@ using System.Text.Json;
 
 public interface ICodergenBackend
 {
-    Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default);
+    Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default);
 }
 
 public record CodergenResult(string Response, OutcomeStatus Status, Dictionary<string, string>? ContextUpdates = null);
@@ -37,7 +37,8 @@ public class CodergenHandler : INodeHandler
         CodergenResult result;
         try
         {
-            result = await _backend.RunAsync(expandedPrompt, model, provider, ct);
+            string? reasoningEffort = !string.IsNullOrEmpty(node.ReasoningEffort) ? node.ReasoningEffort : null;
+            result = await _backend.RunAsync(expandedPrompt, model, provider, reasoningEffort, ct);
         }
         catch (Exception ex)
         {

@@ -152,6 +152,10 @@ public class Session
                 var toolCalls = response.ToolCalls;
                 var reasoning = response.Reasoning;
                 var usage = response.Usage;
+                var thinkingParts = response.Message.Content
+                    .Where(p => (p.Kind == ContentKind.Thinking || p.Kind == ContentKind.RedactedThinking) && p.Thinking is not null)
+                    .Select(p => p.Thinking!)
+                    .ToList();
 
                 // Emit text delta if there is text content
                 if (!string.IsNullOrEmpty(text))
@@ -171,7 +175,8 @@ public class Session
                     reasoning,
                     usage,
                     response.Id,
-                    DateTimeOffset.UtcNow);
+                    DateTimeOffset.UtcNow,
+                    thinkingParts.Count > 0 ? thinkingParts : null);
 
                 History.Add(assistantTurn);
 
@@ -326,8 +331,13 @@ public class Session
                 {
                     var parts = new List<ContentPart>();
 
-                    // Add thinking/reasoning parts if present
-                    if (assistantTurn.Reasoning is not null)
+                    // Add thinking/reasoning parts if present (preserve signatures for round-trip)
+                    if (assistantTurn.ThinkingParts is { Count: > 0 })
+                    {
+                        foreach (var tp in assistantTurn.ThinkingParts)
+                            parts.Add(ContentPart.ThinkingPart(tp));
+                    }
+                    else if (assistantTurn.Reasoning is not null)
                     {
                         parts.Add(ContentPart.ThinkingPart(
                             new ThinkingData(assistantTurn.Reasoning, null, false)));

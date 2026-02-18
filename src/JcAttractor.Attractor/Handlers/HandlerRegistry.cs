@@ -39,7 +39,7 @@ public class HandlerRegistry
     /// </summary>
     private class NullCodergenBackend : ICodergenBackend
     {
-        public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+        public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
         {
             return Task.FromResult(new CodergenResult(
                 Response: "No codergen backend configured.",
