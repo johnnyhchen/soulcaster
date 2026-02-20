@@ -210,12 +210,23 @@ public class OpenAiProfile : IProviderProfile
             }
             else
             {
-                // Read existing file and apply patch via shell
-                var escapedPatch = patch.Replace("'", "'\"'\"'");
-                var result = await env.RunCommandAsync(
-                    $"echo '{escapedPatch}' | patch -p1 --forward --no-backup-if-mismatch",
-                    timeoutMs: 10000);
-                results.Add(result);
+                // Write patch to a temp file to avoid shell escaping issues with echo,
+                // then apply via patch command. Use -p0 for absolute paths, -p1 for a/b/ prefixed.
+                var useP0 = targetFile.StartsWith('/');
+                var stripLevel = useP0 ? "0" : "1";
+                var tmpFile = Path.Combine(Path.GetTempPath(), $"attractor-patch-{Guid.NewGuid():N}.diff");
+                try
+                {
+                    await File.WriteAllTextAsync(tmpFile, patch);
+                    var result = await env.RunCommandAsync(
+                        $"patch -p{stripLevel} --forward --no-backup-if-mismatch < {tmpFile}",
+                        timeoutMs: 10000);
+                    results.Add(result);
+                }
+                finally
+                {
+                    if (File.Exists(tmpFile)) File.Delete(tmpFile);
+                }
                 break; // Let patch handle all files at once
             }
         }
