@@ -23,6 +23,10 @@ public class CodergenHandler : INodeHandler
         // Expand $goal in prompt
         string expandedPrompt = ExpandVariables(node.Prompt, context, graph);
 
+        // Prepend deterministic file-system preamble so the agent always
+        // knows the exact directory layout — no guessing, no hardcoded paths.
+        expandedPrompt = BuildPreamble(node, graph, logsRoot) + expandedPrompt;
+
         // Create stage directory
         string stageDir = Path.Combine(logsRoot, node.Id);
         Directory.CreateDirectory(stageDir);
@@ -74,6 +78,45 @@ public class CodergenHandler : INodeHandler
         );
 
         return outcome;
+    }
+
+    private static string BuildPreamble(GraphNode node, Graph graph, string logsRoot)
+    {
+        // logsRoot is the absolute path to the logs/ directory.
+        // The agent's working directory is its parent (the run output root).
+        var outputRoot = Path.GetFullPath(Path.Combine(logsRoot, ".."));
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("[PIPELINE CONTEXT]");
+        sb.AppendLine($"You are executing node \"{node.Id}\" in pipeline \"{graph.Name}\".");
+        sb.AppendLine();
+        sb.AppendLine("Your working directory (CWD) is:");
+        sb.AppendLine($"  {outputRoot}");
+        sb.AppendLine();
+        sb.AppendLine("Artifact directory layout (relative to CWD):");
+        sb.AppendLine("  logs/                          <- all pipeline artifacts");
+
+        // List each node that has a logs subdirectory, marking which exist
+        foreach (var n in graph.Nodes.Values.OrderBy(n => n.Id))
+        {
+            if (n.Shape.Equals("Mdiamond", StringComparison.OrdinalIgnoreCase) ||
+                n.Shape.Equals("Msquare", StringComparison.OrdinalIgnoreCase) ||
+                n.Shape.Equals("hexagon", StringComparison.OrdinalIgnoreCase))
+                continue; // Skip terminals and gates — they don't produce log dirs
+
+            var nodeDir = Path.Combine(logsRoot, n.Id);
+            var exists = Directory.Exists(nodeDir);
+            var marker = exists ? "(exists)" : "(not yet created)";
+            sb.AppendLine($"  logs/{n.Id,-25} {marker}");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("Use RELATIVE paths (e.g. logs/breakdown/BREAKDOWN-1.md) to read/write artifacts.");
+        sb.AppendLine("Do NOT hardcode absolute paths for pipeline artifacts.");
+        sb.AppendLine("[/PIPELINE CONTEXT]");
+        sb.AppendLine();
+
+        return sb.ToString();
     }
 
     private static string ExpandVariables(string prompt, PipelineContext context, Graph graph)

@@ -2512,7 +2512,7 @@ internal class FakeCodergenBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult(
@@ -2535,7 +2535,7 @@ internal class AlwaysFailBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult(
@@ -2555,7 +2555,7 @@ internal class FailThenSucceedBackend : ICodergenBackend
         _failCount = failCount;
     }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
         CallCount++;
         if (CallCount <= _failCount)
@@ -2583,7 +2583,7 @@ internal class RetryThenSucceedBackend : ICodergenBackend
         _retryCount = retryCount;
     }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
         CallCount++;
         if (CallCount <= _retryCount)
@@ -2605,7 +2605,7 @@ internal class AlwaysRetryBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult(
@@ -2620,7 +2620,7 @@ internal class ContextTrackingBackend : ICodergenBackend
     public bool Step2SawStep1Context { get; private set; }
     private int _callCount;
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
         _callCount++;
         if (_callCount == 1)
