@@ -1,0 +1,450 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Implement a Microsoft Teams mock service adapter (dtu-teams) in the Digital Twin Universe repo at /Users/johnny.chen/ai-digital-twin-rs. Follow the exact same patterns as the existing dtu-slack, dtu-okta, and dtu-jira service adapters. The adapter must include: (1) domain types — Team, Channel, ChatMessage, Member, Presence, Meeting, TeamsApp, Webhook, with proper ID types; (2) in-memory store with RwLock<HashMap> per entity, matching dtu-slack's store pattern; (3) deterministic seeder using the Go-compatible RNG from dtu-core; (4) MessagePack snapshot support via VersionedState; (5) identity subscriber for Okta→Teams user sync with handle collision resolution matching dtu-slack's pattern; (6) Axum HTTP routes mounted under /api/teams/ in dtu-http, with X-Instance-ID routing; (7) SSE event stream for real-time message/presence updates; (8) Bot Framework basics — app registration, bot tokens, incoming webhook delivery with HMAC v0 signing; (9) a React+TypeScript embedded UI under ui/teams/ following the Slack UI patterns; (10) workspace Cargo.toml and Makefile integration; (11) unit tests and integration tests. Refer to crates/dtu-slack/ as the primary pattern to follow, and crates/dtu-http/src/slack/ for HTTP route mounting."
+
+    label = "DTU Microsoft Teams Adapter"
+    default_max_retry = 3
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .codex { provider = \"openai\";    model = \"codex-5.2\";  reasoning_effort = \"high\" }
+        .gpt   { provider = \"openai\";    model = \"gpt-5.2\";   reasoning_effort = \"high\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box, timeout="900s"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 1: PLAN & INTERVIEW (Claude Opus 4.6)
+    //  Assess the DTU codebase — especially dtu-slack as the primary
+    //  pattern — and draft a plan for the Teams adapter.
+    //
+    //  Artifacts:
+    //    logs/orient/ORIENT-{N}.md   — codebase assessment
+    //    logs/plan/PLAN-{N}.md       — implementation plan
+    // ═══════════════════════════════════════════════════════════════════
+
+    orient [
+        class="opus",
+        label="Orient: Assess DTU Codebase",
+        prompt="Read the project codebase at /Users/johnny.chen/ai-digital-twin-rs to understand the current state relevant to this goal: $goal
+
+Explore deeply:
+1. Project structure — workspace crates, ui/ directories, Makefile, Cargo.toml
+2. The dtu-slack crate in detail — domain.rs, store.rs, seed.rs, snapshot support, every public type
+3. The dtu-http/src/slack/ directory — routes, SSE, identity sync, webhooks, middleware
+4. The dtu-okta crate — identity types used for cross-service sync
+5. The dtu-core crate — shared domain types, ID generation, RNG
+6. The dtu-admin crate — event bus, freeze controller, snapshot versioning
+7. The ui/slack/ directory — React app structure, components, API calls, SSE integration
+8. Makefile targets for existing services
+9. docs/design/ARCHITECTURE.md and docs/ADR.md for architectural decisions
+10. Recent git log for active development patterns
+
+Check for prior run artifacts:
+- If logs/orient/ORIENT-*.md exists, read the latest — you are re-orienting after a pipeline loop.
+- If logs/implement/PROGRESS-*.md exists, read the latest — these are completed work items.
+- If logs/validate/VALIDATION-RUN-*.md exists, read the latest — these are known failures to address.
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write a structured orientation summary to logs/orient/ORIENT-{N}.md where N is the next sequential number (start at 1). Include:
+- Detailed assessment of each existing adapter's patterns (especially Slack)
+- Mapping of Slack patterns to Teams equivalents
+- What has already been completed (from prior PROGRESS logs)
+- What remains to be done
+- What failed in prior validation (if any)"
+    ]
+
+    plan [
+        class="opus",
+        label="Plan: Teams Adapter Architecture",
+        prompt="Read the latest logs/orient/ORIENT-*.md for project context.
+
+Check for prior run artifacts:
+- If logs/plan/PLAN-*.md exists, read the latest — you are replanning.
+- If logs/implement/PROGRESS-*.md exists, read the latest — skip work items marked DONE.
+- If logs/validate/VALIDATION-RUN-*.md exists, read the latest — fix identified failures.
+- If logs/critique/CRITIQUE-PARETO-*.md exists, read the latest — incorporate MUST FIX and SHOULD FIX items.
+
+Create a high-level implementation plan for: $goal
+
+The plan MUST cover these layers (in dependency order):
+
+Layer 1 — Foundation:
+- New crate crates/dtu-teams/ with Cargo.toml mirroring dtu-slack's dependencies
+- Domain types: Team, Channel, ChatMessage, Member, Presence, Meeting, TeamsApp, Webhook
+- ID types (TeamId, ChannelId, MessageId, etc.) following dtu-core patterns
+- Add dtu-teams to workspace Cargo.toml members
+
+Layer 2 — Storage & Seeding:
+- In-memory TeamsStore with RwLock<HashMap> per entity (mirror SlackStore)
+- Deterministic TeamsSeeder using Go-compatible RNG
+- MessagePack VersionedState snapshot support
+- Freeze/thaw integration via FreezeController
+
+Layer 3 — Identity & Events:
+- Okta→Teams identity subscriber (mirror slack/identity.rs)
+- Handle collision resolution with numeric suffixes
+- EventBus integration for real-time mutations
+- SSE stream endpoint for Teams events
+
+Layer 4 — HTTP API:
+- Axum routes under /api/teams/ in dtu-http
+- CRUD endpoints: teams, channels, messages, members, presence, meetings
+- X-Instance-ID header routing (per-instance stores)
+- Auth middleware, freeze guard, idempotency middleware
+- Bot Framework: app registration, bot tokens, webhook delivery with HMAC v0
+
+Layer 5 — UI:
+- React+TypeScript SPA under ui/teams/
+- Channel list sidebar, message thread view, presence indicators
+- SSE integration for live updates
+- Vite build, CSS variables matching existing design tokens
+
+Layer 6 — Integration:
+- Makefile targets (build, test, ui-teams-build)
+- Wire into dtu-http ServerState
+- Wire into dtu-admin snapshot save/load
+- Wire into dtu-cli for E2E support
+
+Include:
+1. Architecture approach and rationale
+2. Files to create or modify (exact paths)
+3. Key design decisions and trade-offs
+4. Risk areas and mitigations
+5. Success criteria — what does done look like?
+6. Verification strategy — how do we know it works?
+7. Prior work summary — what is already done
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write the plan to logs/plan/PLAN-{N}.md where N is the next sequential number."
+    ]
+
+    interview [
+        shape=hexagon,
+        label="Review plan & clarify scope"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 2: BREAK DOWN (Claude Opus 4.6)
+    //  Decompose into single-commit chunks with QA plans.
+    //
+    //  Artifacts:
+    //    logs/breakdown/BREAKDOWN-{N}.md — commit-by-commit work plan
+    // ═══════════════════════════════════════════════════════════════════
+
+    breakdown [
+        class="opus",
+        label="Break Down: Commit Chunks",
+        prompt="Read the latest logs/plan/PLAN-*.md.
+
+If logs/implement/PROGRESS-*.md exists, read the latest. Commits marked DONE in the progress log should be EXCLUDED from this breakdown — they are already implemented. Only break down remaining work.
+
+Break the implementation into single-commit chunks. Each commit must:
+1. Be independently buildable — cargo build succeeds after this commit
+2. Be independently testable — cargo test passes or specific verification works
+3. Have a clear, specific description of what changes and why
+4. List the exact files to create or modify
+5. Include a QA plan:
+   - Build verification: cargo build --workspace
+   - Tests: cargo test -p dtu-teams (or specific test)
+   - Manual verification steps if applicable
+
+Suggested commit ordering (adjust based on plan):
+1. Scaffold crate: Cargo.toml, lib.rs, domain.rs with core types
+2. ID types and enums
+3. TeamsStore with basic CRUD
+4. TeamsSeeder with deterministic data
+5. Snapshot support (VersionedState)
+6. Identity subscriber (Okta→Teams sync)
+7. HTTP routes — teams CRUD
+8. HTTP routes — channels CRUD
+9. HTTP routes — messages CRUD
+10. HTTP routes — members and presence
+11. HTTP routes — meetings
+12. HTTP routes — bot framework (app registration, tokens, webhooks)
+13. SSE event stream
+14. ServerState and Makefile integration
+15. UI scaffold (Vite + React)
+16. UI — channel list and message view
+17. UI — presence and meeting indicators
+18. UI — SSE live updates
+19. Snapshot save/load integration
+20. Final integration and cleanup
+
+Review the breakdown against the plan:
+- Every plan item must map to at least one commit
+- Commits must be ordered by dependency (foundations first)
+- No commit should be so large that it is hard to review
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write the breakdown to logs/breakdown/BREAKDOWN-{N}.md where N is the next sequential number."
+    ]
+
+    review_breakdown [
+        shape=hexagon,
+        label="Review breakdown alignment"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 3: IMPLEMENT (OpenAI Codex)
+    //  Execute the breakdown commit by commit.
+    //
+    //  Artifacts:
+    //    logs/implement/PROGRESS-{N}.md — per-commit status tracking
+    // ═══════════════════════════════════════════════════════════════════
+
+    implement [
+        class="codex",
+        label="Implement: Commit by Commit",
+        timeout="1800s",
+        prompt="CRITICAL: All pipeline log files are at /Users/johnny.chen/soulcaster/dotfiles/output/logs/ (NOT in the repo).
+
+Read the breakdown: /Users/johnny.chen/soulcaster/dotfiles/output/logs/breakdown/BREAKDOWN-1.md
+Also read the plan for context: /Users/johnny.chen/soulcaster/dotfiles/output/logs/plan/PLAN-1.md
+
+If /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-*.md exists, read the latest. Skip any commits marked DONE. Resume from the first commit marked TODO or FAILED.
+
+Working directory for code changes: /Users/johnny.chen/ai-digital-twin-rs
+
+For each commit in the breakdown:
+1. Read the commit description, file list, and QA plan
+2. Implement the code changes — follow existing patterns EXACTLY:
+   - Rust style: match dtu-slack naming, error handling, module structure
+   - Use serde derive macros consistently
+   - Use Arc<RwLock<...>> for thread-safe stores
+   - Use proper Axum extractors (State, Path, Json, Header)
+   - UI: match ui/slack/ component structure and CSS patterns
+3. Run the QA plan from the breakdown (cargo build, cargo test, etc.)
+4. If the QA plan fails, fix the issue before moving on
+5. Create a git commit with a descriptive message
+6. IMMEDIATELY after each commit, append its status to the progress log
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+IMPORTANT: All CODE file references must use absolute paths rooted at /Users/johnny.chen/ai-digital-twin-rs.
+IMPORTANT: All LOG file references must use absolute paths rooted at /Users/johnny.chen/soulcaster/dotfiles/output/logs/.
+IMPORTANT: Run cargo fmt after each commit to maintain formatting.
+IMPORTANT: Run cargo clippy --workspace to catch lint issues early.
+
+Progress log format — write to /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-{N}.md where N matches the BREAKDOWN number:
+
+```markdown
+# Implementation Progress — Run {N}
+
+## Commit 1: [title from breakdown]
+- **Status**: DONE | FAILED | SKIPPED
+- **Files modified**: [list]
+- **Build result**: PASS | FAIL (error summary if fail)
+- **Test result**: PASS | FAIL (error summary if fail)
+- **Notes**: [any issues encountered]
+
+## Commit 2: [title]
+...
+```
+
+Write the progress log incrementally — update it after EACH commit.
+
+After all commits are complete, run a final full build and test:
+- cargo build --workspace
+- cargo test --workspace
+- cargo clippy --workspace
+
+Append a summary section to the progress log."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4: VALIDATE (Claude Opus 4.6)
+    //  Comprehensive validation of the Teams adapter.
+    //
+    //  Artifacts:
+    //    logs/validate/VALIDATION-RUN-{N}.md — test matrix and results
+    // ═══════════════════════════════════════════════════════════════════
+
+    validate [
+        class="opus",
+        label="Validate: Teams Adapter",
+        timeout="1800s",
+        prompt="You are a validation agent for the DTU Microsoft Teams adapter.
+
+CRITICAL: Pipeline log files are at /Users/johnny.chen/soulcaster/dotfiles/output/logs/ (NOT in the repo).
+Code changes are in: /Users/johnny.chen/ai-digital-twin-rs
+
+Read /Users/johnny.chen/soulcaster/dotfiles/output/logs/plan/PLAN-1.md to understand what was planned.
+Read /Users/johnny.chen/soulcaster/dotfiles/output/logs/breakdown/BREAKDOWN-1.md to understand what was intended.
+Read the latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-*.md to understand what was actually completed.
+
+Check for existing validation runs at /Users/johnny.chen/soulcaster/dotfiles/output/logs/validate/. If previous runs exist, focus on previously failing items while also checking for regressions.
+
+Execute this validation matrix:
+
+BUILD & LINT:
+- cargo build --workspace (must succeed)
+- cargo test --workspace (must succeed)
+- cargo clippy --workspace (no warnings)
+- cargo fmt --check (must pass)
+
+DOMAIN MODEL:
+- Verify all domain types exist: Team, Channel, ChatMessage, Member, Presence, Meeting, TeamsApp, Webhook
+- Verify ID types follow dtu-core patterns
+- Verify serde serialization round-trips correctly
+
+STORE:
+- Verify TeamsStore CRUD operations via unit tests
+- Verify thread safety (Arc<RwLock<...>> pattern)
+- Verify freeze/thaw blocks mutations when frozen
+
+SEEDER:
+- Verify deterministic seeding produces consistent results
+- Verify seeded data is realistic (names, channels, messages)
+
+SNAPSHOT:
+- Verify VersionedState serialization/deserialization
+- Verify snapshot save and load round-trip
+
+IDENTITY:
+- Verify Okta→Teams user sync creates members
+- Verify handle collision resolution (numeric suffixes)
+
+HTTP API:
+- Start the server: cargo run -p dtu-cli -- serve
+- Verify /api/teams/ routes respond (curl or reqwest tests)
+- Verify X-Instance-ID routing works
+- Verify auth middleware rejects unauthorized requests
+- Verify freeze guard blocks writes when frozen
+
+SSE:
+- Verify SSE endpoint streams events on mutations
+
+UI:
+- Verify ui/teams/ builds (pnpm install && pnpm build)
+- Verify static assets are served
+
+INTEGRATION:
+- Verify dtu-teams is in workspace Cargo.toml
+- Verify Makefile targets exist and work
+- Verify dtu-http server starts with Teams routes mounted
+
+Write results to /Users/johnny.chen/soulcaster/dotfiles/output/logs/validate/VALIDATION-RUN-{N}.md.
+
+Your outcome MUST be:
+- SUCCESS if all tests pass
+- FAIL with specific failure details if any test fails"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 5: CRITIQUE (GPT 5.2 harsh → Opus pareto → human gate)
+    //
+    //  Artifacts:
+    //    logs/critique/CRITIQUE-HARSH-{N}.md  — adversarial review
+    //    logs/critique/CRITIQUE-PARETO-{N}.md — filtered actionable items
+    // ═══════════════════════════════════════════════════════════════════
+
+    critique_harsh [
+        class="gpt",
+        label="Critique: Tear It Down",
+        prompt="You are a harsh, adversarial code reviewer. Your job is to find every possible weakness in the new dtu-teams adapter.
+
+CRITICAL: Pipeline log files are at /Users/johnny.chen/soulcaster/dotfiles/output/logs/ (NOT in the repo).
+Code changes are in: /Users/johnny.chen/ai-digital-twin-rs
+
+Read:
+- /Users/johnny.chen/soulcaster/dotfiles/output/logs/plan/PLAN-1.md
+- /Users/johnny.chen/soulcaster/dotfiles/output/logs/breakdown/BREAKDOWN-1.md
+- The latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-*.md
+- The latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/validate/VALIDATION-RUN-*.md
+- All source files in /Users/johnny.chen/ai-digital-twin-rs/crates/dtu-teams/src/
+- All source files in /Users/johnny.chen/ai-digital-twin-rs/crates/dtu-http/src/teams/
+- All source files in /Users/johnny.chen/ai-digital-twin-rs/ui/teams/src/
+
+If prior critique runs exist at /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-PARETO-*.md, check whether previously identified MUST FIX and SHOULD FIX items were addressed.
+
+Write a brutal, thorough critique covering:
+1. Correctness — logic bugs, off-by-one errors, race conditions, deadlocks
+2. Security — injection, auth bypass, HMAC verification gaps, data exposure
+3. Pattern conformance — does it EXACTLY match dtu-slack patterns or deviate?
+4. Code quality — naming consistency, duplication, dead code
+5. Missing edge cases — empty teams, deleted channels, concurrent message writes
+6. Test gaps — what is NOT tested that should be?
+7. Architecture — coupling, cohesion, does it fit cleanly into the DTU system?
+8. Performance — O(n^2) lookups, unnecessary clones, lock contention
+9. Deviations from the plan — was the plan actually followed?
+10. API fidelity — does the mock API reasonably approximate real MS Teams Graph API?
+
+Be specific. Reference exact files, functions, and code patterns.
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write to /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-HARSH-{N}.md."
+    ]
+
+    critique_pareto [
+        class="opus",
+        label="Critique: Pareto Optimal Changes",
+        prompt="Read the latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-HARSH-*.md.
+
+This was a deliberately adversarial review — harsh by design. Extract signal from noise.
+
+Apply Pareto analysis: identify the 20%% of changes that yield 80%% of improvement. Categorize every critique item:
+
+- **MUST FIX** — Genuine bugs, security vulnerabilities, correctness issues, pattern violations that would confuse maintainers. These block shipping.
+- **SHOULD FIX** — Significant quality improvements worth the effort.
+- **NICE TO HAVE** — Valid observations but low-impact. Not worth a loop.
+- **REJECT** — Overly aggressive, stylistic nitpicks, or premature optimization. Explain why.
+
+For each MUST FIX and SHOULD FIX item, provide:
+1. Specific file and location
+2. What to change
+3. Why it matters
+
+If zero MUST FIX and zero SHOULD FIX items, explicitly state: 'No changes required. Ready to ship.'
+
+IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
+
+Write to /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-PARETO-{N}.md."
+    ]
+
+    critique_gate [
+        shape=hexagon,
+        label="Ship or implement changes?"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Phase 1: Orient → Plan → Interview
+    start -> orient
+    orient -> plan
+    plan -> interview
+    interview -> plan      [label="revise"]
+    interview -> breakdown  [label="approve"]
+
+    // Phase 2: Break Down → Review
+    breakdown -> review_breakdown
+    review_breakdown -> breakdown [label="revise"]
+    review_breakdown -> implement [label="approve"]
+
+    // Phase 3: Implement → Validate
+    implement -> validate
+
+    // Phase 4: Validate gates progress
+    validate -> critique_harsh [condition="outcome=success"]
+    validate -> plan           [condition="outcome=fail", label="Fix needed"]
+
+    // Phase 5: Critique pipeline → human decision
+    critique_harsh -> critique_pareto
+    critique_pareto -> critique_gate
+    critique_gate -> exit [label="ship it"]
+    critique_gate -> plan [label="implement changes"]
+}

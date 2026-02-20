@@ -71,6 +71,8 @@ Check for prior run artifacts:
 - If logs/validate/VALIDATION-RUN-*.md exists, read the latest — you are replanning to fix failures identified in that run. Focus the plan on addressing those specific failures.
 - If logs/critique/CRITIQUE-PARETO-*.md exists, read the latest — incorporate MUST FIX and SHOULD FIX items.
 
+Check for human steering: read the most recent gates/*/answer.json file. If the human selected 'revise' and provided text, their steering MUST be incorporated into this plan. Treat human steering as the highest-priority input — it overrides prior plan decisions.
+
 Create a high-level implementation plan for: $goal
 
 The plan must include:
@@ -109,6 +111,8 @@ Write the plan to logs/plan/PLAN-{N}.md where N is the next sequential number."
 
 If logs/implement/PROGRESS-*.md exists, read the latest. Commits marked DONE in the progress log should be EXCLUDED from this breakdown — they are already implemented. Only break down remaining work.
 
+Check for human steering: read the most recent gates/*/answer.json file. If the human selected 'revise' and provided text, incorporate their feedback into this breakdown. Their steering may request adding, removing, reordering, or modifying work items.
+
 Break the implementation into single-commit chunks. Each commit must:
 1. Be independently buildable — the project compiles after this commit
 2. Be independently testable — there is a way to verify this commit works
@@ -116,7 +120,7 @@ Break the implementation into single-commit chunks. Each commit must:
 4. List the exact files to create or modify
 5. Include a QA plan:
    - Build verification command
-   - Specific tests to run or write
+   - Specific tests to run — prefer targeted/per-suite test commands over running the full test suite, which may be slow or unstable
    - Manual verification steps if applicable
 
 Review the breakdown against the plan:
@@ -156,8 +160,8 @@ If logs/implement/PROGRESS-*.md exists, read the latest. Skip any commits marked
 For each commit in the breakdown:
 1. Read the commit description, file list, and QA plan
 2. Implement the code changes
-3. Run the QA plan from the breakdown (build, test, verify)
-4. If the QA plan fails, fix the issue before moving on
+3. Run the QA plan from the breakdown (build, test, verify). Prefer targeted/per-suite test commands over running the full test suite — full suite runs may crash or timeout due to resource exhaustion without indicating a real code problem.
+4. Mark DONE if the build passes and relevant tests pass. Mark FAILED only for genuine build or test failures. If the full test suite crashes but targeted tests pass, the commit is DONE — do NOT revert it.
 5. IMMEDIATELY after each commit, append its status to the progress log
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
@@ -316,6 +320,7 @@ Write to logs/critique/CRITIQUE-PARETO-{N}.md where N matches the CRITIQUE-HARSH
     // Phase 2: Break Down → Review
     breakdown -> review_breakdown
     review_breakdown -> breakdown [label="revise"]
+    review_breakdown -> plan      [label="revise plan"]
     review_breakdown -> implement [label="approve"]
 
     // Phase 3: Implement → Validate

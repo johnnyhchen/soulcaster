@@ -1,0 +1,47 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Validate the attractor pipeline by having Codex 5.2 return hello world and write it to a file."
+    label = "Codex Hello World Validation"
+    default_max_retry = 1
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"openai\"; model = \"codex-5.2\"; reasoning_effort = \"high\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box, timeout="120s"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  SINGLE NODE: Ping Codex 5.2
+    //  Asks Codex to write "Hello, World!" to a file as a smoke test.
+    //
+    //  Artifacts:
+    //    logs/ping_codex/response.md — raw LLM response
+    //    hello-world.txt             — written by Codex via shell tool
+    // ═══════════════════════════════════════════════════════════════════
+
+    ping_codex [
+        label="Ping Codex 5.2: Hello World",
+        prompt="You are a smoke-test agent validating that the attractor pipeline can reach Codex 5.2.
+
+Do the following:
+1. Write the text 'Hello, World!' to a file at hello-world.txt in the current working directory.
+2. Read the file back and confirm its contents.
+3. Print a short confirmation message: 'Codex 5.2 smoke test passed.'
+
+That is all. Do not do anything else."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+    start -> ping_codex
+    ping_codex -> exit
+}
