@@ -83,18 +83,25 @@ public class CodergenHandler : INodeHandler
     private static string BuildPreamble(GraphNode node, Graph graph, string logsRoot)
     {
         // logsRoot is the absolute path to the logs/ directory.
-        // The agent's working directory is its parent (the run output root).
+        // outputRoot = logs parent = the run output directory (e.g. dotfiles/output/run-name).
         var outputRoot = Path.GetFullPath(Path.Combine(logsRoot, ".."));
+
+        // Project root: dotfile lives at {project}/dotfiles/{name}.dot,
+        // so output is at {project}/dotfiles/output/{run}. Going up three
+        // levels from logsRoot (logs → output/run → output → dotfiles → project).
+        var projectRoot = Path.GetFullPath(Path.Combine(logsRoot, "..", "..", "..", ".."));
 
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("[PIPELINE CONTEXT]");
         sb.AppendLine($"You are executing node \"{node.Id}\" in pipeline \"{graph.Name}\".");
         sb.AppendLine();
-        sb.AppendLine("Your working directory (CWD) is:");
-        sb.AppendLine($"  {outputRoot}");
+        sb.AppendLine("Your working directory (CWD) is the project root:");
+        sb.AppendLine($"  {projectRoot}");
         sb.AppendLine();
-        sb.AppendLine("Artifact directory layout (relative to CWD):");
-        sb.AppendLine("  logs/                          <- all pipeline artifacts");
+        sb.AppendLine("Pipeline artifacts are stored at:");
+        sb.AppendLine($"  {logsRoot}/");
+        sb.AppendLine();
+        sb.AppendLine("Artifact directory layout:");
 
         // List each node that has a logs subdirectory, marking which exist
         foreach (var n in graph.Nodes.Values.OrderBy(n => n.Id))
@@ -107,12 +114,12 @@ public class CodergenHandler : INodeHandler
             var nodeDir = Path.Combine(logsRoot, n.Id);
             var exists = Directory.Exists(nodeDir);
             var marker = exists ? "(exists)" : "(not yet created)";
-            sb.AppendLine($"  logs/{n.Id,-25} {marker}");
+            sb.AppendLine($"  {logsRoot}/{n.Id,-25} {marker}");
         }
 
         sb.AppendLine();
-        sb.AppendLine("Use RELATIVE paths (e.g. logs/breakdown/BREAKDOWN-1.md) to read/write artifacts.");
-        sb.AppendLine("Do NOT hardcode absolute paths for pipeline artifacts.");
+        sb.AppendLine("Use ABSOLUTE paths when reading/writing pipeline artifacts.");
+        sb.AppendLine("Source code files can use paths relative to the project root (your CWD).");
         sb.AppendLine("[/PIPELINE CONTEXT]");
         sb.AppendLine();
 

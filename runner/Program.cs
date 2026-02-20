@@ -2119,6 +2119,10 @@ static async Task<int> RunPipeline(string[] args)
     var workingDir = Path.Combine(Path.GetDirectoryName(dotFilePath)!, "output", dotName);
     Directory.CreateDirectory(workingDir);
 
+    // Convention: dotfile lives at {project}/dotfiles/{name}.dot,
+    // so the project root is the dotfile directory's parent.
+    var projectRoot = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(dotFilePath)!, ".."));
+
     var logsDir = Path.Combine(workingDir, "logs");
     Directory.CreateDirectory(logsDir);
 
@@ -2128,6 +2132,7 @@ static async Task<int> RunPipeline(string[] args)
     RegisterRun(dotFilePath, workingDir);
 
     Console.WriteLine($"Pipeline:    {dotFilePath}");
+    Console.WriteLine($"Project root:{projectRoot}");
     Console.WriteLine($"Working dir: {workingDir}");
     Console.WriteLine($"Logs dir:    {logsDir}");
     Console.WriteLine($"Gates dir:   {gatesDir}");
@@ -2142,7 +2147,7 @@ static async Task<int> RunPipeline(string[] args)
     Console.WriteLine($"Edges: {graph.Edges.Count}");
     Console.WriteLine();
 
-    var backend = new AgentCodergenBackend(workingDir);
+    var backend = new AgentCodergenBackend(workingDir, projectRoot);
 
     var config = new PipelineConfig(
         LogsRoot: logsDir,
@@ -2217,10 +2222,12 @@ static int ShowHelp()
 class AgentCodergenBackend : ICodergenBackend
 {
     private readonly string _workingDir;
+    private readonly string _projectRoot;
 
-    public AgentCodergenBackend(string workingDir)
+    public AgentCodergenBackend(string workingDir, string projectRoot)
     {
         _workingDir = workingDir;
+        _projectRoot = projectRoot;
     }
 
     public async Task<CodergenResult> RunAsync(
@@ -2263,7 +2270,7 @@ class AgentCodergenBackend : ICodergenBackend
         }
 
         // Create execution environment and session
-        var env = new LocalExecutionEnvironment(_workingDir);
+        var env = new LocalExecutionEnvironment(_projectRoot);
         var sessionConfig = new SessionConfig(
             MaxTurns: 200,
             MaxToolRoundsPerInput: 300,
