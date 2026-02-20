@@ -126,6 +126,13 @@ public sealed class Client
     /// </summary>
     internal IProviderAdapter GetProviderForRequest(Request request)
     {
+        // Resolve model alias (e.g. "codex-5.2" → "gpt-5.2-codex") via catalog
+        var resolvedModel = ResolveModelAlias(request.Model);
+        if (resolvedModel != request.Model)
+        {
+            request = request with { Model = resolvedModel };
+        }
+
         var providerName = request.Provider;
 
         // If no provider specified, try to infer from model name
@@ -148,6 +155,17 @@ public sealed class Client
     }
 
     /// <summary>
+    /// Resolves a model alias to its canonical ID via the ModelCatalog.
+    /// Returns the original model string if no alias match is found.
+    /// </summary>
+    public static string ResolveModelAlias(string model)
+    {
+        if (string.IsNullOrEmpty(model)) return model;
+        var info = ModelCatalog.GetModelInfo(model);
+        return info?.Id ?? model;
+    }
+
+    /// <summary>
     /// Attempts to infer the provider from the model name.
     /// </summary>
     private string? InferProviderFromModel(string model)
@@ -161,7 +179,7 @@ public sealed class Client
             return "anthropic";
 
         // OpenAI models
-        if ((lower.StartsWith("gpt") || lower.StartsWith("o1") || lower.StartsWith("o3") || lower.StartsWith("o4"))
+        if ((lower.StartsWith("gpt") || lower.StartsWith("o1") || lower.StartsWith("o3") || lower.StartsWith("o4") || lower.StartsWith("codex"))
             && _providers.ContainsKey("openai"))
             return "openai";
 

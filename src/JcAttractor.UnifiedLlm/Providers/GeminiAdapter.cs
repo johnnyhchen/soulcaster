@@ -20,7 +20,7 @@ public sealed class GeminiAdapter : IProviderAdapter
     {
         _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
         _baseUrl = baseUrl.TrimEnd('/');
-        _http = httpClient ?? new HttpClient();
+        _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
     }
 
     // ── CompleteAsync ──────────────────────────────────────────────────
