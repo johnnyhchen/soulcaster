@@ -13,6 +13,10 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
   <!-- Exclude agent-generated output files from compilation -->
   <ItemGroup>
     <Compile Remove="output/**" />
