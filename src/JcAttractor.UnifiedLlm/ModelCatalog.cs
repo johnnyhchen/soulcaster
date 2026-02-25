@@ -22,6 +22,19 @@ public static class ModelCatalog
             Aliases: ["claude-opus-4-6-20250617"]),
 
         new ModelInfo(
+            Id: "claude-sonnet-4-6",
+            Provider: "anthropic",
+            DisplayName: "Claude Sonnet 4.6",
+            ContextWindow: 200_000,
+            MaxOutput: 16_384,
+            SupportsTools: true,
+            SupportsVision: true,
+            SupportsReasoning: true,
+            InputCostPerMillion: 3.00m,
+            OutputCostPerMillion: 15.00m,
+            Aliases: ["claude-sonnet-4-6-20250514"]),
+
+        new ModelInfo(
             Id: "claude-sonnet-4-5-20250514",
             Provider: "anthropic",
             DisplayName: "Claude Sonnet 4.5",
@@ -33,6 +46,19 @@ public static class ModelCatalog
             InputCostPerMillion: 3.00m,
             OutputCostPerMillion: 15.00m,
             Aliases: ["claude-sonnet-4-5-latest"]),
+
+        new ModelInfo(
+            Id: "claude-haiku-4-5",
+            Provider: "anthropic",
+            DisplayName: "Claude Haiku 4.5",
+            ContextWindow: 200_000,
+            MaxOutput: 8_192,
+            SupportsTools: true,
+            SupportsVision: true,
+            SupportsReasoning: false,
+            InputCostPerMillion: 0.80m,
+            OutputCostPerMillion: 4.00m,
+            Aliases: ["claude-haiku-4-5-20251001"]),
 
         // ── OpenAI ─────────────────────────────────────────────────────
         new ModelInfo(
@@ -73,6 +99,19 @@ public static class ModelCatalog
             InputCostPerMillion: 10.00m,
             OutputCostPerMillion: 30.00m,
             Aliases: ["codex-5.2"]),
+
+        new ModelInfo(
+            Id: "codex-5.3",
+            Provider: "openai",
+            DisplayName: "Codex 5.3",
+            ContextWindow: 200_000,
+            MaxOutput: 32_768,
+            SupportsTools: true,
+            SupportsVision: true,
+            SupportsReasoning: true,
+            InputCostPerMillion: 10.00m,
+            OutputCostPerMillion: 30.00m,
+            Aliases: ["gpt-5.3-codex"]),
 
         // ── Google Gemini ──────────────────────────────────────────────
         new ModelInfo(

@@ -124,7 +124,7 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         return result.ToString().Trim();
     }
 
-    public Task<IReadOnlyList<string>> GlobAsync(string pattern, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> GlobAsync(string pattern, string? path = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
@@ -133,7 +133,7 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         try
         {
             // Determine search directory and file pattern from the glob
-            var searchDir = WorkingDirectory;
+            var searchDir = path is not null ? ResolvePath(path) : WorkingDirectory;
             var filePattern = pattern;
 
             // Handle patterns like "**/*.cs" or "src/**/*.cs"
@@ -185,19 +185,22 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         return Task.FromResult<IReadOnlyList<string>>(results);
     }
 
-    public async Task<IReadOnlyList<string>> GrepAsync(string pattern, string? path = null, CancellationToken ct = default)
+    public async Task<IReadOnlyList<string>> GrepAsync(string pattern, string? path = null, string? globFilter = null, bool caseInsensitive = false, int? maxResults = null, CancellationToken ct = default)
     {
         var searchPath = path is not null ? ResolvePath(path) : WorkingDirectory;
         var results = new List<string>();
-        var regex = new Regex(pattern, RegexOptions.Compiled, TimeSpan.FromSeconds(5));
+        var regexOptions = RegexOptions.Compiled;
+        if (caseInsensitive) regexOptions |= RegexOptions.IgnoreCase;
+        var regex = new Regex(pattern, regexOptions, TimeSpan.FromSeconds(5));
 
         if (File.Exists(searchPath))
         {
-            await SearchFileAsync(searchPath, regex, results, ct);
+            await SearchFileAsync(searchPath, regex, results, ct, maxResults);
         }
         else if (Directory.Exists(searchPath))
         {
-            var files = Directory.EnumerateFiles(searchPath, "*", SearchOption.AllDirectories);
+            var filePattern = globFilter ?? "*";
+            var files = Directory.EnumerateFiles(searchPath, filePattern, SearchOption.AllDirectories);
             foreach (var file in files)
             {
                 ct.ThrowIfCancellationRequested();
@@ -206,11 +209,63 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
                 if (IsBinaryExtension(file) || IsHiddenPath(file))
                     continue;
 
-                await SearchFileAsync(file, regex, results, ct);
+                await SearchFileAsync(file, regex, results, ct, maxResults);
+                if (maxResults.HasValue && results.Count >= maxResults.Value)
+                    break;
             }
         }
 
+        if (maxResults.HasValue && results.Count > maxResults.Value)
+            results.RemoveRange(maxResults.Value, results.Count - maxResults.Value);
+
         return results;
+    }
+
+    public Task<string> ListDirectoryAsync(string path, CancellationToken ct = default)
+    {
+        var fullPath = ResolvePath(path);
+        if (!Directory.Exists(fullPath))
+            return Task.FromResult($"Error: Directory not found: {fullPath}");
+
+        ct.ThrowIfCancellationRequested();
+        var sb = new StringBuilder();
+        sb.AppendLine($"Directory: {fullPath}");
+
+        foreach (var dir in Directory.EnumerateDirectories(fullPath).OrderBy(d => d))
+        {
+            ct.ThrowIfCancellationRequested();
+            sb.AppendLine($"  [DIR]  {Path.GetFileName(dir)}/");
+        }
+        foreach (var file in Directory.EnumerateFiles(fullPath).OrderBy(f => f))
+        {
+            ct.ThrowIfCancellationRequested();
+            var info = new FileInfo(file);
+            sb.AppendLine($"  [FILE] {Path.GetFileName(file)} ({info.Length} bytes)");
+        }
+
+        return Task.FromResult(sb.ToString());
+    }
+
+    public async Task<string> ReadManyFilesAsync(IReadOnlyList<string> paths, CancellationToken ct = default)
+    {
+        var sb = new StringBuilder();
+        foreach (var p in paths)
+        {
+            ct.ThrowIfCancellationRequested();
+            var fullPath = ResolvePath(p);
+            sb.AppendLine($"=== {fullPath} ===");
+            if (!File.Exists(fullPath))
+            {
+                sb.AppendLine("Error: File not found");
+            }
+            else
+            {
+                var content = await File.ReadAllTextAsync(fullPath, ct);
+                sb.AppendLine(content);
+            }
+            sb.AppendLine();
+        }
+        return sb.ToString();
     }
 
     public bool FileExists(string path)
@@ -254,7 +309,7 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         return "'" + arg.Replace("'", "'\"'\"'") + "'";
     }
 
-    private static async Task SearchFileAsync(string filePath, Regex regex, List<string> results, CancellationToken ct)
+    private static async Task SearchFileAsync(string filePath, Regex regex, List<string> results, CancellationToken ct, int? maxResults = null)
     {
         try
         {
@@ -262,6 +317,8 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
             for (var i = 0; i < lines.Length; i++)
             {
                 ct.ThrowIfCancellationRequested();
+                if (maxResults.HasValue && results.Count >= maxResults.Value)
+                    return;
                 if (regex.IsMatch(lines[i]))
                 {
                     results.Add($"{filePath}:{i + 1}:{lines[i]}");

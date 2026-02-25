@@ -1,0 +1,75 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Test multi-hop parallel branch execution with fan-in."
+    label = "QA Parallel Multi-Hop Test"
+    default_max_retry = 1
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PARALLEL: two branches, one has 2 hops (multi-hop)
+    // ═══════════════════════════════════════════════════════════════════
+    parallel_split [shape=component, label="Parallel Split"]
+
+    // Branch A: 2 hops (multi-hop)
+    branch_a_step1 [
+        label="Branch A Step 1",
+        prompt="Write 'Branch A Step 1 done' to logs/parallel_test/BRANCH-A-STEP1.md. That is all."
+    ]
+    branch_a_step2 [
+        label="Branch A Step 2",
+        prompt="Read logs/parallel_test/BRANCH-A-STEP1.md to verify step 1. Then write 'Branch A Step 2 done' to logs/parallel_test/BRANCH-A-STEP2.md. That is all."
+    ]
+
+    // Branch B: 1 hop
+    branch_b [
+        label="Branch B",
+        prompt="Write 'Branch B done' to logs/parallel_test/BRANCH-B.md. That is all."
+    ]
+
+    // Fan-in
+    merge [shape=tripleoctagon, label="Merge Results"]
+
+    // Verify node — reads all branch artifacts
+    verify [
+        label="Verify All Branches",
+        prompt="Check that these files exist and are non-empty:
+- logs/parallel_test/BRANCH-A-STEP1.md
+- logs/parallel_test/BRANCH-A-STEP2.md
+- logs/parallel_test/BRANCH-B.md
+
+Print 'All branches verified' if all exist. That is all."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+    start -> parallel_split
+
+    // Parallel fans out to both branches
+    parallel_split -> branch_a_step1
+    parallel_split -> branch_b
+
+    // Branch A: multi-hop (step1 → step2 → merge)
+    branch_a_step1 -> branch_a_step2
+    branch_a_step2 -> merge
+
+    // Branch B: single-hop (branch_b → merge)
+    branch_b -> merge
+
+    // After fan-in
+    merge -> verify
+    verify -> exit
+}

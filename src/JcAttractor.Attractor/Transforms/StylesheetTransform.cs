@@ -29,7 +29,7 @@ public class StylesheetTransform : IGraphTransform
             if (styleProps.TryGetValue("provider", out var provider) && string.IsNullOrEmpty(node.LlmProvider))
                 updated = updated with { LlmProvider = provider };
 
-            if (styleProps.TryGetValue("reasoning_effort", out var effort) && node.ReasoningEffort == "high")
+            if (styleProps.TryGetValue("reasoning_effort", out var effort) && string.IsNullOrEmpty(node.ReasoningEffort))
                 updated = updated with { ReasoningEffort = effort };
 
             if (styleProps.TryGetValue("fidelity", out var fidelity) && string.IsNullOrEmpty(node.Fidelity))

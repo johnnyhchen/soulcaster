@@ -15,4 +15,15 @@ public class PipelineContext
         foreach (var (k, v) in updates)
             _data[k] = v;
     }
+
+    /// <summary>
+    /// Creates an isolated clone of this context for parallel branch execution.
+    /// </summary>
+    public PipelineContext Clone()
+    {
+        var clone = new PipelineContext();
+        foreach (var (k, v) in _data)
+            clone._data[k] = v;
+        return clone;
+    }
 }

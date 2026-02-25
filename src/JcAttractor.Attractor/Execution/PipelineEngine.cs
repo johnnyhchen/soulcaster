@@ -55,15 +55,30 @@ public class PipelineEngine
         var completedNodes = new List<string>();
         var nodeOutcomes = new Dictionary<string, Outcome>();
         var retryCounts = new Dictionary<string, int>();
+        var startTime = DateTimeOffset.UtcNow;
 
-        // Set initial context from graph goal
+        // ── INITIALIZE phase ────────────────────────────────────────────
+        // Mirror all graph attributes into context
         if (!string.IsNullOrEmpty(graph.Goal))
             context.Set("goal", graph.Goal);
+        if (!string.IsNullOrEmpty(graph.Name))
+            context.Set("graph.name", graph.Name);
+        if (!string.IsNullOrEmpty(graph.ModelStylesheet))
+            context.Set("graph.model_stylesheet", "true");
+
+        // Mirror graph attributes
+        foreach (var (key, value) in graph.Attributes)
+            context.Set($"graph.{key}", value);
+
+        // Explicitly create the run directory structure
+        Directory.CreateDirectory(_config.LogsRoot);
 
         // Try to resume from checkpoint
         var checkpoint = Checkpoint.Load(_config.LogsRoot);
+        var isResuming = false;
         if (checkpoint != null)
         {
+            isResuming = true;
             completedNodes.AddRange(checkpoint.CompletedNodes);
             context.MergeUpdates(checkpoint.ContextData.ToDictionary(kv => kv.Key, kv => kv.Value));
             foreach (var (k, v) in checkpoint.RetryCounts)
@@ -130,6 +145,12 @@ public class PipelineEngine
                 var exitOutcome = await exitHandler.ExecuteAsync(currentNode, context, graph, _config.LogsRoot, ct);
                 completedNodes.Add(currentNodeId);
                 nodeOutcomes[currentNodeId] = exitOutcome;
+
+                // ── FINALIZE phase ──────────────────────────────────────
+                var duration = DateTimeOffset.UtcNow - startTime;
+                context.Set("pipeline.duration_ms", ((long)duration.TotalMilliseconds).ToString());
+                context.Set("pipeline.nodes_executed", completedNodes.Count.ToString());
+                context.Set("pipeline.status", "success");
                 SaveCheckpoint(currentNodeId, completedNodes, context, retryCounts);
 
                 return new PipelineResult(
@@ -138,6 +159,18 @@ public class PipelineEngine
                     NodeOutcomes: nodeOutcomes,
                     FinalContext: context
                 );
+            }
+
+            // Fidelity degradation on resume: if resuming and this is the first node,
+            // degrade fidelity from "full" to "summary:high"
+            if (isResuming)
+            {
+                isResuming = false; // Only degrade for the first resumed node
+                if (string.IsNullOrEmpty(currentNode.Fidelity) || currentNode.Fidelity == "full")
+                {
+                    graph.Nodes[currentNodeId] = currentNode with { Fidelity = "summary:high" };
+                    currentNode = graph.Nodes[currentNodeId];
+                }
             }
 
             // Step 2: Execute handler with retry policy

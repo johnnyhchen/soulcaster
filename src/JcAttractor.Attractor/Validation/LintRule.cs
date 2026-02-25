@@ -18,6 +18,9 @@ public static class Validator
         ValidateEdgesReferenceValidNodes(graph, results);
         ValidateCodergenNodesHavePrompt(graph, results);
         ValidateConditionExpressions(graph, results);
+        ValidateStuckNodes(graph, results);
+        ValidateParallelWithoutFanIn(graph, results);
+        ValidateGoalGateWithoutRetryTarget(graph, results);
 
         return results;
     }
@@ -208,6 +211,60 @@ public static class Validator
             {
                 results.Add(new LintResult("condition_syntax", LintSeverity.Error, null, edgeId,
                     $"Edge {edgeId} has unparseable condition '{edge.Condition}': {ex.Message}"));
+            }
+        }
+    }
+
+    private static void ValidateStuckNodes(Graph graph, List<LintResult> results)
+    {
+        foreach (var node in graph.Nodes.Values)
+        {
+            // Skip terminal nodes
+            if (node.Shape.Equals("Msquare", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var outgoing = graph.Edges.Where(e => e.FromNode == node.Id).ToList();
+            if (outgoing.Count == 0)
+            {
+                results.Add(new LintResult("stuck_node", LintSeverity.Warning, node.Id, null,
+                    $"Non-terminal node '{node.Id}' has no outgoing edges and may cause the pipeline to get stuck."));
+            }
+        }
+    }
+
+    private static void ValidateParallelWithoutFanIn(Graph graph, List<LintResult> results)
+    {
+        var parallelNodes = graph.Nodes.Values
+            .Where(n => n.Shape.Equals("component", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var hasFanIn = graph.Nodes.Values
+            .Any(n => n.Shape.Equals("tripleoctagon", StringComparison.OrdinalIgnoreCase));
+
+        foreach (var parallel in parallelNodes)
+        {
+            if (!hasFanIn)
+            {
+                results.Add(new LintResult("parallel_no_fan_in", LintSeverity.Warning, parallel.Id, null,
+                    $"Parallel node '{parallel.Id}' has no corresponding fan-in node (shape=tripleoctagon) to collect results."));
+            }
+        }
+    }
+
+    private static void ValidateGoalGateWithoutRetryTarget(Graph graph, List<LintResult> results)
+    {
+        var goalGateNodes = graph.Nodes.Values.Where(n => n.GoalGate).ToList();
+        foreach (var gate in goalGateNodes)
+        {
+            var hasRetryTarget = !string.IsNullOrEmpty(gate.RetryTarget)
+                || !string.IsNullOrEmpty(gate.FallbackRetryTarget)
+                || !string.IsNullOrEmpty(graph.RetryTarget)
+                || !string.IsNullOrEmpty(graph.FallbackRetryTarget);
+
+            if (!hasRetryTarget)
+            {
+                results.Add(new LintResult("goal_gate_no_retry", LintSeverity.Warning, gate.Id, null,
+                    $"Goal gate node '{gate.Id}' has no retry_target or fallback_retry_target. Pipeline will fail if this gate is unsatisfied."));
             }
         }
     }

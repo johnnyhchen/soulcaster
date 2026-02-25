@@ -7,15 +7,18 @@ public class ToolHandler : INodeHandler
 {
     public async Task<Outcome> ExecuteAsync(GraphNode node, PipelineContext context, Graph graph, string logsRoot, CancellationToken ct = default)
     {
+        // Spec §4.10: primary attribute is tool_command, with command and tool as fallbacks
+        string toolCommand = node.RawAttributes.GetValueOrDefault("tool_command", "");
         string command = node.RawAttributes.GetValueOrDefault("command", "");
         string tool = node.RawAttributes.GetValueOrDefault("tool", "");
 
-        if (string.IsNullOrWhiteSpace(command) && string.IsNullOrWhiteSpace(tool))
+        if (string.IsNullOrWhiteSpace(toolCommand) && string.IsNullOrWhiteSpace(command) && string.IsNullOrWhiteSpace(tool))
         {
-            return new Outcome(OutcomeStatus.Fail, Notes: $"Tool node '{node.Id}' has no command or tool attribute.");
+            return new Outcome(OutcomeStatus.Fail, Notes: $"Tool node '{node.Id}' has no tool_command, command, or tool attribute.");
         }
 
-        string executable = !string.IsNullOrWhiteSpace(command) ? command : tool;
+        string executable = !string.IsNullOrWhiteSpace(toolCommand) ? toolCommand
+            : !string.IsNullOrWhiteSpace(command) ? command : tool;
 
         // Expand variables in command
         executable = executable.Replace("$goal", graph.Goal);
@@ -27,6 +30,19 @@ public class ToolHandler : INodeHandler
         // Create stage directory
         string stageDir = Path.Combine(logsRoot, node.Id);
         Directory.CreateDirectory(stageDir);
+
+        // Determine effective cancellation token (with timeout if specified)
+        int? timeoutMs = node.RawAttributes.TryGetValue("timeout", out var timeoutStr) && int.TryParse(timeoutStr, out var t) ? t : null;
+        CancellationTokenSource? timeoutCts = null;
+        CancellationTokenSource? linkedCts = null;
+        var effectiveCt = ct;
+
+        if (timeoutMs.HasValue)
+        {
+            timeoutCts = new CancellationTokenSource(timeoutMs.Value);
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+            effectiveCt = linkedCts.Token;
+        }
 
         try
         {
@@ -40,13 +56,20 @@ public class ToolHandler : INodeHandler
                 CreateNoWindow = true
             };
 
+            // Strip sensitive environment variables from the process
+            var sensitivePatterns = new[] { "_API_KEY", "_SECRET", "_TOKEN", "_PASSWORD" };
+            foreach (var envKey in Environment.GetEnvironmentVariables().Keys.Cast<string>())
+            {
+                if (sensitivePatterns.Any(p => envKey.EndsWith(p, StringComparison.OrdinalIgnoreCase)))
+                    psi.Environment[envKey] = "";
+            }
+
             using var process = new Process { StartInfo = psi };
             process.Start();
 
-            var stdout = await process.StandardOutput.ReadToEndAsync(ct);
-            var stderr = await process.StandardError.ReadToEndAsync(ct);
-
-            await process.WaitForExitAsync(ct);
+            var stdout = await process.StandardOutput.ReadToEndAsync(effectiveCt);
+            var stderr = await process.StandardError.ReadToEndAsync(effectiveCt);
+            await process.WaitForExitAsync(effectiveCt);
 
             int exitCode = process.ExitCode;
             var status = exitCode == 0 ? OutcomeStatus.Success : OutcomeStatus.Fail;
@@ -80,9 +103,22 @@ public class ToolHandler : INodeHandler
                 Notes: $"Tool node '{node.Id}' exited with code {exitCode}."
             );
         }
+        catch (OperationCanceledException) when (timeoutCts is not null && !ct.IsCancellationRequested)
+        {
+            return new Outcome(OutcomeStatus.Fail, Notes: $"Tool node '{node.Id}' timed out after {timeoutMs}ms.");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             return new Outcome(OutcomeStatus.Fail, Notes: $"Tool node '{node.Id}' failed: {ex.Message}");
+        }
+        finally
+        {
+            linkedCts?.Dispose();
+            timeoutCts?.Dispose();
         }
     }
 }

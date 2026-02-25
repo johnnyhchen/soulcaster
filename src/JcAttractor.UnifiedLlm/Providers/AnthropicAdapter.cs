@@ -320,6 +320,28 @@ public sealed class AnthropicAdapter : IProviderAdapter
             body["system"] = sysArray;
         }
 
+        // Add cache_control breakpoint on the last tool-result message
+        // to maximize prompt caching for agentic multi-turn conversations
+        if (messages.Count > 0)
+        {
+            for (var idx = messages.Count - 1; idx >= 0; idx--)
+            {
+                var msgNode = messages[idx]?.AsObject();
+                if (msgNode is null) continue;
+
+                var contentNode = msgNode["content"];
+                if (contentNode is JsonArray arr && arr.Count > 0)
+                {
+                    var lastBlock = arr[arr.Count - 1]?.AsObject();
+                    if (lastBlock is not null && lastBlock["type"]?.GetValue<string>() == "tool_result")
+                    {
+                        lastBlock["cache_control"] = new JsonObject { ["type"] = "ephemeral" };
+                        break;
+                    }
+                }
+            }
+        }
+
         body["messages"] = messages;
 
         // Tools

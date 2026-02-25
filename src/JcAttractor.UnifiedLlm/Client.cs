@@ -110,12 +110,46 @@ public sealed class Client
 
     /// <summary>
     /// Streams a completion from the appropriate provider.
-    /// Middleware is not applied to streaming (middleware wraps the non-streaming path).
+    /// Middleware is applied around the stream initiation — each middleware
+    /// can transform the request before it reaches the provider.
     /// </summary>
-    public IAsyncEnumerable<StreamEvent> StreamAsync(Request request, CancellationToken ct = default)
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(
+        Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var provider = GetProviderForRequest(request);
-        return provider.StreamAsync(request, ct);
+
+        // Apply middleware to transform the request (middleware can't wrap individual stream events,
+        // but can pre/post-process the request itself)
+        var effectiveRequest = request;
+        if (_middleware is not null)
+        {
+            // Build a middleware chain that captures the final request
+            Request? transformedRequest = null;
+            Func<Request, Task<Response>> captureHandler = req =>
+            {
+                transformedRequest = req;
+                // Return a dummy response — we only care about the request transformation
+                return Task.FromResult(new Response("", "", "", Message.AssistantMsg(""), FinishReason.Stop, Usage.Empty));
+            };
+
+            var handler = captureHandler;
+            for (var i = _middleware.Count - 1; i >= 0; i--)
+            {
+                var mw = _middleware[i];
+                var next = handler;
+                handler = req => mw(req, next);
+            }
+
+            await handler(request).ConfigureAwait(false);
+            if (transformedRequest is not null)
+                effectiveRequest = transformedRequest;
+        }
+
+        await foreach (var evt in provider.StreamAsync(effectiveRequest, ct).ConfigureAwait(false))
+        {
+            yield return evt;
+        }
     }
 
     // ── Provider resolution ────────────────────────────────────────────

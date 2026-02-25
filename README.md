@@ -198,8 +198,10 @@ Then assign classes to nodes: `my_node [class="opus", prompt="..."]`
 |----|----------|----------|
 | `claude-opus-4-6` | Anthropic | Planning, architecture, complex reasoning |
 | `claude-sonnet-4-6` | Anthropic | General purpose (default) |
+| `claude-haiku-4-5` | Anthropic | Fast, lightweight tasks |
 | `gpt-5.2` | OpenAI | General reasoning, critique |
 | `gpt-5.2-codex` / `codex-5.2` | OpenAI | Agentic coding, implementation |
+| `codex-5.3` / `gpt-5.3-codex` | OpenAI | Latest agentic coding model |
 | `gpt-5.2-mini` | OpenAI | Fast, lightweight tasks |
 | `gemini-3.0-pro-preview` | Google | Large context (1M tokens) |
 

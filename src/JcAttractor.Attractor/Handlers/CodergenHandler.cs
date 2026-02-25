@@ -7,7 +7,12 @@ public interface ICodergenBackend
     Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default);
 }
 
-public record CodergenResult(string Response, OutcomeStatus Status, Dictionary<string, string>? ContextUpdates = null);
+public record CodergenResult(
+    string Response,
+    OutcomeStatus Status,
+    Dictionary<string, string>? ContextUpdates = null,
+    string? PreferredLabel = null,
+    List<string>? SuggestedNextIds = null);
 
 public class CodergenHandler : INodeHandler
 {
@@ -55,9 +60,11 @@ public class CodergenHandler : INodeHandler
         // Write response
         await File.WriteAllTextAsync(Path.Combine(stageDir, "response.md"), result.Response, ct);
 
-        // Build outcome
+        // Build outcome — forward preferred_label and suggested_next_ids from backend
         var outcome = new Outcome(
             Status: result.Status,
+            PreferredLabel: result.PreferredLabel ?? "",
+            SuggestedNextIds: result.SuggestedNextIds,
             ContextUpdates: result.ContextUpdates,
             Notes: $"Codergen node '{node.Id}' completed with status {result.Status}."
         );

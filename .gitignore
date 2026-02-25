@@ -5,4 +5,8 @@ obj/
 *.suo
 **/output/
 *.svg
+qa-results/
+logs/
+.claude/ralph-loop.local.md
+.claude/plans/
 

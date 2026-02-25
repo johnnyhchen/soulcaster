@@ -1,0 +1,50 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Write a haiku about code quality to validate the attractor pipeline end-to-end."
+    label = "QA Smoke Test"
+    default_max_retry = 1
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  NODE 1: Write a haiku
+    //  Artifacts: logs/write_haiku/response.md
+    // ═══════════════════════════════════════════════════════════════════
+    write_haiku [
+        label="Write Haiku",
+        prompt="Write a haiku about code quality. Save it to a file at logs/smoke/HAIKU-1.md in the pipeline output directory.
+
+That is all. Do not do anything else."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  NODE 2: Verify the haiku
+    //  Reads the artifact from node 1 to test inter-node continuity.
+    //  Artifacts: logs/verify_haiku/response.md
+    // ═══════════════════════════════════════════════════════════════════
+    verify_haiku [
+        label="Verify Haiku",
+        prompt="Read the file at logs/smoke/HAIKU-1.md and confirm it contains a haiku (a three-line poem). Print 'Verification passed' if valid, or 'Verification failed' if not.
+
+That is all. Do not do anything else."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+    start -> write_haiku
+    write_haiku -> verify_haiku
+    verify_haiku -> exit
+}

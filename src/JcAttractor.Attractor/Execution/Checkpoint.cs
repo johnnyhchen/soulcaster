@@ -6,14 +6,17 @@ public record Checkpoint(
     string CurrentNodeId,
     List<string> CompletedNodes,
     Dictionary<string, string> ContextData,
-    Dictionary<string, int> RetryCounts
+    Dictionary<string, int> RetryCounts,
+    DateTime? Timestamp = null,
+    List<string>? Logs = null
 )
 {
     public void Save(string logsRoot)
     {
         var path = Path.Combine(logsRoot, "checkpoint.json");
         Directory.CreateDirectory(logsRoot);
-        File.WriteAllText(path, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        var withTimestamp = this with { Timestamp = DateTime.UtcNow };
+        File.WriteAllText(path, JsonSerializer.Serialize(withTimestamp, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     public static Checkpoint? Load(string logsRoot)

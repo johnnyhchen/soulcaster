@@ -468,7 +468,8 @@ internal class FakeProfile : IProviderProfile
     public ToolRegistry ToolRegistry { get; } = new();
     public bool SupportsReasoning => false;
     public bool SupportsStreaming => false;
-    public bool SupportsParallelToolCalls => false;
+    public bool SupportsParallelToolCalls_Value { get; set; }
+    public bool SupportsParallelToolCalls => SupportsParallelToolCalls_Value;
     public int ContextWindowSize => 8000;
 
     public FakeProfile(IProviderAdapter adapter)
@@ -500,11 +501,17 @@ internal class FakeExecutionEnvironment : IExecutionEnvironment
     public Task<string> RunCommandAsync(string command, int? timeoutMs = null, CancellationToken ct = default)
         => Task.FromResult($"Output of: {command}");
 
-    public Task<IReadOnlyList<string>> GlobAsync(string pattern, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> GlobAsync(string pattern, string? path = null, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<string>>(new List<string> { "/fake/file1.cs", "/fake/file2.cs" });
 
-    public Task<IReadOnlyList<string>> GrepAsync(string pattern, string? path = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> GrepAsync(string pattern, string? path = null, string? globFilter = null, bool caseInsensitive = false, int? maxResults = null, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<string>>(new List<string> { "/fake/file1.cs:10:matching line" });
+
+    public Task<string> ListDirectoryAsync(string path, CancellationToken ct = default)
+        => Task.FromResult($"Directory: {path}\n  [DIR]  subdir/\n  [FILE] test.cs (100 bytes)");
+
+    public Task<string> ReadManyFilesAsync(IReadOnlyList<string> paths, CancellationToken ct = default)
+        => Task.FromResult(string.Join("\n", paths.Select(p => $"=== {p} ===\nContent of {p}\n")));
 
     public bool FileExists(string path) => true;
 
@@ -550,6 +557,504 @@ internal class LoopingProvider : IProviderAdapter
         yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "test" };
         await Task.CompletedTask;
     }
+}
+
+// ── Phase 1 Fixes ───────────────────────────────────────────────────────────
+
+public class SessionAbortTests
+{
+    [Fact]
+    public async Task Session_TransitionsToClosed_OnCancellation()
+    {
+        var cts = new CancellationTokenSource();
+        var provider = new SlowProvider();
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        cts.CancelAfter(TimeSpan.FromMilliseconds(200));
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => session.ProcessInputAsync("do something", cts.Token));
+
+        Assert.Equal(SessionState.Closed, session.State);
+    }
+}
+
+// ── Subagent Tests ──────────────────────────────────────────────────────────
+
+public class SubAgentTests
+{
+    [Fact]
+    public void SpawnSubagent_IncreasesDepth()
+    {
+        var provider = new FakeProvider("test");
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        var subagent = session.SpawnSubagent();
+
+        Assert.NotNull(subagent);
+        Assert.Equal(1, subagent.Depth);
+        Assert.Single(session.Subagents);
+    }
+
+    [Fact]
+    public void SpawnSubagent_ThrowsAtMaxDepth()
+    {
+        var provider = new FakeProvider("test");
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment())
+        { Depth = SubAgent.DefaultMaxDepth };
+
+        Assert.Throws<InvalidOperationException>(() => session.SpawnSubagent());
+    }
+
+    [Fact]
+    public void CloseSubagent_RemovesFromList()
+    {
+        var provider = new FakeProvider("test");
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        var subagent = session.SpawnSubagent();
+        Assert.Single(session.Subagents);
+
+        session.CloseSubagent(subagent.Id);
+        Assert.Empty(session.Subagents);
+    }
+
+    [Fact]
+    public void GetSubagent_FindsById()
+    {
+        var provider = new FakeProvider("test");
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        var subagent = session.SpawnSubagent();
+        var found = session.GetSubagent(subagent.Id);
+
+        Assert.NotNull(found);
+        Assert.Equal(subagent.Id, found!.Id);
+    }
+
+    [Fact]
+    public void GetSubagent_ReturnsNull_ForUnknownId()
+    {
+        var provider = new FakeProvider("test");
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        Assert.Null(session.GetSubagent("nonexistent"));
+    }
+}
+
+// ── Tool Parameter Tests ────────────────────────────────────────────────────
+
+public class ToolParameterTests
+{
+    [Fact]
+    public void AnthropicProfile_GrepHasGlobFilter()
+    {
+        var profile = new AnthropicProfile();
+        var grepTool = profile.Tools().First(t => t.Name == "grep");
+        Assert.Contains(grepTool.Parameters, p => p.Name == "glob_filter");
+        Assert.Contains(grepTool.Parameters, p => p.Name == "case_insensitive");
+        Assert.Contains(grepTool.Parameters, p => p.Name == "max_results");
+    }
+
+    [Fact]
+    public void AllProfiles_GlobHasPathParam()
+    {
+        var anthropic = new AnthropicProfile();
+        var openai = new OpenAiProfile();
+        var gemini = new GeminiProfile();
+
+        foreach (var profile in new IProviderProfile[] { anthropic, openai, gemini })
+        {
+            var globTool = profile.Tools().First(t => t.Name == "glob");
+            Assert.Contains(globTool.Parameters, p => p.Name == "path");
+        }
+    }
+
+    [Fact]
+    public void GeminiProfile_HasListDir()
+    {
+        var profile = new GeminiProfile();
+        Assert.Contains(profile.Tools(), t => t.Name == "list_dir");
+    }
+
+    [Fact]
+    public void GeminiProfile_HasReadManyFiles()
+    {
+        var profile = new GeminiProfile();
+        Assert.Contains(profile.Tools(), t => t.Name == "read_many_files");
+    }
+}
+
+// ── ProjectDocs Tests ───────────────────────────────────────────────────────
+
+public class ProjectDocsTests
+{
+    [Fact]
+    public void Discover_ReturnsEmpty_ForFakePath()
+    {
+        var docs = ProjectDocs.Discover("/nonexistent/path");
+        Assert.Empty(docs);
+    }
+
+    [Fact]
+    public void Discover_ReturnsEmpty_ForTempDir()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var docs = ProjectDocs.Discover(tempDir);
+            Assert.Empty(docs);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public void Discover_FindsClaudeMd()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        // Create a .git dir so it stops walking up
+        Directory.CreateDirectory(Path.Combine(tempDir, ".git"));
+        File.WriteAllText(Path.Combine(tempDir, "CLAUDE.md"), "# Project Instructions\nTest content");
+        try
+        {
+            var docs = ProjectDocs.Discover(tempDir);
+            Assert.Single(docs);
+            Assert.Contains("Test content", docs[0]);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+}
+
+// ── QA Plan Tests T1-T4, T17-T19 ────────────────────────────────────────────
+
+public class T1_GrepExecutionTests
+{
+    [Fact]
+    public async Task GrepAsync_GlobFilter_ExcludesNonMatchingFiles()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(Path.Combine(tempDir, "match.txt"), "hello world");
+        File.WriteAllText(Path.Combine(tempDir, "skip.cs"), "hello world");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var results = await env.GrepAsync("hello", globFilter: "*.txt");
+            Assert.Single(results);
+            Assert.Contains("match.txt", results[0]);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public async Task GrepAsync_CaseInsensitive_MatchesUpperCase()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(Path.Combine(tempDir, "test.txt"), "HELLO WORLD");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var sensitive = await env.GrepAsync("hello");
+            var insensitive = await env.GrepAsync("hello", caseInsensitive: true);
+            Assert.Empty(sensitive);
+            Assert.Single(insensitive);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public async Task GrepAsync_MaxResults_LimitsOutput()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(Path.Combine(tempDir, "test.txt"), "match1\nmatch2\nmatch3\nmatch4\nmatch5");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var all = await env.GrepAsync("match");
+            var limited = await env.GrepAsync("match", maxResults: 2);
+            Assert.Equal(5, all.Count);
+            Assert.Equal(2, limited.Count);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+}
+
+public class T2_GlobPathParamTests
+{
+    [Fact]
+    public async Task GlobAsync_PathParam_SearchesOnlySubdir()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        var subDir = Path.Combine(tempDir, "sub");
+        Directory.CreateDirectory(subDir);
+        File.WriteAllText(Path.Combine(tempDir, "root.txt"), "root");
+        File.WriteAllText(Path.Combine(subDir, "child.txt"), "child");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var subOnly = await env.GlobAsync("*.txt", path: subDir);
+            Assert.Single(subOnly);
+            Assert.Contains("child.txt", subOnly[0]);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public async Task GlobAsync_NoPath_DefaultsToWorkingDir()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(Path.Combine(tempDir, "file.txt"), "data");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var results = await env.GlobAsync("*.txt");
+            Assert.Single(results);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+}
+
+public class T3_ListDirTests
+{
+    [Fact]
+    public async Task ListDirectoryAsync_ShowsFilesAndDirs()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(tempDir, "subdir"));
+        File.WriteAllText(Path.Combine(tempDir, "file.txt"), "content");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var output = await env.ListDirectoryAsync(tempDir);
+            Assert.Contains("[DIR]", output);
+            Assert.Contains("subdir", output);
+            Assert.Contains("[FILE]", output);
+            Assert.Contains("file.txt", output);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public async Task ListDirectoryAsync_NonExistentPath_ReturnsError()
+    {
+        var env = new LocalExecutionEnvironment("/tmp");
+        var output = await env.ListDirectoryAsync("/nonexistent/path/xyz");
+        Assert.Contains("Error", output);
+    }
+}
+
+public class T4_ReadManyFilesTests
+{
+    [Fact]
+    public async Task ReadManyFilesAsync_ConcatenatesContents()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var f1 = Path.Combine(tempDir, "a.txt");
+        var f2 = Path.Combine(tempDir, "b.txt");
+        var f3 = Path.Combine(tempDir, "c.txt");
+        File.WriteAllText(f1, "content_a");
+        File.WriteAllText(f2, "content_b");
+        File.WriteAllText(f3, "content_c");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var output = await env.ReadManyFilesAsync(new List<string> { f1, f2, f3 });
+            Assert.Contains("content_a", output);
+            Assert.Contains("content_b", output);
+            Assert.Contains("content_c", output);
+            Assert.Contains("===", output); // Separator headers
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public async Task ReadManyFilesAsync_HandlesNonExistentFile()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var f1 = Path.Combine(tempDir, "exists.txt");
+        File.WriteAllText(f1, "real_content");
+        try
+        {
+            var env = new LocalExecutionEnvironment(tempDir);
+            var output = await env.ReadManyFilesAsync(new List<string> { f1, "/nonexistent.txt" });
+            Assert.Contains("real_content", output);
+            Assert.Contains("File not found", output);
+        }
+        finally { Directory.Delete(tempDir, true); }
+    }
+}
+
+public class T17_SessionParallelToolExecutionTests
+{
+    [Fact]
+    public async Task Session_ExecutesMultipleToolCalls()
+    {
+        var provider = new MultiToolProvider();
+        var profile = new FakeProfile(provider);
+        profile.SupportsParallelToolCalls_Value = true;
+
+        // Register a test tool
+        profile.ToolRegistry.Register(new RegisteredTool(
+            "test_tool",
+            new ToolDefinition("test_tool", "A test tool",
+                new List<ToolParameter>()),
+            async (args, env) => "tool_result"));
+
+        var session = new Session(provider, profile, new FakeExecutionEnvironment());
+        var result = await session.ProcessInputAsync("do work");
+
+        // The provider returns 3 tool calls, then a final response
+        Assert.Equal("all done", result.Content);
+        // History should contain tool results for all 3 calls
+        var toolResultTurns = session.History.OfType<ToolResultsTurn>().ToList();
+        Assert.Single(toolResultTurns);
+        Assert.Equal(3, toolResultTurns[0].Results.Count);
+    }
+}
+
+public class T18_SessionProviderOptionsTests
+{
+    [Fact]
+    public async Task Session_AttachesProviderOptions_ToRequest()
+    {
+        var provider = new CapturingProvider();
+        var profile = new OptionsProfile(provider);
+        var session = new Session(provider, profile, new FakeExecutionEnvironment());
+
+        await session.ProcessInputAsync("test");
+
+        Assert.NotNull(provider.LastRequest);
+        Assert.NotNull(provider.LastRequest!.ProviderOptions);
+        Assert.True(provider.LastRequest.ProviderOptions!.ContainsKey("custom_option"));
+        Assert.Equal("test_value", provider.LastRequest.ProviderOptions["custom_option"]);
+    }
+}
+
+public class T19_SubagentToolRegistrationTests
+{
+    [Fact]
+    public void AllProfiles_HaveSubagentTools_AfterRegistration()
+    {
+        var anthropic = new AnthropicProfile();
+        anthropic.RegisterSubagentTools();
+        var openai = new OpenAiProfile();
+        openai.RegisterSubagentTools();
+        var gemini = new GeminiProfile();
+        gemini.RegisterSubagentTools();
+
+        foreach (var profile in new IProviderProfile[] { anthropic, openai, gemini })
+        {
+            var tools = profile.Tools();
+            Assert.Contains(tools, t => t.Name == "spawn_agent");
+            Assert.Contains(tools, t => t.Name == "send_input");
+            Assert.Contains(tools, t => t.Name == "wait_agent");
+            Assert.Contains(tools, t => t.Name == "close_agent");
+        }
+    }
+}
+
+// ── T17-T18 test helpers ────────────────────────────────────────────────────
+
+internal class MultiToolProvider : IProviderAdapter
+{
+    public string Name => "multi";
+    private int _callCount;
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+    {
+        _callCount++;
+        if (_callCount == 1)
+        {
+            // Return 3 tool calls
+            var msg = new Message(Role.Assistant, new List<ContentPart>
+            {
+                ContentPart.TextPart("calling tools"),
+                ContentPart.ToolCallPart(new ToolCallData("tc1", "test_tool", "{}", "function")),
+                ContentPart.ToolCallPart(new ToolCallData("tc2", "test_tool", "{}", "function")),
+                ContentPart.ToolCallPart(new ToolCallData("tc3", "test_tool", "{}", "function"))
+            });
+            return Task.FromResult(new Response("id1", "model", "multi", msg, FinishReason.ToolCalls, Usage.Empty));
+        }
+        // Final response
+        return Task.FromResult(new Response("id2", "model", "multi",
+            Message.AssistantMsg("all done"), FinishReason.Stop, Usage.Empty));
+    }
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "test" };
+        await Task.CompletedTask;
+    }
+}
+
+internal class CapturingProvider : IProviderAdapter
+{
+    public string Name => "capturing";
+    public Request? LastRequest { get; private set; }
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+    {
+        LastRequest = request;
+        return Task.FromResult(new Response("id", "model", "capturing",
+            Message.AssistantMsg("captured"), FinishReason.Stop, Usage.Empty));
+    }
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "test" };
+        await Task.CompletedTask;
+    }
+}
+
+internal class OptionsProfile : IProviderProfile
+{
+    private readonly IProviderAdapter _adapter;
+    public string Id => "options";
+    public string Model { get; set; } = "test-model";
+    public ToolRegistry ToolRegistry { get; } = new();
+    public bool SupportsReasoning => false;
+    public bool SupportsStreaming => false;
+    public bool SupportsParallelToolCalls => false;
+    public int ContextWindowSize => 8000;
+
+    public OptionsProfile(IProviderAdapter adapter) { _adapter = adapter; }
+
+    public string BuildSystemPrompt(IExecutionEnvironment env, IReadOnlyList<string>? projectDocs = null) => "test";
+    public IReadOnlyList<ToolDefinition> Tools() => ToolRegistry.GetDefinitions();
+    public Dictionary<string, object>? ProviderOptions() => new() { ["custom_option"] = "test_value" };
 }
 
 internal class SlowProvider : IProviderAdapter

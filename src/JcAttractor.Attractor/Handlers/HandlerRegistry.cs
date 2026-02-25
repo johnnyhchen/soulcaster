@@ -13,8 +13,9 @@ public class HandlerRegistry
         _handlers["hexagon"] = new WaitHumanHandler(interviewer ?? new AutoApproveInterviewer());
         _handlers["diamond"] = new ConditionalHandler();
         _handlers["component"] = new ParallelHandler(this);
-        _handlers["tripleoctagon"] = new FanInHandler();
+        _handlers["tripleoctagon"] = new FanInHandler(backend);
         _handlers["parallelogram"] = new ToolHandler();
+        _handlers["house"] = new ManagerLoopHandler(backend);
     }
 
     public void Register(string shape, INodeHandler handler)
@@ -42,8 +43,8 @@ public class HandlerRegistry
         public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
         {
             return Task.FromResult(new CodergenResult(
-                Response: "No codergen backend configured.",
-                Status: OutcomeStatus.Fail
+                Response: "[Simulated] Response for codergen node. No backend configured.",
+                Status: OutcomeStatus.Success
             ));
         }
     }

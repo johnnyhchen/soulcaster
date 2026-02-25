@@ -412,7 +412,7 @@ public class ModelCatalogTests
     public void ListModels_ReturnsAllModels_WhenNoFilter()
     {
         var all = ModelCatalog.ListModels();
-        Assert.True(all.Count >= 7); // We have at least 7 models
+        Assert.True(all.Count >= 10); // We have at least 10 models
     }
 
     [Fact]
@@ -446,6 +446,23 @@ public class ModelCatalogTests
         Assert.NotNull(model);
         Assert.True(model.InputCostPerMillion > 0);
         Assert.True(model.OutputCostPerMillion > 0);
+    }
+
+    [Fact]
+    public void GetModelInfo_FindsCodex53_ById()
+    {
+        var info = ModelCatalog.GetModelInfo("codex-5.3");
+        Assert.NotNull(info);
+        Assert.Equal("openai", info.Provider);
+        Assert.Equal("Codex 5.3", info.DisplayName);
+    }
+
+    [Fact]
+    public void GetModelInfo_FindsCodex53_ByAlias()
+    {
+        var info = ModelCatalog.GetModelInfo("gpt-5.3-codex");
+        Assert.NotNull(info);
+        Assert.Equal("codex-5.3", info.Id);
     }
 }
 
@@ -588,3 +605,172 @@ internal class FakeProvider : IProviderAdapter
         await Task.CompletedTask;
     }
 }
+
+// ── QA Plan Tests T11, T12, T13 ────────────────────────────────────────────
+
+public class T11_StreamingMiddlewareTests
+{
+    [Fact]
+    public async Task StreamAsync_AppliesMiddleware_ToTransformRequest()
+    {
+        var capturingProvider = new ModelCapturingProvider();
+        var providers = new Dictionary<string, IProviderAdapter>
+        {
+            ["test"] = capturingProvider
+        };
+
+        // Middleware that transforms the model name
+        var middleware = new List<Func<Request, Func<Request, Task<Response>>, Task<Response>>>
+        {
+            async (req, next) =>
+            {
+                var modified = req with { Model = "transformed-model" };
+                return await next(modified);
+            }
+        };
+
+        var client = new Client(providers, middleware: middleware);
+
+        var request = new Request
+        {
+            Model = "original-model",
+            Messages = new List<Message> { Message.UserMsg("test") }
+        };
+
+        // Consume the stream
+        await foreach (var evt in client.StreamAsync(request))
+        {
+            // Just consume
+        }
+
+        // The provider should have received the transformed model
+        Assert.Equal("transformed-model", capturingProvider.LastReceivedModel);
+    }
+}
+
+public class T12_AnthropicCacheBreakpointTests
+{
+    [Fact]
+    public void AnthropicAdapter_AddsCacheBreakpoint_ToLastToolResult()
+    {
+        // We test this by creating an adapter and inspecting the request body via reflection
+        var adapter = new AnthropicAdapter("test-key");
+
+        // Build a request with tool results in history
+        var request = new Request
+        {
+            Model = "claude-sonnet-4-6",
+            Messages = new List<Message>
+            {
+                Message.SystemMsg("system prompt"),
+                Message.UserMsg("user message"),
+                new Message(Role.Assistant, new List<ContentPart>
+                {
+                    ContentPart.ToolCallPart(new ToolCallData("tc1", "tool1", "{}")),
+                }),
+                Message.ToolResultMsg("tc1", "first result", false),
+                new Message(Role.Assistant, new List<ContentPart>
+                {
+                    ContentPart.ToolCallPart(new ToolCallData("tc2", "tool2", "{}")),
+                }),
+                Message.ToolResultMsg("tc2", "second result", false),
+            }
+        };
+
+        // Use reflection to call the private BuildRequestBody method
+        var method = typeof(AnthropicAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        // Find the last tool_result message and check for cache_control
+        var messages = body!["messages"]!.AsArray();
+        System.Text.Json.Nodes.JsonObject? lastToolResult = null;
+        foreach (var msg in messages)
+        {
+            var content = msg?["content"]?.AsArray();
+            if (content is not null)
+            {
+                foreach (var block in content)
+                {
+                    if (block?["type"]?.GetValue<string>() == "tool_result")
+                        lastToolResult = block.AsObject();
+                }
+            }
+        }
+
+        Assert.NotNull(lastToolResult);
+        Assert.NotNull(lastToolResult!["cache_control"]);
+        Assert.Equal("ephemeral", lastToolResult["cache_control"]!["type"]!.GetValue<string>());
+    }
+}
+
+public class T13_ProviderOptionsPassThroughTests
+{
+    [Fact]
+    public void OpenAiAdapter_MergesProviderOptions_IntoBody()
+    {
+        var adapter = new OpenAiAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gpt-5.2",
+            Messages = new List<Message> { Message.UserMsg("test") },
+            ProviderOptions = new Dictionary<string, object> { ["store"] = true }
+        };
+
+        var method = typeof(OpenAiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+        Assert.True(body!.ContainsKey("store"));
+    }
+
+    [Fact]
+    public void GeminiAdapter_MergesProviderOptions_IntoBody()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gemini-2.5-pro",
+            Messages = new List<Message> { Message.UserMsg("test") },
+            ProviderOptions = new Dictionary<string, object> { ["customSetting"] = "value" }
+        };
+
+        var method = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+        Assert.True(body!.ContainsKey("customSetting"));
+    }
+}
+
+// ── T11 test helper ─────────────────────────────────────────────────────────
+
+internal class ModelCapturingProvider : IProviderAdapter
+{
+    public string Name => "capturing";
+    public string? LastReceivedModel { get; private set; }
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+    {
+        LastReceivedModel = request.Model;
+        return Task.FromResult(new Response("id", request.Model, Name,
+            Message.AssistantMsg("ok"), FinishReason.Stop, Usage.Empty));
+    }
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        LastReceivedModel = request.Model;
+        yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "ok" };
+        yield return new StreamEvent { Type = StreamEventType.Finish, FinishReason = FinishReason.Stop };
+        await Task.CompletedTask;
+    }
+}
+

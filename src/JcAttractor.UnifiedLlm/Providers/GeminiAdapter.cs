@@ -411,6 +411,8 @@ public sealed class GeminiAdapter : IProviderAdapter
                     var prop = new JsonObject { ["type"] = param.Type.ToUpperInvariant() };
                     if (param.Description is not null)
                         prop["description"] = param.Description;
+                    if (param.ItemsType is not null)
+                        prop["items"] = new JsonObject { ["type"] = param.ItemsType.ToUpperInvariant() };
                     properties[param.Name] = prop;
                     if (param.Required)
                         required.Add(param.Name);
@@ -462,6 +464,16 @@ public sealed class GeminiAdapter : IProviderAdapter
             }
 
             body["toolConfig"] = toolConfig;
+        }
+
+        // Provider options escape hatch — merge extra keys into the request body
+        if (request.ProviderOptions is not null)
+        {
+            foreach (var (key, value) in request.ProviderOptions)
+            {
+                if (body.ContainsKey(key)) continue; // Don't override existing keys
+                body[key] = JsonSerializer.SerializeToNode(value);
+            }
         }
 
         return body;

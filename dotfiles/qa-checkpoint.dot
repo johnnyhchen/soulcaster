@@ -1,0 +1,62 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Execute a 4-node pipeline to test checkpoint save and resume."
+    label = "QA Checkpoint Test"
+    default_max_retry = 1
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  4 sequential steps — each depends on the previous one.
+    //  The test harness will kill after step_b completes, then resume.
+    // ═══════════════════════════════════════════════════════════════════
+
+    step_a [
+        label="Step A",
+        prompt="Write the text 'Step A complete' to a file at logs/checkpoint_test/STEP-A.md.
+
+That is all."
+    ]
+
+    step_b [
+        label="Step B",
+        prompt="Read logs/checkpoint_test/STEP-A.md to verify Step A ran. Then write 'Step B complete' to logs/checkpoint_test/STEP-B.md.
+
+That is all."
+    ]
+
+    step_c [
+        label="Step C",
+        prompt="Read logs/checkpoint_test/STEP-B.md to verify Step B ran. Then write 'Step C complete' to logs/checkpoint_test/STEP-C.md.
+
+That is all."
+    ]
+
+    step_d [
+        label="Step D",
+        prompt="Read logs/checkpoint_test/STEP-C.md to verify Step C ran. Then write 'Step D complete - all steps finished' to logs/checkpoint_test/STEP-D.md.
+
+That is all."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+    start -> step_a
+    step_a -> step_b
+    step_b -> step_c
+    step_c -> step_d
+    step_d -> exit
+}

@@ -105,13 +105,15 @@ public class AnthropicProfile : IProviderProfile
                 "Finds files matching a glob pattern. Supports patterns like '**/*.cs' or 'src/**/*.ts'. Returns sorted list of matching file paths.",
                 new List<ToolParameter>
                 {
-                    new("pattern", "string", "The glob pattern to match files against", true)
+                    new("pattern", "string", "The glob pattern to match files against", true),
+                    new("path", "string", "Directory to search in (defaults to working directory)", false)
                 }),
             async (args, env) =>
             {
                 var json = JsonDocument.Parse(args);
                 var pattern = json.RootElement.GetProperty("pattern").GetString()!;
-                var results = await env.GlobAsync(pattern);
+                string? path = json.RootElement.TryGetProperty("path", out var p) ? p.GetString() : null;
+                var results = await env.GlobAsync(pattern, path);
                 return results.Count > 0 ? string.Join('\n', results) : "No files found matching pattern.";
             }));
 
@@ -123,14 +125,20 @@ public class AnthropicProfile : IProviderProfile
                 new List<ToolParameter>
                 {
                     new("pattern", "string", "The regex pattern to search for", true),
-                    new("path", "string", "File or directory to search in (defaults to working directory)", false)
+                    new("path", "string", "File or directory to search in (defaults to working directory)", false),
+                    new("glob_filter", "string", "File name glob to filter which files are searched (e.g. '*.cs')", false),
+                    new("case_insensitive", "boolean", "Whether to perform case-insensitive matching", false),
+                    new("max_results", "integer", "Maximum number of results to return", false)
                 }),
             async (args, env) =>
             {
                 var json = JsonDocument.Parse(args);
                 var pattern = json.RootElement.GetProperty("pattern").GetString()!;
                 string? path = json.RootElement.TryGetProperty("path", out var p) ? p.GetString() : null;
-                var results = await env.GrepAsync(pattern, path);
+                string? globFilter = json.RootElement.TryGetProperty("glob_filter", out var gf) ? gf.GetString() : null;
+                bool caseInsensitive = json.RootElement.TryGetProperty("case_insensitive", out var ci) && ci.GetBoolean();
+                int? maxResults = json.RootElement.TryGetProperty("max_results", out var mr) ? mr.GetInt32() : null;
+                var results = await env.GrepAsync(pattern, path, globFilter, caseInsensitive, maxResults);
                 return results.Count > 0 ? string.Join('\n', results) : "No matches found.";
             }));
     }
@@ -175,6 +183,8 @@ public class AnthropicProfile : IProviderProfile
 
         return sb.ToString();
     }
+
+    public void RegisterSubagentTools() => SubagentTools.Register(ToolRegistry);
 
     public IReadOnlyList<ToolDefinition> Tools() => ToolRegistry.GetDefinitions();
 

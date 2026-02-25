@@ -4,7 +4,8 @@ public record ToolParameter(
     string Name,
     string Type,
     string? Description,
-    bool Required);
+    bool Required,
+    string? ItemsType = null);
 
 public record ToolDefinition(
     string Name,

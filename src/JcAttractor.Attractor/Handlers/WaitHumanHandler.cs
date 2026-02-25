@@ -32,6 +32,34 @@ public class WaitHumanHandler : INodeHandler
 
         var answer = await _interviewer.AskAsync(question, ct);
 
+        // Handle timeout — check for default choice or return retry
+        if (answer.Status == AnswerStatus.Timeout)
+        {
+            var defaultChoice = node.RawAttributes.GetValueOrDefault("human.default_choice", "");
+            if (!string.IsNullOrWhiteSpace(defaultChoice))
+            {
+                return new Outcome(
+                    Status: OutcomeStatus.Success,
+                    PreferredLabel: defaultChoice,
+                    Notes: $"Human gate '{node.Id}' timed out, using default: {defaultChoice}"
+                );
+            }
+
+            return new Outcome(
+                Status: OutcomeStatus.Retry,
+                Notes: $"Human gate '{node.Id}' timed out with no default choice."
+            );
+        }
+
+        // Handle skip — return fail
+        if (answer.Status == AnswerStatus.Skipped)
+        {
+            return new Outcome(
+                Status: OutcomeStatus.Fail,
+                Notes: $"Human gate '{node.Id}' was skipped."
+            );
+        }
+
         return new Outcome(
             Status: OutcomeStatus.Success,
             PreferredLabel: answer.Text,

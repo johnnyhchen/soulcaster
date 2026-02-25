@@ -470,6 +470,16 @@ public sealed class OpenAiAdapter : IProviderAdapter
             body["metadata"] = meta;
         }
 
+        // Provider options escape hatch — merge extra keys into the request body
+        if (request.ProviderOptions is not null)
+        {
+            foreach (var (key, value) in request.ProviderOptions)
+            {
+                if (body.ContainsKey(key)) continue; // Don't override existing keys
+                body[key] = JsonSerializer.SerializeToNode(value);
+            }
+        }
+
         return body;
     }
 

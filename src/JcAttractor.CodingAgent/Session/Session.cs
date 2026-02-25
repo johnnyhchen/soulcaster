@@ -19,6 +19,7 @@ public class Session
     private readonly List<SubAgent> _subagents = new();
 
     public IReadOnlyList<SubAgent> Subagents => _subagents;
+    public int Depth { get; init; }
 
     public Session(
         IProviderAdapter llmClient,
@@ -31,6 +32,47 @@ public class Session
         ExecutionEnv = executionEnv;
         Config = config ?? new SessionConfig();
         EventEmitter.SessionId = Id;
+    }
+
+    /// <summary>
+    /// Spawns a child subagent with its own session.
+    /// </summary>
+    public SubAgent SpawnSubagent(string? model = null)
+    {
+        if (Depth >= SubAgent.DefaultMaxDepth)
+            throw new InvalidOperationException($"Max subagent depth ({SubAgent.DefaultMaxDepth}) reached.");
+
+        var childSession = new Session(
+            LlmClient,
+            ProviderProfile,
+            ExecutionEnv,
+            Config)
+        { Depth = Depth + 1 };
+
+        if (model is not null)
+            childSession.ProviderProfile.Model = model;
+
+        var subagent = new SubAgent(childSession, Depth + 1);
+        _subagents.Add(subagent);
+        return subagent;
+    }
+
+    /// <summary>
+    /// Gets a subagent by ID.
+    /// </summary>
+    public SubAgent? GetSubagent(string id) => _subagents.FirstOrDefault(s => s.Id == id);
+
+    /// <summary>
+    /// Closes and removes a subagent.
+    /// </summary>
+    public void CloseSubagent(string id)
+    {
+        var subagent = _subagents.FirstOrDefault(s => s.Id == id);
+        if (subagent is not null)
+        {
+            subagent.Close();
+            _subagents.Remove(subagent);
+        }
     }
 
     /// <summary>
@@ -115,7 +157,8 @@ public class Session
 
                 // Build messages and call LLM
                 var messages = ConvertHistoryToMessages();
-                var systemPrompt = ProviderProfile.BuildSystemPrompt(ExecutionEnv);
+                var projectDocs = ProjectDocs.Discover(ExecutionEnv.WorkingDirectory);
+                var systemPrompt = ProviderProfile.BuildSystemPrompt(ExecutionEnv, projectDocs.Count > 0 ? projectDocs : null);
 
                 var request = new Request
                 {
@@ -123,7 +166,8 @@ public class Session
                     Messages = messages,
                     Tools = ProviderProfile.Tools().ToList(),
                     ToolChoice = ToolChoice.Auto,
-                    ReasoningEffort = Config.ReasoningEffort
+                    ReasoningEffort = Config.ReasoningEffort,
+                    ProviderOptions = ProviderProfile.ProviderOptions()
                 };
 
                 // Insert system message at position 0
@@ -135,6 +179,10 @@ public class Session
                 try
                 {
                     response = await LlmClient.CompleteAsync(request, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -205,7 +253,7 @@ public class Session
         }
         catch (OperationCanceledException)
         {
-            State = SessionState.Idle;
+            State = SessionState.Closed;
             throw;
         }
         catch (Exception ex)
@@ -244,6 +292,39 @@ public class Session
         List<ToolCallData> toolCalls,
         CancellationToken ct)
     {
+        // Execute tool calls in parallel when the profile supports it and there are multiple calls
+        if (ProviderProfile.SupportsParallelToolCalls && toolCalls.Count > 1)
+        {
+            var tasks = toolCalls.Select(async toolCall =>
+            {
+                await EventEmitter.EmitAsync(EventKind.ToolCallStart, new Dictionary<string, object?>
+                {
+                    ["toolCallId"] = toolCall.Id,
+                    ["toolName"] = toolCall.Name,
+                    ["arguments"] = toolCall.Arguments
+                });
+
+                var result = await ExecuteSingleToolAsync(toolCall, ct);
+                var truncatedContent = OutputTruncation.Truncate(
+                    result.Content, toolCall.Name, Config.ToolOutputLimits);
+                var finalResult = result with { Content = truncatedContent };
+
+                await EventEmitter.EmitAsync(EventKind.ToolCallEnd, new Dictionary<string, object?>
+                {
+                    ["toolCallId"] = toolCall.Id,
+                    ["toolName"] = toolCall.Name,
+                    ["isError"] = finalResult.IsError,
+                    ["outputLength"] = finalResult.Content.Length
+                });
+
+                return finalResult;
+            }).ToList();
+
+            var parallelResults = await Task.WhenAll(tasks);
+            return parallelResults.ToList();
+        }
+
+        // Sequential execution
         var results = new List<ToolResultData>();
 
         foreach (var toolCall in toolCalls)

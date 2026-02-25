@@ -105,13 +105,15 @@ public class GeminiProfile : IProviderProfile
                 "Finds files matching a glob pattern. Returns sorted list of absolute file paths.",
                 new List<ToolParameter>
                 {
-                    new("pattern", "string", "The glob pattern to match files against", true)
+                    new("pattern", "string", "The glob pattern to match files against", true),
+                    new("path", "string", "Directory to search in (defaults to working directory)", false)
                 }),
             async (args, env) =>
             {
                 var json = JsonDocument.Parse(args);
                 var pattern = json.RootElement.GetProperty("pattern").GetString()!;
-                var results = await env.GlobAsync(pattern);
+                string? path = json.RootElement.TryGetProperty("path", out var p) ? p.GetString() : null;
+                var results = await env.GlobAsync(pattern, path);
                 return results.Count > 0 ? string.Join('\n', results) : "No files found matching pattern.";
             }));
 
@@ -123,15 +125,56 @@ public class GeminiProfile : IProviderProfile
                 new List<ToolParameter>
                 {
                     new("pattern", "string", "The regex pattern to search for", true),
-                    new("path", "string", "File or directory to search in (defaults to working directory)", false)
+                    new("path", "string", "File or directory to search in (defaults to working directory)", false),
+                    new("glob_filter", "string", "File name glob to filter which files are searched (e.g. '*.py')", false),
+                    new("case_insensitive", "boolean", "Whether to perform case-insensitive matching", false),
+                    new("max_results", "integer", "Maximum number of results to return", false)
                 }),
             async (args, env) =>
             {
                 var json = JsonDocument.Parse(args);
                 var pattern = json.RootElement.GetProperty("pattern").GetString()!;
                 string? path = json.RootElement.TryGetProperty("path", out var p) ? p.GetString() : null;
-                var results = await env.GrepAsync(pattern, path);
+                string? globFilter = json.RootElement.TryGetProperty("glob_filter", out var gf) ? gf.GetString() : null;
+                bool caseInsensitive = json.RootElement.TryGetProperty("case_insensitive", out var ci) && ci.GetBoolean();
+                int? maxResults = json.RootElement.TryGetProperty("max_results", out var mr) ? mr.GetInt32() : null;
+                var results = await env.GrepAsync(pattern, path, globFilter, caseInsensitive, maxResults);
                 return results.Count > 0 ? string.Join('\n', results) : "No matches found.";
+            }));
+
+        ToolRegistry.Register(new RegisteredTool(
+            "list_dir",
+            new ToolDefinition(
+                "list_dir",
+                "Lists the contents of a directory, showing files and subdirectories with their sizes.",
+                new List<ToolParameter>
+                {
+                    new("path", "string", "The absolute path to the directory to list", true)
+                }),
+            async (args, env) =>
+            {
+                var json = JsonDocument.Parse(args);
+                var path = json.RootElement.GetProperty("path").GetString()!;
+                return await env.ListDirectoryAsync(path);
+            }));
+
+        ToolRegistry.Register(new RegisteredTool(
+            "read_many_files",
+            new ToolDefinition(
+                "read_many_files",
+                "Reads multiple files at once and returns their concatenated contents. More efficient than reading files one at a time.",
+                new List<ToolParameter>
+                {
+                    new("paths", "array", "Array of absolute file paths to read", true, ItemsType: "string")
+                }),
+            async (args, env) =>
+            {
+                var json = JsonDocument.Parse(args);
+                var paths = json.RootElement.GetProperty("paths")
+                    .EnumerateArray()
+                    .Select(e => e.GetString()!)
+                    .ToList();
+                return await env.ReadManyFilesAsync(paths);
             }));
     }
 
@@ -174,6 +217,8 @@ public class GeminiProfile : IProviderProfile
 
         return sb.ToString();
     }
+
+    public void RegisterSubagentTools() => SubagentTools.Register(ToolRegistry);
 
     public IReadOnlyList<ToolDefinition> Tools() => ToolRegistry.GetDefinitions();
 

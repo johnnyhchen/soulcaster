@@ -1,0 +1,61 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Test multi-provider routing by having three different LLMs each write their provider name to a file."
+    label = "QA Multi-Model Test"
+    default_max_retry = 1
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    //  Default: Anthropic claude-sonnet-4-6
+    //  .codex:  OpenAI codex-5.3
+    //  .gemini: Google gemini-3.0-pro-preview
+    // ─────────────────────────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .codex  { provider = \"openai\";  model = \"codex-5.2\" }
+        .gemini { provider = \"gemini\";  model = \"gemini-2.5-pro\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Three nodes, each routed to a different LLM provider.
+    // ═══════════════════════════════════════════════════════════════════
+
+    anthropic_node [
+        label="Anthropic Node (claude-sonnet-4-6)",
+        prompt="You are running on Anthropic Claude. Write the exact text 'provider=anthropic model=claude-sonnet-4-6' to logs/multimodel/ANTHROPIC-1.md.
+
+That is all."
+    ]
+
+    openai_node [
+        class="codex",
+        label="OpenAI Node (codex-5.2)",
+        prompt="You are running on OpenAI Codex. Write the exact text 'provider=openai model=codex-5.2' to logs/multimodel/OPENAI-1.md.
+
+That is all."
+    ]
+
+    gemini_node [
+        class="gemini",
+        label="Gemini Node (gemini-2.5-pro)",
+        prompt="You are running on Google Gemini. Write the exact text 'provider=gemini model=gemini-2.5-pro' to logs/multimodel/GEMINI-1.md.
+
+That is all."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES — sequential through all three providers
+    // ═══════════════════════════════════════════════════════════════════
+    start -> anthropic_node
+    anthropic_node -> openai_node
+    openai_node -> gemini_node
+    gemini_node -> exit
+}
