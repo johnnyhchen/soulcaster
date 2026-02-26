@@ -1,0 +1,217 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Build a static site generator in Go called 'marble' that converts a directory of Markdown files into a static HTML website. Features: (1) Markdown to HTML via goldmark with syntax highlighting, (2) YAML front matter for title, date, tags, and layout, (3) Go html/template based layouts with a base template, index page, and post page, (4) Built-in development server with live reload via WebSocket, (5) Tag index pages that list all posts with a given tag, (6) RSS feed generation at /feed.xml, (7) Incremental builds — only regenerate changed files based on mtime comparison. The CLI should support 'marble build', 'marble serve', and 'marble init' commands."
+    label = "Markdown Static Site Generator (Go)"
+    default_max_retry = 3
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .codex { provider = \"openai\";    model = \"codex-5.2\";  reasoning_effort = \"high\" }
+        .gpt   { provider = \"openai\";    model = \"gpt-5.2\";   reasoning_effort = \"high\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 1: PLAN
+    // ═══════════════════════════════════════════════════════════════════
+
+    orient [
+        class="opus",
+        label="Orient: Check environment",
+        prompt="Check the working directory and Go toolchain:
+1. go version
+2. Whether a go.mod already exists (resuming?)
+3. Available Go modules in the ecosystem for markdown (goldmark), YAML (gopkg.in/yaml.v3), and syntax highlighting (github.com/alecthomas/chroma)
+
+Check for prior run artifacts:
+- logs/orient/ORIENT-*.md, logs/implement/PROGRESS-*.md, logs/validate/VALIDATION-RUN-*.md
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/orient/ORIENT-{N}.md."
+    ]
+
+    plan [
+        class="opus",
+        label="Plan: System Design",
+        prompt="Read logs/orient/ORIENT-*.md.
+
+Check for prior artifacts: logs/plan/PLAN-*.md, logs/implement/PROGRESS-*.md, logs/validate/VALIDATION-RUN-*.md, logs/critique/CRITIQUE-PARETO-*.md.
+
+Design the static site generator for: $goal
+
+Architecture:
+1. cmd/marble/main.go — CLI entry point with cobra or raw flag parsing
+2. internal/config/ — site configuration (config.yaml: title, base_url, per_page)
+3. internal/content/ — markdown parsing, front matter extraction, content model
+4. internal/render/ — template loading, HTML rendering, layout resolution
+5. internal/build/ — full and incremental build orchestration, output directory management
+6. internal/server/ — HTTP file server with WebSocket live reload
+7. internal/feed/ — RSS 2.0 XML generation
+8. internal/tags/ — tag aggregation and tag index page generation
+
+Key design decisions to address:
+- How does incremental build detect changes? (mtime-based manifest file)
+- How does live reload work? (fsnotify watcher → WebSocket broadcast → JS snippet injected into HTML)
+- How are tag pages generated? (aggregate during build, render one page per unique tag)
+- What is the content directory convention? (content/*.md, layouts/*.html, static/*, output/)
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/plan/PLAN-{N}.md."
+    ]
+
+    interview [
+        shape=hexagon,
+        label="Review plan"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 2: BREAK DOWN
+    // ═══════════════════════════════════════════════════════════════════
+
+    breakdown [
+        class="opus",
+        label="Break Down: Commit Chunks",
+        prompt="Read logs/plan/PLAN-*.md. Exclude DONE items from logs/implement/PROGRESS-*.md if present.
+
+Break into commits:
+1. Scaffold: go mod init, directory structure, main.go with cobra commands
+2. Content model: front matter parsing, Post struct, Markdown → HTML via goldmark
+3. Template engine: base layout, index template, post template, template funcs
+4. Build command: full build — scan content dir, parse all posts, render to output/
+5. Init command: scaffold a new site with example content, default layout, config.yaml
+6. Tag system: aggregate tags during build, generate /tags/{tag}/index.html pages
+7. RSS feed: generate /feed.xml with full content, proper dates, enclosures
+8. Incremental builds: mtime manifest, skip unchanged files, clean deleted
+9. Dev server: serve output/ with live reload — fsnotify + WebSocket + JS injection
+10. Integration tests: build a test site, verify HTML output, check links
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/breakdown/BREAKDOWN-{N}.md."
+    ]
+
+    review_breakdown [
+        shape=hexagon,
+        label="Review breakdown"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 3: IMPLEMENT
+    // ═══════════════════════════════════════════════════════════════════
+
+    implement [
+        class="codex",
+        label="Implement: Build marble",
+        prompt="Read logs/breakdown/BREAKDOWN-*.md. Skip DONE commits from logs/implement/PROGRESS-*.md.
+
+For each commit:
+1. Implement the changes
+2. Run go build ./... and go test ./... (or targeted test commands from the breakdown QA plan)
+3. Mark DONE/FAILED immediately
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+IMPORTANT: Use explicit file paths.
+
+Write progress to logs/implement/PROGRESS-{N}.md."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4: VALIDATE
+    // ═══════════════════════════════════════════════════════════════════
+
+    validate [
+        class="opus",
+        label="Validate: Full QA",
+        goal_gate=true,
+        retry_target="plan",
+        prompt="Read logs/plan/PLAN-*.md, logs/breakdown/BREAKDOWN-*.md, logs/implement/PROGRESS-*.md.
+
+Validate:
+1. go build ./... — must compile
+2. go test ./... — all tests pass
+3. go vet ./... — no issues
+4. Smoke test:
+   - ./marble init test-site && cd test-site
+   - ../marble build — generates output/ with HTML files
+   - Verify: output/index.html exists and contains post links
+   - Verify: output/posts/*.html exist with rendered markdown
+   - Verify: output/tags/*/index.html exist for each tag
+   - Verify: output/feed.xml is valid XML with <item> entries
+5. Incremental build: touch one .md file, rebuild, verify only that file regenerated
+
+Compare against prior logs/validate/VALIDATION-RUN-*.md if present.
+
+Write to logs/validate/VALIDATION-RUN-{N}.md."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 5: CRITIQUE
+    // ═══════════════════════════════════════════════════════════════════
+
+    critique_harsh [
+        class="gpt",
+        label="Critique: Tear It Down",
+        prompt="Read all .go files in the project. Also read logs/plan/PLAN-*.md and logs/validate/VALIDATION-RUN-*.md.
+
+Adversarial review — be ruthless:
+1. Template injection: can user-controlled front matter inject HTML/JS?
+2. Path traversal: can content paths escape the output directory?
+3. Memory: does it load all content into memory? Will it handle 10,000 posts?
+4. Concurrency: is the dev server's WebSocket handling race-free?
+5. RSS correctness: does the feed validate against the RSS 2.0 spec?
+6. Edge cases: no posts, post with no front matter, binary files in content/, deeply nested dirs
+7. Live reload: does it correctly detect new files, not just changes?
+8. Missing features from goal that are not implemented
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/critique/CRITIQUE-HARSH-{N}.md."
+    ]
+
+    critique_pareto [
+        class="opus",
+        label="Critique: Filter",
+        prompt="Read logs/critique/CRITIQUE-HARSH-*.md (latest). Filter into MUST FIX / SHOULD FIX / NICE TO HAVE.
+
+Check if prior CRITIQUE-PARETO-*.md items were addressed.
+
+Write to logs/critique/CRITIQUE-PARETO-{N}.md."
+    ]
+
+    critique_gate [
+        shape=hexagon,
+        label="Ship or iterate?"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+
+    start -> orient -> plan -> interview
+    interview -> breakdown [label="approve"]
+    interview -> plan [label="revise"]
+
+    breakdown -> review_breakdown
+    review_breakdown -> implement [label="approve"]
+    review_breakdown -> breakdown [label="revise"]
+
+    implement -> validate
+    validate -> critique_harsh [condition="outcome=success"]
+    validate -> plan [condition="outcome=fail", label="Fix failures"]
+
+    critique_harsh -> critique_pareto -> critique_gate
+    critique_gate -> exit [label="ship it"]
+    critique_gate -> plan [label="iterate"]
+}

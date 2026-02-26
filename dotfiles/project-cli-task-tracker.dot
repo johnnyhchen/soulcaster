@@ -1,0 +1,248 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Build a CLI task tracker in Rust called 'tsk' that stores tasks in a local SQLite database. It should support: add, list, done, delete, and search commands. Tasks have a title, optional description, priority (low/medium/high), created_at timestamp, and done_at timestamp. The 'list' command supports filtering by priority and status. The 'search' command does full-text search across title and description. Output should be a clean table format using the comfy-table crate. The binary should be installable via 'cargo install --path .'."
+    label = "CLI Task Tracker (Rust)"
+    default_max_retry = 3
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .codex { provider = \"openai\";    model = \"codex-5.2\";  reasoning_effort = \"high\" }
+        .gpt   { provider = \"openai\";    model = \"gpt-5.2\";   reasoning_effort = \"high\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 1: PLAN & INTERVIEW
+    // ═══════════════════════════════════════════════════════════════════
+
+    orient [
+        class="opus",
+        label="Orient: Assess workspace",
+        prompt="Assess the current working directory for any existing Rust projects, toolchain version (rustc --version, cargo --version), and available disk space.
+
+Check for prior run artifacts:
+- If logs/orient/ORIENT-*.md exists, read the latest.
+- If logs/implement/PROGRESS-*.md exists, read the latest to see completed work.
+- If logs/validate/VALIDATION-RUN-*.md exists, read the latest for known failures.
+
+Determine:
+1. Whether a Cargo.toml already exists (we may be resuming)
+2. The Rust edition and toolchain available
+3. Whether SQLite dev headers are available (needed for rusqlite)
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write findings to logs/orient/ORIENT-{N}.md (next sequential number)."
+    ]
+
+    plan [
+        class="opus",
+        label="Plan: Architecture & API Design",
+        prompt="Read the latest logs/orient/ORIENT-*.md.
+
+Check for prior artifacts:
+- logs/plan/PLAN-*.md — prior plans
+- logs/implement/PROGRESS-*.md — skip DONE items
+- logs/validate/VALIDATION-RUN-*.md — fix identified failures
+- logs/critique/CRITIQUE-PARETO-*.md — incorporate MUST FIX items
+
+Design the CLI task tracker architecture for: $goal
+
+The plan must cover:
+1. Project structure: src/main.rs, src/db.rs, src/models.rs, src/commands/*.rs
+2. Database schema: tasks table with id, title, description, priority, status, created_at, done_at
+3. CLI argument parsing using clap with derive macros
+4. Each command's input/output contract
+5. Error handling strategy (anyhow for applications)
+6. Testing approach: unit tests for DB layer, integration tests for CLI commands
+7. Dependencies: clap, rusqlite (with bundled feature), comfy-table, anyhow, chrono
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write the plan to logs/plan/PLAN-{N}.md."
+    ]
+
+    interview [
+        shape=hexagon,
+        label="Review plan & approve"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 2: BREAK DOWN
+    // ═══════════════════════════════════════════════════════════════════
+
+    breakdown [
+        class="opus",
+        label="Break Down: Commit Chunks",
+        prompt="Read the latest logs/plan/PLAN-*.md.
+
+If logs/implement/PROGRESS-*.md exists, exclude commits marked DONE.
+
+Break the implementation into single-commit chunks. Suggested order:
+1. Scaffold: cargo init, Cargo.toml with all dependencies, basic main.rs
+2. Database layer: schema migration, connection pool, CRUD operations
+3. Models: Task struct with serialization, Priority enum, Status enum
+4. Add command: parse args, validate input, insert into DB, print confirmation
+5. List command: query with filters (--priority, --status, --all), table output
+6. Done command: mark task as done by ID, set done_at timestamp
+7. Delete command: remove task by ID with confirmation prompt
+8. Search command: FTS5 setup, query across title+description
+9. Error handling: user-friendly error messages, exit codes
+10. Integration tests: test each command via assert_cmd crate
+
+Each commit must include a QA plan with specific cargo test commands.
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/breakdown/BREAKDOWN-{N}.md."
+    ]
+
+    review_breakdown [
+        shape=hexagon,
+        label="Review breakdown"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 3: IMPLEMENT
+    // ═══════════════════════════════════════════════════════════════════
+
+    implement [
+        class="codex",
+        label="Implement: Build tsk",
+        prompt="Read the latest logs/breakdown/BREAKDOWN-*.md.
+
+If logs/implement/PROGRESS-*.md exists, skip DONE commits. Resume from first TODO or FAILED.
+
+For each commit:
+1. Implement the code changes
+2. Run the QA plan (cargo build, cargo test -- specific tests)
+3. Mark DONE/FAILED in the progress log immediately after each commit
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+IMPORTANT: Use explicit file paths.
+
+Write progress to logs/implement/PROGRESS-{N}.md matching the BREAKDOWN number."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4: VALIDATE
+    // ═══════════════════════════════════════════════════════════════════
+
+    validate [
+        class="opus",
+        label="Validate: Full QA Pass",
+        goal_gate=true,
+        retry_target="plan",
+        prompt="Read the latest logs/plan/PLAN-*.md, logs/breakdown/BREAKDOWN-*.md, and logs/implement/PROGRESS-*.md.
+
+Run a full validation:
+1. cargo build --release — must succeed
+2. cargo test — all tests must pass
+3. Manual smoke test:
+   - ./target/release/tsk add 'Test task' --priority high
+   - ./target/release/tsk list
+   - ./target/release/tsk done 1
+   - ./target/release/tsk list --status done
+   - ./target/release/tsk search 'Test'
+   - ./target/release/tsk delete 1
+4. cargo clippy -- -D warnings — no warnings
+5. Verify help text: ./target/release/tsk --help
+
+Check for prior validation runs:
+- If logs/validate/VALIDATION-RUN-*.md exists, compare: track fixed, regressed, persistent, and new issues.
+
+Write results to logs/validate/VALIDATION-RUN-{N}.md with:
+- Summary: Total/Passed/Failed
+- Per-test results
+- Verdict: PASS or FAIL"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 5: CRITIQUE
+    // ═══════════════════════════════════════════════════════════════════
+
+    critique_harsh [
+        class="gpt",
+        label="Critique: Adversarial Review",
+        prompt="Read the full implementation by examining all .rs files in the project src/ directory.
+Also read logs/plan/PLAN-*.md and logs/validate/VALIDATION-RUN-*.md.
+
+Perform an adversarial code review. Be harsh. Look for:
+1. SQL injection vulnerabilities (parameterized queries?)
+2. Error handling gaps (unwrap() calls, missing error context)
+3. Edge cases: empty title, very long strings, concurrent access, corrupt DB
+4. UX issues: unclear error messages, missing help text, inconsistent output
+5. Performance: unnecessary allocations, missing indexes, N+1 queries
+6. Missing features from the goal that were not implemented
+7. Test coverage gaps: untested commands, untested edge cases
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write a brutal review to logs/critique/CRITIQUE-HARSH-{N}.md."
+    ]
+
+    critique_pareto [
+        class="opus",
+        label="Critique: Pareto Filter",
+        prompt="Read logs/critique/CRITIQUE-HARSH-*.md (the latest).
+
+Filter the harsh critique into actionable categories:
+
+MUST FIX — Security issues, data loss risks, crashes
+SHOULD FIX — UX problems, missing error handling, test gaps
+NICE TO HAVE — Style improvements, optimizations, refactors
+
+Only include items where the effort-to-impact ratio is favorable.
+Discard nitpicks and subjective style preferences.
+
+If logs/critique/CRITIQUE-PARETO-*.md exists (prior run), check whether prior MUST FIX items were addressed.
+
+Write to logs/critique/CRITIQUE-PARETO-{N}.md."
+    ]
+
+    critique_gate [
+        shape=hexagon,
+        label="Ship or iterate?"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Phase 1
+    start -> orient
+    orient -> plan
+    plan -> interview
+    interview -> breakdown [label="approve"]
+    interview -> plan [label="revise"]
+
+    // Phase 2
+    breakdown -> review_breakdown
+    review_breakdown -> implement [label="approve"]
+    review_breakdown -> breakdown [label="revise"]
+
+    // Phase 3 → 4
+    implement -> validate
+
+    // Phase 4 routing
+    validate -> critique_harsh [condition="outcome=success"]
+    validate -> plan [condition="outcome=fail", label="Fix failures"]
+
+    // Phase 5
+    critique_harsh -> critique_pareto
+    critique_pareto -> critique_gate
+
+    // Ship or loop
+    critique_gate -> exit [label="ship it"]
+    critique_gate -> plan [label="iterate"]
+}

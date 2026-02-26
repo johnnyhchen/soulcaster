@@ -3166,9 +3166,12 @@ public class ToolHandlerEdgeCaseTests
 public class QaDotfileParsingTests
 {
     [Theory]
-    [InlineData("qa-smoke.dot", 4, 3)]        // start, write_haiku, verify_haiku, exit → 3 edges
-    [InlineData("qa-checkpoint.dot", 6, 5)]    // start, step_a-d, exit → 5 edges
-    [InlineData("qa-multimodel.dot", 5, 4)]    // start, 3 provider nodes, exit → 4 edges
+    [InlineData("qa-smoke.dot", 4, 3)]
+    [InlineData("qa-checkpoint.dot", 6, 5)]
+    [InlineData("qa-multimodel.dot", 5, 4)]
+    [InlineData("project-cli-task-tracker.dot", 12, 15)]
+    [InlineData("project-markdown-static-site.dot", 12, 15)]
+    [InlineData("project-http-load-tester.dot", 12, 15)]
     public void QaDotfile_ParsesAndValidates(string filename, int expectedNodes, int expectedEdges)
     {
         var dotfilePath = Path.Combine(

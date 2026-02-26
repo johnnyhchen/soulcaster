@@ -1,0 +1,223 @@
+digraph attractor_run {
+    // ─── Pipeline Configuration ──────────────────────────────────────
+    goal = "Build an HTTP load testing tool in Python called 'salvo' that sends concurrent requests to a target URL and reports latency statistics. Features: (1) Configurable concurrency level (-c), total requests (-n), and duration (-d for time-based mode), (2) Support for GET, POST, PUT, DELETE with custom headers and JSON body from file, (3) Real-time progress bar showing RPS, latency percentiles, and error rate using rich library, (4) Final report with p50/p95/p99 latencies, total requests, error count, throughput, and a latency histogram rendered in the terminal, (5) HAR file export for detailed request/response logging, (6) Rate limiting option (--rps) to cap requests per second, (7) Connection reuse via aiohttp session pooling. The tool should use asyncio for concurrency and be installable via pip."
+    label = "HTTP Load Tester (Python)"
+    default_max_retry = 3
+
+    // ─── Model Stylesheet ────────────────────────────────────────────
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .codex { provider = \"openai\";    model = \"codex-5.2\";  reasoning_effort = \"high\" }
+        .gpt   { provider = \"openai\";    model = \"gpt-5.2\";   reasoning_effort = \"high\" }
+    "
+
+    // ─── Defaults ────────────────────────────────────────────────────
+    node [shape=box]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  TERMINALS
+    // ═══════════════════════════════════════════════════════════════════
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 1: PLAN
+    // ═══════════════════════════════════════════════════════════════════
+
+    orient [
+        class="opus",
+        label="Orient: Python environment",
+        prompt="Check the working directory and Python environment:
+1. python3 --version
+2. pip3 --version
+3. Whether a pyproject.toml or setup.py already exists
+4. Available system resources (ulimit -n for max open files — important for load testing)
+
+Check for prior run artifacts: logs/orient/ORIENT-*.md, logs/implement/PROGRESS-*.md, logs/validate/VALIDATION-RUN-*.md.
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/orient/ORIENT-{N}.md."
+    ]
+
+    plan [
+        class="opus",
+        label="Plan: Architecture",
+        prompt="Read logs/orient/ORIENT-*.md.
+
+Check for prior artifacts: logs/plan/PLAN-*.md, logs/implement/PROGRESS-*.md, logs/validate/VALIDATION-RUN-*.md, logs/critique/CRITIQUE-PARETO-*.md.
+
+Design the load tester for: $goal
+
+Architecture:
+1. salvo/__init__.py, salvo/__main__.py — package entry point
+2. salvo/cli.py — argument parsing with click
+3. salvo/engine.py — asyncio-based request engine with aiohttp
+4. salvo/stats.py — latency collection, percentile calculation, histogram
+5. salvo/reporter.py — rich-based live display and final summary
+6. salvo/har.py — HAR 1.2 file export
+7. salvo/limiter.py — token bucket rate limiter for --rps
+8. pyproject.toml — project metadata, dependencies, entry point
+
+Key design decisions:
+- Engine model: producer-consumer with asyncio.Queue? Or semaphore-bounded gather?
+  Recommend: semaphore approach (simpler, aiohttp handles connection pooling)
+- Stats collection: thread-safe? Use asyncio primitives since everything is single-threaded async
+- Duration mode: how to stop? Use asyncio.wait_for with timeout, keep sending until time expires
+- Rate limiter: token bucket with asyncio.sleep for pacing
+- HAR export: collect entries during run, write to file after completion
+
+Dependencies: aiohttp, click, rich, numpy (for percentiles)
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/plan/PLAN-{N}.md."
+    ]
+
+    interview [
+        shape=hexagon,
+        label="Review plan"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 2: BREAK DOWN
+    // ═══════════════════════════════════════════════════════════════════
+
+    breakdown [
+        class="opus",
+        label="Break Down: Commit Chunks",
+        prompt="Read logs/plan/PLAN-*.md. Exclude DONE items from logs/implement/PROGRESS-*.md.
+
+Break into commits:
+1. Scaffold: pyproject.toml, package structure, click CLI skeleton with --help
+2. Request engine: aiohttp session, semaphore concurrency, basic GET request loop
+3. Stats collector: latency recording, percentile calculation (p50/p95/p99), error tracking
+4. Reporter: rich live display with progress bar, RPS counter, rolling latency
+5. Final summary: table with all stats, ASCII histogram of latency distribution
+6. HTTP methods: POST/PUT/DELETE support, --data-file for JSON body, --header repeatable
+7. Duration mode: --duration flag, time-based loop with graceful shutdown
+8. Rate limiter: --rps flag, token bucket implementation, integrate with engine
+9. HAR export: --har flag, collect entries, write HAR 1.2 JSON on completion
+10. Integration tests: test against a local httpbin-like server, verify stats accuracy
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/breakdown/BREAKDOWN-{N}.md."
+    ]
+
+    review_breakdown [
+        shape=hexagon,
+        label="Review breakdown"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 3: IMPLEMENT
+    // ═══════════════════════════════════════════════════════════════════
+
+    implement [
+        class="codex",
+        label="Implement: Build salvo",
+        prompt="Read logs/breakdown/BREAKDOWN-*.md. Skip DONE commits from logs/implement/PROGRESS-*.md.
+
+For each commit:
+1. Implement the changes
+2. Run: python -m pytest tests/ -v (or specific test file from breakdown QA plan)
+3. Also verify: python -m salvo --help (CLI loads without error)
+4. Mark DONE/FAILED immediately
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+IMPORTANT: Use explicit file paths.
+
+Write progress to logs/implement/PROGRESS-{N}.md."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4: VALIDATE
+    // ═══════════════════════════════════════════════════════════════════
+
+    validate [
+        class="opus",
+        label="Validate: Full QA",
+        goal_gate=true,
+        retry_target="plan",
+        prompt="Read logs/plan/PLAN-*.md, logs/breakdown/BREAKDOWN-*.md, logs/implement/PROGRESS-*.md.
+
+Validate:
+1. pip install -e . — installs without error
+2. python -m pytest tests/ -v — all tests pass
+3. Smoke test against a real endpoint:
+   - Start a simple HTTP server: python -c 'from http.server import HTTPServer, BaseHTTPRequestHandler; ...' &
+   - salvo http://localhost:8888 -n 100 -c 10 — completes, shows stats
+   - salvo http://localhost:8888 -n 50 -c 5 --rps 20 — rate limited run
+   - salvo http://localhost:8888 -d 3s -c 5 — duration mode
+   - salvo http://localhost:8888 -n 20 --har /tmp/test.har — HAR export exists
+4. python -m mypy salvo/ --ignore-missing-imports — type check (if mypy available)
+5. Verify --help output documents all flags
+
+Compare against prior logs/validate/VALIDATION-RUN-*.md.
+
+Write to logs/validate/VALIDATION-RUN-{N}.md."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 5: CRITIQUE
+    // ═══════════════════════════════════════════════════════════════════
+
+    critique_harsh [
+        class="gpt",
+        label="Critique: Adversarial Review",
+        prompt="Read all .py files in the project. Also read logs/plan/PLAN-*.md and logs/validate/VALIDATION-RUN-*.md.
+
+Adversarial review:
+1. Resource exhaustion: what happens at -c 10000? Does it OOM or handle gracefully?
+2. Connection handling: are connections properly closed on Ctrl+C? Resource leaks?
+3. Stats accuracy: are percentiles computed correctly? (numpy vs manual — edge cases with few samples)
+4. Rate limiter correctness: does it actually limit to the target RPS? Bursty?
+5. HAR compliance: does the output validate against the HAR 1.2 spec?
+6. Signal handling: does SIGINT produce a clean summary or crash?
+7. DNS resolution: is it resolved once or per-request? (performance implication)
+8. TLS: does it handle HTTPS correctly? Certificate validation?
+9. Encoding: does it handle non-UTF8 response bodies?
+10. Missing features from goal
+
+IMPORTANT: Use bash heredoc for files over 100 lines.
+
+Write to logs/critique/CRITIQUE-HARSH-{N}.md."
+    ]
+
+    critique_pareto [
+        class="opus",
+        label="Critique: Filter",
+        prompt="Read logs/critique/CRITIQUE-HARSH-*.md (latest). Filter into MUST FIX / SHOULD FIX / NICE TO HAVE.
+
+Check if prior CRITIQUE-PARETO-*.md items were addressed.
+
+Write to logs/critique/CRITIQUE-PARETO-{N}.md."
+    ]
+
+    critique_gate [
+        shape=hexagon,
+        label="Ship or iterate?"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EDGES
+    // ═══════════════════════════════════════════════════════════════════
+
+    start -> orient -> plan -> interview
+    interview -> breakdown [label="approve"]
+    interview -> plan [label="revise"]
+
+    breakdown -> review_breakdown
+    review_breakdown -> implement [label="approve"]
+    review_breakdown -> breakdown [label="revise"]
+
+    implement -> validate
+    validate -> critique_harsh [condition="outcome=success"]
+    validate -> plan [condition="outcome=fail", label="Fix failures"]
+
+    critique_harsh -> critique_pareto -> critique_gate
+    critique_gate -> exit [label="ship it"]
+    critique_gate -> plan [label="iterate"]
+}
