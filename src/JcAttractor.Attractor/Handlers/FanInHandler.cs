@@ -72,6 +72,19 @@ public class FanInHandler : INodeHandler
         // Store the ranked results for downstream consumption
         context.Set("fan_in.ranked_results", JsonSerializer.Serialize(ranked));
 
+        if (branchResults.Any(result => result.ContainsKey("queue_item") || result.ContainsKey("queue_item_id")))
+        {
+            var queueSummary = new Dictionary<string, object?>
+            {
+                ["total_items"] = branchResults.Count,
+                ["success_count"] = branchResults.Count(result => string.Equals(result.GetValueOrDefault("status")?.ToString(), "success", StringComparison.OrdinalIgnoreCase)),
+                ["partial_success_count"] = branchResults.Count(result => string.Equals(result.GetValueOrDefault("status")?.ToString(), "partial_success", StringComparison.OrdinalIgnoreCase)),
+                ["fail_count"] = branchResults.Count(result => string.Equals(result.GetValueOrDefault("status")?.ToString(), "fail", StringComparison.OrdinalIgnoreCase)),
+                ["best_item"] = bestResult?.GetValueOrDefault("node_id")
+            };
+            context.Set("fan_in.queue_summary", JsonSerializer.Serialize(queueSummary));
+        }
+
         return new Outcome(
             Status: combinedStatus,
             Notes: $"Fan-in node '{node.Id}' merged {branchResults.Count} branches. Best: {bestResult?.GetValueOrDefault("node_id")}."

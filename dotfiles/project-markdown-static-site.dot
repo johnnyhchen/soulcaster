@@ -4,6 +4,40 @@ digraph attractor_run {
     label = "Markdown Static Site Generator (Go)"
     default_max_retry = 3
 
+    // ─── Definition of Done ─────────────────────────────────────────
+    //
+    //  The pipeline is complete when ALL of these are true:
+    //
+    //  BUILD
+    //    [ ] go build ./... compiles with zero errors
+    //    [ ] go vet ./... reports zero issues
+    //
+    //  TESTS
+    //    [ ] go test ./... passes all tests
+    //    [ ] Tests cover: content parsing, template rendering, build output, RSS generation
+    //
+    //  FUNCTIONAL (verified by validate node + qa-agent)
+    //    [ ] marble init test-site → scaffolds content/, layouts/, config.yaml
+    //    [ ] marble build           → generates output/ with HTML files
+    //    [ ] output/index.html      → contains links to all posts
+    //    [ ] output/posts/*.html    → rendered markdown with layout applied
+    //    [ ] output/tags/*/index.html → one page per unique tag
+    //    [ ] output/feed.xml        → valid RSS 2.0 with <item> entries
+    //    [ ] marble serve            → starts HTTP server on localhost
+    //    [ ] Incremental: touch one .md, rebuild → only that file regenerated
+    //    [ ] marble --help           → shows usage for init, build, serve
+    //
+    //  QA-AGENT VERIFICATION
+    //    [ ] qa-agent validates: GET / returns HTML 200, GET /feed.xml returns XML 200,
+    //        GET /posts/first-post/ returns HTML 200, GET /tags/go/ returns HTML 200
+    //
+    //  QUALITY
+    //    [ ] No path traversal — content paths cannot escape output directory
+    //    [ ] Template errors produce clear messages, not panics
+    //    [ ] RSS feed validates against RSS 2.0 spec structure
+    //
+    // ─────────────────────────────────────────────────────────────────
+
     // ─── Model Stylesheet ────────────────────────────────────────────
     model_stylesheet = "
         * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
@@ -157,6 +191,17 @@ Write to logs/validate/VALIDATION-RUN-{N}.md."
     ]
 
     // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4b: QA-AGENT VALIDATION
+    //  Build a test site, start marble serve, run qa-agent against it.
+    // ═══════════════════════════════════════════════════════════════════
+
+    qa_agent_validate [
+        shape=parallelogram,
+        label="QA-Agent: Validate served site",
+        tool_command="cd $PROJECT_ROOT && go build -o marble ./cmd/marble 2>/dev/null && rm -rf /tmp/marble-qa-site && ./marble init /tmp/marble-qa-site && cd /tmp/marble-qa-site && $PROJECT_ROOT/marble build && $PROJECT_ROOT/marble serve --port 9200 & MARBLE_PID=$! && sleep 2 && cd $HOME/qa-agent && go run ./cmd/qa-agent run --feature 'GET http://localhost:9200/ returns HTML with status 200 containing links to posts. GET http://localhost:9200/feed.xml returns XML with status 200 containing item elements. GET http://localhost:9200/posts/ returns HTML with status 200. GET http://localhost:9200/tags/ returns HTML with status 200.' --surfaces api --budget-steps 30 --budget-minutes 3 --output-dir /tmp/qa-marble-run 2>&1; QA_EXIT=$?; kill $MARBLE_PID 2>/dev/null; exit $QA_EXIT"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
     //  PHASE 5: CRITIQUE
     // ═══════════════════════════════════════════════════════════════════
 
@@ -208,8 +253,10 @@ Write to logs/critique/CRITIQUE-PARETO-{N}.md."
     review_breakdown -> breakdown [label="revise"]
 
     implement -> validate
-    validate -> critique_harsh [condition="outcome=success"]
+    validate -> qa_agent_validate [condition="outcome=success"]
     validate -> plan [condition="outcome=fail", label="Fix failures"]
+
+    qa_agent_validate -> critique_harsh
 
     critique_harsh -> critique_pareto -> critique_gate
     critique_gate -> exit [label="ship it"]

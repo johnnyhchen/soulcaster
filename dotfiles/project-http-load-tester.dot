@@ -4,6 +4,41 @@ digraph attractor_run {
     label = "HTTP Load Tester (Python)"
     default_max_retry = 3
 
+    // ─── Definition of Done ─────────────────────────────────────────
+    //
+    //  The pipeline is complete when ALL of these are true:
+    //
+    //  BUILD
+    //    [ ] pip install -e . succeeds
+    //    [ ] python -m salvo --help runs without error
+    //
+    //  TESTS
+    //    [ ] pytest tests/ passes all tests
+    //    [ ] Tests cover: engine, stats, reporter, rate limiter, HAR export
+    //
+    //  FUNCTIONAL (verified by validate node + qa-agent)
+    //    [ ] salvo http://target -n 100 -c 10     → completes, shows stats table
+    //    [ ] salvo http://target -n 50 --rps 20   → rate-limited, actual RPS ≤ 25
+    //    [ ] salvo http://target -d 3s -c 5       → runs for ~3s then stops
+    //    [ ] salvo http://target -n 20 --har out.har → HAR file written, valid JSON
+    //    [ ] salvo http://target -X POST --data-file body.json -n 10 → POST requests sent
+    //    [ ] Stats report shows p50, p95, p99 latencies
+    //    [ ] Stats report shows ASCII latency histogram
+    //    [ ] Non-zero exit code when target is unreachable
+    //
+    //  QA-AGENT VERIFICATION
+    //    [ ] salvo starts a built-in echo server (salvo echo-server --port 9300)
+    //    [ ] qa-agent validates: GET http://localhost:9300/ returns 200,
+    //        POST http://localhost:9300/echo returns 200 with echoed body
+    //    [ ] qa-agent validates salvo's own run produces expected output artifacts
+    //
+    //  QUALITY
+    //    [ ] Graceful shutdown on Ctrl+C (SIGINT) — prints partial stats
+    //    [ ] No resource leaks — aiohttp sessions closed properly
+    //    [ ] Type hints on all public functions
+    //
+    // ─────────────────────────────────────────────────────────────────
+
     // ─── Model Stylesheet ────────────────────────────────────────────
     model_stylesheet = "
         * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
@@ -58,15 +93,16 @@ Architecture:
 5. salvo/reporter.py — rich-based live display and final summary
 6. salvo/har.py — HAR 1.2 file export
 7. salvo/limiter.py — token bucket rate limiter for --rps
-8. pyproject.toml — project metadata, dependencies, entry point
+8. salvo/echo_server.py — built-in echo HTTP server for testing and qa-agent validation (salvo echo-server --port PORT)
+9. pyproject.toml — project metadata, dependencies, entry point
 
 Key design decisions:
-- Engine model: producer-consumer with asyncio.Queue? Or semaphore-bounded gather?
-  Recommend: semaphore approach (simpler, aiohttp handles connection pooling)
-- Stats collection: thread-safe? Use asyncio primitives since everything is single-threaded async
-- Duration mode: how to stop? Use asyncio.wait_for with timeout, keep sending until time expires
-- Rate limiter: token bucket with asyncio.sleep for pacing
-- HAR export: collect entries during run, write to file after completion
+- Engine model: semaphore-bounded asyncio.gather with aiohttp session pooling
+- Stats: collected in-process via asyncio primitives (single-threaded async)
+- Duration mode: asyncio.wait_for with timeout
+- Rate limiter: token bucket with asyncio.sleep pacing
+- HAR: collect entries during run, write JSON after completion
+- Echo server: simple aiohttp server that returns request details as JSON — used by qa-agent for validation
 
 Dependencies: aiohttp, click, rich, numpy (for percentiles)
 
@@ -99,7 +135,8 @@ Break into commits:
 7. Duration mode: --duration flag, time-based loop with graceful shutdown
 8. Rate limiter: --rps flag, token bucket implementation, integrate with engine
 9. HAR export: --har flag, collect entries, write HAR 1.2 JSON on completion
-10. Integration tests: test against a local httpbin-like server, verify stats accuracy
+10. Echo server: salvo echo-server --port PORT — returns request method, headers, body as JSON
+11. Integration tests: test against echo server, verify stats accuracy, HAR output
 
 IMPORTANT: Use bash heredoc for files over 100 lines.
 
@@ -146,18 +183,31 @@ Write progress to logs/implement/PROGRESS-{N}.md."
 Validate:
 1. pip install -e . — installs without error
 2. python -m pytest tests/ -v — all tests pass
-3. Smoke test against a real endpoint:
-   - Start a simple HTTP server: python -c 'from http.server import HTTPServer, BaseHTTPRequestHandler; ...' &
-   - salvo http://localhost:8888 -n 100 -c 10 — completes, shows stats
-   - salvo http://localhost:8888 -n 50 -c 5 --rps 20 — rate limited run
-   - salvo http://localhost:8888 -d 3s -c 5 — duration mode
-   - salvo http://localhost:8888 -n 20 --har /tmp/test.har — HAR export exists
-4. python -m mypy salvo/ --ignore-missing-imports — type check (if mypy available)
-5. Verify --help output documents all flags
+3. Smoke test against the built-in echo server:
+   - python -m salvo echo-server --port 9300 &
+   - salvo http://localhost:9300 -n 100 -c 10 — completes, shows stats
+   - salvo http://localhost:9300 -n 50 -c 5 --rps 20 — rate limited run
+   - salvo http://localhost:9300 -d 3s -c 5 — duration mode
+   - salvo http://localhost:9300 -n 20 --har /tmp/test.har — HAR export exists and is valid JSON
+   - kill the echo server
+4. Verify --help output documents all flags
+5. Verify non-zero exit code: salvo http://localhost:1 -n 1 (unreachable target)
 
 Compare against prior logs/validate/VALIDATION-RUN-*.md.
 
 Write to logs/validate/VALIDATION-RUN-{N}.md."
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4b: QA-AGENT VALIDATION
+    //  Start the echo server, run qa-agent to validate its endpoints,
+    //  then run salvo against it and verify output.
+    // ═══════════════════════════════════════════════════════════════════
+
+    qa_agent_validate [
+        shape=parallelogram,
+        label="QA-Agent: Validate echo server",
+        tool_command="cd $PROJECT_ROOT && pip install -e . 2>/dev/null && python -m salvo echo-server --port 9300 & ECHO_PID=$! && sleep 2 && cd $HOME/qa-agent && go run ./cmd/qa-agent run --feature 'GET http://localhost:9300/ returns JSON with status 200 containing a method field. POST http://localhost:9300/echo with body hello returns JSON with status 200 containing the echoed body. GET http://localhost:9300/health returns status 200.' --surfaces api --budget-steps 30 --budget-minutes 3 --output-dir /tmp/qa-salvo-run 2>&1; QA_EXIT=$?; kill $ECHO_PID 2>/dev/null; exit $QA_EXIT"
     ]
 
     // ═══════════════════════════════════════════════════════════════════
@@ -214,8 +264,10 @@ Write to logs/critique/CRITIQUE-PARETO-{N}.md."
     review_breakdown -> breakdown [label="revise"]
 
     implement -> validate
-    validate -> critique_harsh [condition="outcome=success"]
+    validate -> qa_agent_validate [condition="outcome=success"]
     validate -> plan [condition="outcome=fail", label="Fix failures"]
+
+    qa_agent_validate -> critique_harsh
 
     critique_harsh -> critique_pareto -> critique_gate
     critique_gate -> exit [label="ship it"]

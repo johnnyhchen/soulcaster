@@ -4,6 +4,39 @@ digraph attractor_run {
     label = "CLI Task Tracker (Rust)"
     default_max_retry = 3
 
+    // ─── Definition of Done ─────────────────────────────────────────
+    //
+    //  The pipeline is complete when ALL of these are true:
+    //
+    //  BUILD
+    //    [ ] cargo build --release succeeds with zero errors
+    //    [ ] cargo clippy -- -D warnings produces zero warnings
+    //
+    //  TESTS
+    //    [ ] cargo test passes all unit and integration tests
+    //    [ ] Integration tests cover: add, list, done, delete, search
+    //
+    //  FUNCTIONAL (verified by validate node + qa-agent)
+    //    [ ] tsk add 'Buy milk' --priority high  → prints confirmation, exit 0
+    //    [ ] tsk add 'Read book'                  → default priority low, exit 0
+    //    [ ] tsk list                             → table with both tasks
+    //    [ ] tsk list --priority high             → only 'Buy milk' shown
+    //    [ ] tsk done 1                           → marks task done, exit 0
+    //    [ ] tsk list --status done               → shows completed task with done_at
+    //    [ ] tsk search 'milk'                    → finds 'Buy milk' via FTS
+    //    [ ] tsk delete 2                         → removes task, exit 0
+    //    [ ] tsk --help                           → shows usage for all commands
+    //
+    //  QA-AGENT VERIFICATION
+    //    [ ] qa-agent runs tsk through a REST wrapper and returns verdict: pass
+    //
+    //  QUALITY
+    //    [ ] No unwrap() in non-test code (uses anyhow ? operator)
+    //    [ ] All SQL uses parameterized queries (no string interpolation)
+    //    [ ] Errors produce user-friendly messages, not stack traces
+    //
+    // ─────────────────────────────────────────────────────────────────
+
     // ─── Model Stylesheet ────────────────────────────────────────────
     model_stylesheet = "
         * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
@@ -66,6 +99,7 @@ The plan must cover:
 5. Error handling strategy (anyhow for applications)
 6. Testing approach: unit tests for DB layer, integration tests for CLI commands
 7. Dependencies: clap, rusqlite (with bundled feature), comfy-table, anyhow, chrono
+8. A thin HTTP wrapper (using tiny_http or actix-web) that exposes tsk commands as REST endpoints for qa-agent validation: GET /tasks, POST /tasks, PUT /tasks/:id/done, DELETE /tasks/:id, GET /search?q=term
 
 IMPORTANT: Use bash heredoc for files over 100 lines.
 
@@ -99,6 +133,7 @@ Break the implementation into single-commit chunks. Suggested order:
 8. Search command: FTS5 setup, query across title+description
 9. Error handling: user-friendly error messages, exit codes
 10. Integration tests: test each command via assert_cmd crate
+11. REST wrapper: thin HTTP server exposing task CRUD for qa-agent validation
 
 Each commit must include a QA plan with specific cargo test commands.
 
@@ -168,6 +203,18 @@ Write results to logs/validate/VALIDATION-RUN-{N}.md with:
     ]
 
     // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 4b: QA-AGENT VALIDATION
+    //  Start the REST wrapper, run qa-agent against it, verify all
+    //  endpoints return expected results.
+    // ═══════════════════════════════════════════════════════════════════
+
+    qa_agent_validate [
+        shape=parallelogram,
+        label="QA-Agent: Validate REST API",
+        tool_command="cd $PROJECT_ROOT && cargo build --release 2>/dev/null && ./target/release/tsk serve --port 9100 & TSK_PID=$! && sleep 2 && cd $HOME/qa-agent && go run ./cmd/qa-agent run --feature 'GET http://localhost:9100/tasks returns a JSON array with status 200. POST http://localhost:9100/tasks with a JSON body creates a task and returns status 201. GET http://localhost:9100/tasks returns at least one task after creation with status 200. PUT http://localhost:9100/tasks/1/done marks the task done and returns status 200. GET http://localhost:9100/search?q=test returns matching tasks with status 200. DELETE http://localhost:9100/tasks/1 removes the task and returns status 200.' --surfaces api --budget-steps 30 --budget-minutes 3 --output-dir /tmp/qa-tsk-run 2>&1; QA_EXIT=$?; kill $TSK_PID 2>/dev/null; exit $QA_EXIT"
+    ]
+
+    // ═══════════════════════════════════════════════════════════════════
     //  PHASE 5: CRITIQUE
     // ═══════════════════════════════════════════════════════════════════
 
@@ -234,9 +281,12 @@ Write to logs/critique/CRITIQUE-PARETO-{N}.md."
     // Phase 3 → 4
     implement -> validate
 
-    // Phase 4 routing
-    validate -> critique_harsh [condition="outcome=success"]
+    // Phase 4 → 4b (qa-agent)
+    validate -> qa_agent_validate [condition="outcome=success"]
     validate -> plan [condition="outcome=fail", label="Fix failures"]
+
+    // Phase 4b → 5
+    qa_agent_validate -> critique_harsh
 
     // Phase 5
     critique_harsh -> critique_pareto

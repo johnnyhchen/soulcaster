@@ -230,7 +230,7 @@ public sealed class AnthropicAdapter : IProviderAdapter
         if (request.MaxTokens is not null)
             body["max_tokens"] = request.MaxTokens.Value;
         else
-            body["max_tokens"] = request.ReasoningEffort is not null ? 65536 : 16384;
+            body["max_tokens"] = request.ReasoningEffort is not null ? 64000 : 16384;
 
         if (request.Temperature is not null)
             body["temperature"] = request.Temperature.Value;

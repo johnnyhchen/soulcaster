@@ -501,7 +501,7 @@ internal class FakeExecutionEnvironment : IExecutionEnvironment
     public Task<string> RunCommandAsync(string command, int? timeoutMs = null, CancellationToken ct = default)
         => Task.FromResult($"Output of: {command}");
 
-    public Task<IReadOnlyList<string>> GlobAsync(string pattern, string? path = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> GlobAsync(string pattern, string? path = null, int? maxResults = null, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<string>>(new List<string> { "/fake/file1.cs", "/fake/file2.cs" });
 
     public Task<IReadOnlyList<string>> GrepAsync(string pattern, string? path = null, string? globFilter = null, bool caseInsensitive = false, int? maxResults = null, CancellationToken ct = default)

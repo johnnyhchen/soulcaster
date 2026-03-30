@@ -1,7 +1,10 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Diagnostics;
+using System.Net;
 using JcAttractor.Attractor;
 using JcAttractor.CodingAgent;
+using JcAttractor.Runner;
 using JcAttractor.UnifiedLlm;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -21,6 +24,8 @@ return command switch
     "status" => await ShowStatus(args[1..]),
     "logs" => await ShowLogs(args[1..]),
     "web" => await RunWeb(args[1..]),
+    "lint" => await RunLint(args[1..]),
+    "builder" => await RunBuilder(args[1..]),
     "help" or "--help" or "-h" => ShowHelp(),
     _ when command.EndsWith(".dot") => await RunPipeline(args), // backwards compat
     _ => ShowHelp()
@@ -112,6 +117,45 @@ static string? FindLogsDir(string outputDir)
 }
 
 static JsonSerializerOptions JsonOpts() => new() { WriteIndented = true };
+
+static object? ConvertJsonValue(JsonElement value)
+{
+    return value.ValueKind switch
+    {
+        JsonValueKind.Object => value.EnumerateObject()
+            .ToDictionary(p => p.Name, p => ConvertJsonValue(p.Value), StringComparer.Ordinal),
+        JsonValueKind.Array => value.EnumerateArray().Select(ConvertJsonValue).ToList(),
+        JsonValueKind.String => value.GetString(),
+        JsonValueKind.Number when value.TryGetInt64(out var i64) => i64,
+        JsonValueKind.Number when value.TryGetDouble(out var d) => d,
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null => null,
+        _ => value.ToString()
+    };
+}
+
+static bool TryReadLong(JsonElement root, string property, out long value)
+{
+    value = 0;
+    if (!root.TryGetProperty(property, out var el))
+        return false;
+
+    if (el.ValueKind == JsonValueKind.Number && el.TryGetInt64(out var number))
+    {
+        value = number;
+        return true;
+    }
+
+    if (el.ValueKind == JsonValueKind.String &&
+        long.TryParse(el.GetString(), out var parsed))
+    {
+        value = parsed;
+        return true;
+    }
+
+    return false;
+}
 
 // ═════════════════════════════════════════════════════════════════════
 // Global run registry (~/.attractor/runs.json)
@@ -533,7 +577,11 @@ static async Task<int> ShowStatus(string[] args)
             var sRoot = statusDoc.RootElement;
             statusText = sRoot.TryGetProperty("status", out var s) ? s.GetString() ?? "done" : "done";
             var notes = sRoot.TryGetProperty("notes", out var n) ? n.GetString() : null;
-            var preferred = sRoot.TryGetProperty("preferred_label", out var p) ? p.GetString() : null;
+            var preferred = sRoot.TryGetProperty("preferred_next_label", out var pNext)
+                ? pNext.GetString()
+                : sRoot.TryGetProperty("preferred_label", out var pLegacy)
+                    ? pLegacy.GetString()
+                    : null;
             if (!string.IsNullOrEmpty(preferred))
                 statusText += $" → {preferred}";
         }
@@ -873,7 +921,11 @@ static async Task<int> RunWeb(string[] args)
                 var doc = JsonDocument.Parse(await File.ReadAllTextAsync(statusFile));
                 var sr = doc.RootElement;
                 status = sr.TryGetProperty("status", out var s) ? s.GetString() ?? "done" : "done";
-                preferred = sr.TryGetProperty("preferred_label", out var p) ? p.GetString() : null;
+                preferred = sr.TryGetProperty("preferred_next_label", out var pNext)
+                    ? pNext.GetString()
+                    : sr.TryGetProperty("preferred_label", out var pLegacy)
+                        ? pLegacy.GetString()
+                        : null;
                 notes = sr.TryGetProperty("notes", out var n) ? n.GetString() : null;
             }
             var inCurrentIteration = currentIterationNodes.Contains(node);
@@ -1208,6 +1260,119 @@ static async Task<int> RunWeb(string[] args)
         });
     });
 
+    app.MapGet("/api/pipeline/{id}/graph", async (string id) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
+
+        var dotPath = ResolvePipelineDotfilePath(pipelineDir);
+        if (dotPath == null || !File.Exists(dotPath))
+            return Results.NotFound("dotfile not found for pipeline");
+
+        var checkpointPath = Path.Combine(pipelineDir, "logs", "checkpoint.json");
+        string? currentNode = null;
+        var completedNodes = new HashSet<string>(StringComparer.Ordinal);
+        if (File.Exists(checkpointPath))
+        {
+            try
+            {
+                var cp = JsonDocument.Parse(await File.ReadAllTextAsync(checkpointPath));
+                currentNode = cp.RootElement.TryGetProperty("CurrentNodeId", out var current) ? current.GetString() : null;
+                if (cp.RootElement.TryGetProperty("CompletedNodes", out var completed) && completed.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var node in completed.EnumerateArray())
+                    {
+                        var idText = node.GetString();
+                        if (!string.IsNullOrWhiteSpace(idText))
+                            completedNodes.Add(idText);
+                    }
+                }
+            }
+            catch
+            {
+                // Best effort.
+            }
+        }
+
+        var svg = await RenderGraphSvgAsync(dotPath, currentNode, completedNodes);
+        return Results.Text(svg, "image/svg+xml");
+    });
+
+    app.MapGet("/api/pipeline/{id}/telemetry", async (string id) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
+
+        var eventsPath = Path.Combine(pipelineDir, "logs", "events.jsonl");
+        if (!File.Exists(eventsPath))
+            return Results.Json(new
+            {
+                events = Array.Empty<object>(),
+                per_node = new Dictionary<string, object>(),
+                stage_metrics = new Dictionary<string, object>(),
+                totals = new { tool_calls = 0L, tool_errors = 0L, total_tokens = 0L }
+            });
+
+        var events = new List<Dictionary<string, object?>>();
+        var perNode = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        var stageMetrics = new Dictionary<string, object?>(StringComparer.Ordinal);
+        long totalToolCalls = 0;
+        long totalToolErrors = 0;
+        long totalTokens = 0;
+
+        foreach (var line in await File.ReadAllLinesAsync(eventsPath))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                var evt = new Dictionary<string, object?>();
+                foreach (var prop in root.EnumerateObject())
+                    evt[prop.Name] = ConvertJsonValue(prop.Value);
+                events.Add(evt);
+
+                var node = root.TryGetProperty("node_id", out var n) ? n.GetString() ?? "unknown" : "unknown";
+                var eventType = root.TryGetProperty("event_type", out var t) ? t.GetString() ?? "unknown" : "unknown";
+                if (!perNode.TryGetValue(node, out var nodeStats))
+                {
+                    nodeStats = new Dictionary<string, int>(StringComparer.Ordinal);
+                    perNode[node] = nodeStats;
+                }
+                nodeStats[eventType] = nodeStats.GetValueOrDefault(eventType, 0) + 1;
+
+                if (eventType == "stage_end" && root.TryGetProperty("stage_metrics", out var metrics))
+                    stageMetrics[node] = ConvertJsonValue(metrics);
+
+                if (TryReadLong(root, "tool_calls", out var toolCalls))
+                    totalToolCalls += toolCalls;
+                if (TryReadLong(root, "tool_errors", out var toolErrors))
+                    totalToolErrors += toolErrors;
+                if (TryReadLong(root, "total_tokens", out var tokens))
+                    totalTokens += tokens;
+            }
+            catch
+            {
+                // Ignore malformed line.
+            }
+        }
+
+        return Results.Json(new
+        {
+            events,
+            per_node = perNode,
+            stage_metrics = stageMetrics,
+            totals = new
+            {
+                tool_calls = totalToolCalls,
+                tool_errors = totalToolErrors,
+                total_tokens = totalTokens
+            }
+        });
+    });
+
     // ── Dashboard HTML ──────────────────────────────────────────────
 
     app.MapGet("/", () => Results.Content(DashboardHtml(), "text/html"));
@@ -1329,6 +1494,143 @@ static List<object> DiscoverAllPipelines()
     }
 
     return pipelines;
+}
+
+static string? ResolvePipelineDotfilePath(string pipelineDir)
+{
+    // 1) run-manifest.json (authoritative for new runs)
+    var manifestPath = Path.Combine(pipelineDir, "run-manifest.json");
+    if (File.Exists(manifestPath))
+    {
+        try
+        {
+            var manifest = JsonSerializer.Deserialize<RunManifest>(File.ReadAllText(manifestPath));
+            if (!string.IsNullOrWhiteSpace(manifest?.graph_path) && File.Exists(manifest.graph_path))
+                return manifest.graph_path;
+        }
+        catch
+        {
+            // Ignore malformed manifest.
+        }
+    }
+
+    // 2) registry lookup
+    var registry = LoadRegistry();
+    var match = registry.FirstOrDefault(r =>
+        Path.GetFullPath(r.output_dir).Equals(Path.GetFullPath(pipelineDir), StringComparison.OrdinalIgnoreCase));
+    if (match is not null && File.Exists(match.dotfile))
+        return Path.GetFullPath(match.dotfile);
+
+    // 3) conventional path: {dotfiles}/{runname}.dot where pipelineDir is {dotfiles}/output/{runname}
+    var outputDir = Path.GetDirectoryName(pipelineDir);
+    if (outputDir is not null && Path.GetFileName(outputDir).Equals("output", StringComparison.OrdinalIgnoreCase))
+    {
+        var dotfilesDir = Path.GetDirectoryName(outputDir);
+        if (dotfilesDir is not null)
+        {
+            var candidate = Path.Combine(dotfilesDir, Path.GetFileName(pipelineDir) + ".dot");
+            if (File.Exists(candidate))
+                return candidate;
+        }
+    }
+
+    return null;
+}
+
+static async Task<string> RenderGraphSvgAsync(string dotPath, string? currentNode, HashSet<string> completedNodes)
+{
+    var psi = new ProcessStartInfo
+    {
+        FileName = "dot",
+        ArgumentList = { "-Tsvg", dotPath },
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+
+    try
+    {
+        using var process = Process.Start(psi);
+        if (process is null)
+            return "<svg xmlns=\"http://www.w3.org/2000/svg\"><text x=\"10\" y=\"24\">Unable to start graphviz dot.</text></svg>";
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var svg = await stdoutTask;
+        var stderr = await stderrTask;
+
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(svg))
+        {
+            var message = WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(stderr) ? "dot failed to render graph" : stderr);
+            return $"<svg xmlns=\"http://www.w3.org/2000/svg\"><text x=\"10\" y=\"24\">{message}</text></svg>";
+        }
+
+        svg = Regex.Replace(svg, @"<\?xml[^>]*\?>\s*", string.Empty, RegexOptions.IgnoreCase);
+        svg = Regex.Replace(svg, @"<!DOCTYPE[^>]*>\s*", string.Empty, RegexOptions.IgnoreCase);
+
+        return DecorateGraphSvg(svg, currentNode, completedNodes);
+    }
+    catch (Exception ex)
+    {
+        var message = WebUtility.HtmlEncode(ex.Message);
+        return $"<svg xmlns=\"http://www.w3.org/2000/svg\"><text x=\"10\" y=\"24\">{message}</text></svg>";
+    }
+}
+
+static string DecorateGraphSvg(string svg, string? currentNode, HashSet<string> completedNodes)
+{
+    var styleBlock =
+        "<style>" +
+        ".node.completed ellipse,.node.completed polygon,.node.completed path{fill:#e6ffed !important;stroke:#1a7f37 !important;stroke-width:1.8px !important;}" +
+        ".node.active ellipse,.node.active polygon,.node.active path{fill:#fff4ce !important;stroke:#b54708 !important;stroke-width:2.4px !important;}" +
+        ".node.active text{font-weight:700;}" +
+        "</style>";
+
+    svg = Regex.Replace(
+        svg,
+        @"(<svg\b[^>]*>)",
+        "$1" + styleBlock,
+        RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(1));
+
+    var nodeGroupPattern = new Regex(
+        @"<g(?<attrs>[^>]*\bclass=""node""[^>]*)>(?<body>.*?)</g>",
+        RegexOptions.Singleline | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
+
+    svg = nodeGroupPattern.Replace(svg, match =>
+    {
+        var attrs = match.Groups["attrs"].Value;
+        var body = match.Groups["body"].Value;
+
+        var titleMatch = Regex.Match(body, @"<title>(?<id>[^<]+)</title>", RegexOptions.IgnoreCase);
+        if (!titleMatch.Success)
+            return match.Value;
+
+        var nodeId = WebUtility.HtmlDecode(titleMatch.Groups["id"].Value);
+        var classes = new List<string> { "node" };
+
+        if (completedNodes.Contains(nodeId))
+            classes.Add("completed");
+        if (!string.IsNullOrWhiteSpace(currentNode) && currentNode.Equals(nodeId, StringComparison.Ordinal))
+            classes.Add("active");
+
+        if (classes.Count == 1)
+            return match.Value;
+
+        var updatedAttrs = Regex.Replace(
+            attrs,
+            @"class=""[^""]*""",
+            $"class=\"{string.Join(" ", classes)}\"",
+            RegexOptions.IgnoreCase,
+            TimeSpan.FromSeconds(1));
+
+        return "<g" + updatedAttrs + ">" + body + "</g>";
+    });
+
+    return svg;
 }
 
 // ── Summary extraction helpers ──────────────────────────────────────
@@ -1603,6 +1905,8 @@ static string DashboardHtml() => """
   .scorecard-failures { margin-top: 4px; padding-left: 24px; font-size: 11px; color: var(--red); }
   .current-task { background: rgba(210,153,34,0.12); border: 1px solid var(--yellow); border-radius: 6px;
                   padding: 8px 12px; margin-bottom: 12px; font-size: 13px; color: var(--yellow); }
+  .graph-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; overflow: auto; }
+  .graph-wrap svg { width: 100%; height: auto; display: block; }
 </style>
 </head>
 <body>
@@ -1683,6 +1987,12 @@ async function fetchJson(url) {
   return r.json();
 }
 
+async function fetchText(url) {
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return r.text();
+}
+
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -1729,11 +2039,13 @@ async function selectPipeline(id) {
 // ── Detail panel ────────────────────────────────────────────────────
 
 async function loadDetail(id) {
-  const [status, gates, logs, summaries] = await Promise.all([
+  const [status, gates, logs, summaries, graphSvg, telemetry] = await Promise.all([
     fetchJson(`/api/pipeline/${id}/status`),
     fetchJson(`/api/pipeline/${id}/gates`),
     fetchJson(`/api/pipeline/${id}/logs`),
-    fetchJson(`/api/pipeline/${id}/summaries`)
+    fetchJson(`/api/pipeline/${id}/summaries`),
+    fetchText(`/api/pipeline/${id}/graph`),
+    fetchJson(`/api/pipeline/${id}/telemetry`)
   ]);
 
   let html = '';
@@ -1802,6 +2114,43 @@ async function loadDetail(id) {
       });
       html += `</div>`;
     }
+    html += `</div>`;
+  }
+
+  if (graphSvg) {
+    html += `<div class="section"><div class="section-title">Live Graph</div><div class="graph-wrap">${graphSvg}</div></div>`;
+  }
+
+  if (telemetry && ((telemetry.per_node && Object.keys(telemetry.per_node).length > 0) || (telemetry.stage_metrics && Object.keys(telemetry.stage_metrics).length > 0))) {
+    html += `<div class="section"><div class="section-title">Telemetry</div>`;
+    if (telemetry.totals) {
+      const tc = telemetry.totals.tool_calls || 0;
+      const te = telemetry.totals.tool_errors || 0;
+      const tt = telemetry.totals.total_tokens || 0;
+      html += `<div style="margin-bottom:10px;font-size:12px;color:var(--text2);">tool calls: <strong>${tc}</strong> &middot; tool errors: <strong>${te}</strong> &middot; total tokens: <strong>${tt}</strong></div>`;
+    }
+    const perNode = telemetry.per_node || {};
+    const entries = Object.entries(perNode);
+    entries.sort((a, b) => a[0].localeCompare(b[0]));
+    entries.forEach(([node, stats]) => {
+      const start = stats.stage_start || 0;
+      const end = stats.stage_end || 0;
+      const retry = stats.stage_retry || 0;
+      const metrics = telemetry.stage_metrics ? telemetry.stage_metrics[node] : null;
+      let details = '';
+      if (metrics) {
+        const toolCalls = metrics.tool_calls || 0;
+        const toolErrors = metrics.tool_errors || 0;
+        const touched = metrics.touched_files_count || 0;
+        const tokens = metrics.token_usage?.total_tokens || 0;
+        details = ` &middot; tools:${toolCalls} errors:${toolErrors} files:${touched} tokens:${tokens}`;
+      }
+      html += `<div class="node-row"><span class="node-name">${node}</span><span class="node-status">start:${start} end:${end} retry:${retry}${details}</span></div>`;
+      if (metrics && metrics.touched_files && metrics.touched_files.length > 0) {
+        const files = metrics.touched_files.slice(0, 6).map(f => escapeHtml(String(f))).join(', ');
+        html += `<div class="node-summary">touched: ${files}${metrics.touched_files.length > 6 ? ', ...' : ''}</div>`;
+      }
+    });
     html += `</div>`;
   }
 
@@ -2099,14 +2448,422 @@ pollTimer = setInterval(refresh, 3000);
 """;
 
 // ═════════════════════════════════════════════════════════════════════
+// builder — assisted DOT authoring workflow
+// ═════════════════════════════════════════════════════════════════════
+
+static Task<int> RunBuilder(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.Error.WriteLine("builder: missing subcommand. Use init | graph | node | edge | inspect.");
+        return Task.FromResult(1);
+    }
+
+    return args[0] switch
+    {
+        "init" => RunBuilderInit(args[1..]),
+        "graph" => RunBuilderGraph(args[1..]),
+        "node" => RunBuilderNode(args[1..]),
+        "edge" => RunBuilderEdge(args[1..]),
+        "inspect" => RunBuilderInspect(args[1..]),
+        _ => Task.FromResult(ShowBuilderHelp())
+    };
+}
+
+static Task<int> RunBuilderInit(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.Error.WriteLine("builder init: missing <dotfile> path.");
+        return Task.FromResult(1);
+    }
+
+    var dotFilePath = Path.GetFullPath(args[0]);
+    var name = Path.GetFileNameWithoutExtension(dotFilePath);
+    string? goal = null;
+
+    for (var i = 1; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--name" when i + 1 < args.Length:
+                name = args[++i];
+                break;
+            case "--goal" when i + 1 < args.Length:
+                goal = args[++i];
+                break;
+        }
+    }
+
+    var graph = BuilderCommandSupport.InitializeGraph(name, goal);
+    BuilderCommandSupport.Save(dotFilePath, graph);
+    Console.WriteLine($"builder: initialized {dotFilePath}");
+    return Task.FromResult(0);
+}
+
+static Task<int> RunBuilderGraph(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.Error.WriteLine("builder graph: missing <dotfile> path.");
+        return Task.FromResult(1);
+    }
+
+    var dotFilePath = Path.GetFullPath(args[0]);
+    if (!File.Exists(dotFilePath))
+    {
+        Console.Error.WriteLine($"builder graph: dotfile not found: {dotFilePath}");
+        return Task.FromResult(1);
+    }
+
+    var graph = BuilderCommandSupport.Load(dotFilePath);
+    var attributes = new Dictionary<string, string>(StringComparer.Ordinal);
+    for (var i = 1; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--goal" when i + 1 < args.Length:
+                attributes["goal"] = args[++i];
+                break;
+            case "--label" when i + 1 < args.Length:
+                attributes["label"] = args[++i];
+                break;
+            case "--retry-target" when i + 1 < args.Length:
+                attributes["retry_target"] = args[++i];
+                break;
+            case "--fallback-retry-target" when i + 1 < args.Length:
+                attributes["fallback_retry_target"] = args[++i];
+                break;
+            case "--default-fidelity" when i + 1 < args.Length:
+                attributes["default_fidelity"] = args[++i];
+                break;
+            case "--default-max-retry" when i + 1 < args.Length:
+                attributes["default_max_retry"] = args[++i];
+                break;
+            case "--attr" when i + 1 < args.Length:
+                if (!TryParseBuilderAttribute(args[++i], out var key, out var value))
+                    return Task.FromResult(FailBuilderArgument("builder graph", $"invalid --attr '{args[i]}' (expected key=value)."));
+                attributes[key] = value;
+                break;
+        }
+    }
+
+    BuilderCommandSupport.UpsertGraphAttributes(graph, attributes);
+    BuilderCommandSupport.Save(dotFilePath, graph);
+    Console.WriteLine($"builder: updated graph attributes for {dotFilePath}");
+    return Task.FromResult(0);
+}
+
+static Task<int> RunBuilderNode(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("builder node: usage: attractor builder node <dotfile> <node-id> [options]");
+        return Task.FromResult(1);
+    }
+
+    var dotFilePath = Path.GetFullPath(args[0]);
+    if (!File.Exists(dotFilePath))
+    {
+        Console.Error.WriteLine($"builder node: dotfile not found: {dotFilePath}");
+        return Task.FromResult(1);
+    }
+
+    var nodeId = args[1];
+    var graph = BuilderCommandSupport.Load(dotFilePath);
+    var attributes = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    for (var i = 2; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--shape" when i + 1 < args.Length:
+                attributes["shape"] = args[++i];
+                break;
+            case "--label" when i + 1 < args.Length:
+                attributes["label"] = args[++i];
+                break;
+            case "--prompt" when i + 1 < args.Length:
+                attributes["prompt"] = args[++i];
+                break;
+            case "--type" when i + 1 < args.Length:
+                attributes["type"] = args[++i];
+                break;
+            case "--max-retries" when i + 1 < args.Length:
+                attributes["max_retries"] = args[++i];
+                break;
+            case "--goal-gate":
+                attributes["goal_gate"] = "true";
+                break;
+            case "--retry-target" when i + 1 < args.Length:
+                attributes["retry_target"] = args[++i];
+                break;
+            case "--fallback-retry-target" when i + 1 < args.Length:
+                attributes["fallback_retry_target"] = args[++i];
+                break;
+            case "--fidelity" when i + 1 < args.Length:
+                attributes["fidelity"] = args[++i];
+                break;
+            case "--thread-id" when i + 1 < args.Length:
+                attributes["thread_id"] = args[++i];
+                break;
+            case "--class" when i + 1 < args.Length:
+                attributes["class"] = args[++i];
+                break;
+            case "--timeout" when i + 1 < args.Length:
+                attributes["timeout"] = args[++i];
+                break;
+            case "--model" when i + 1 < args.Length:
+                attributes["model"] = args[++i];
+                break;
+            case "--provider" when i + 1 < args.Length:
+                attributes["provider"] = args[++i];
+                break;
+            case "--reasoning-effort" when i + 1 < args.Length:
+                attributes["reasoning_effort"] = args[++i];
+                break;
+            case "--auto-status":
+                attributes["auto_status"] = "true";
+                break;
+            case "--allow-partial":
+                attributes["allow_partial"] = "true";
+                break;
+            case "--attr" when i + 1 < args.Length:
+                if (!TryParseBuilderAttribute(args[++i], out var key, out var value))
+                    return Task.FromResult(FailBuilderArgument("builder node", $"invalid --attr '{args[i]}' (expected key=value)."));
+                attributes[key] = value;
+                break;
+        }
+    }
+
+    BuilderCommandSupport.UpsertNode(graph, nodeId, attributes);
+    BuilderCommandSupport.Save(dotFilePath, graph);
+    Console.WriteLine($"builder: upserted node '{nodeId}' in {dotFilePath}");
+    return Task.FromResult(0);
+}
+
+static Task<int> RunBuilderEdge(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("builder edge: usage: attractor builder edge <dotfile> <from-node> <to-node> [options]");
+        return Task.FromResult(1);
+    }
+
+    var dotFilePath = Path.GetFullPath(args[0]);
+    if (!File.Exists(dotFilePath))
+    {
+        Console.Error.WriteLine($"builder edge: dotfile not found: {dotFilePath}");
+        return Task.FromResult(1);
+    }
+
+    var fromNode = args[1];
+    var toNode = args[2];
+    var graph = BuilderCommandSupport.Load(dotFilePath);
+    var attributes = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    for (var i = 3; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--label" when i + 1 < args.Length:
+                attributes["label"] = args[++i];
+                break;
+            case "--condition" when i + 1 < args.Length:
+                attributes["condition"] = args[++i];
+                break;
+            case "--weight" when i + 1 < args.Length:
+                attributes["weight"] = args[++i];
+                break;
+            case "--fidelity" when i + 1 < args.Length:
+                attributes["fidelity"] = args[++i];
+                break;
+            case "--thread-id" when i + 1 < args.Length:
+                attributes["thread_id"] = args[++i];
+                break;
+            case "--loop-restart":
+                attributes["loop_restart"] = "true";
+                break;
+            case "--attr" when i + 1 < args.Length:
+                if (!TryParseBuilderAttribute(args[++i], out var key, out var value))
+                    return Task.FromResult(FailBuilderArgument("builder edge", $"invalid --attr '{args[i]}' (expected key=value)."));
+                attributes[key] = value;
+                break;
+        }
+    }
+
+    BuilderCommandSupport.UpsertEdge(graph, fromNode, toNode, attributes);
+    BuilderCommandSupport.Save(dotFilePath, graph);
+    Console.WriteLine($"builder: upserted edge {fromNode} -> {toNode} in {dotFilePath}");
+    return Task.FromResult(0);
+}
+
+static Task<int> RunBuilderInspect(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.Error.WriteLine("builder inspect: missing <dotfile> path.");
+        return Task.FromResult(1);
+    }
+
+    var dotFilePath = Path.GetFullPath(args[0]);
+    if (!File.Exists(dotFilePath))
+    {
+        Console.Error.WriteLine($"builder inspect: dotfile not found: {dotFilePath}");
+        return Task.FromResult(1);
+    }
+
+    var graph = BuilderCommandSupport.Load(dotFilePath);
+    Console.WriteLine(BuilderCommandSupport.Describe(graph));
+    return Task.FromResult(0);
+}
+
+static bool TryParseBuilderAttribute(string text, out string key, out string value)
+{
+    key = string.Empty;
+    value = string.Empty;
+    var separator = text.IndexOf('=');
+    if (separator <= 0 || separator == text.Length - 1)
+        return false;
+
+    key = text[..separator];
+    value = text[(separator + 1)..];
+    return !string.IsNullOrWhiteSpace(key);
+}
+
+static int FailBuilderArgument(string commandName, string message)
+{
+    Console.Error.WriteLine($"{commandName}: {message}");
+    return 1;
+}
+
+static int ShowBuilderHelp()
+{
+    Console.WriteLine("builder — assisted DOT authoring workflow");
+    Console.WriteLine();
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  attractor builder init <dotfile> [--name <name>] [--goal <goal>]");
+    Console.WriteLine("  attractor builder graph <dotfile> [--goal <goal>] [--label <label>] [--attr key=value]");
+    Console.WriteLine("  attractor builder node <dotfile> <node-id> [--shape <shape>] [--label <label>] [--prompt <prompt>] [--attr key=value]");
+    Console.WriteLine("  attractor builder edge <dotfile> <from-node> <to-node> [--label <label>] [--condition <expr>] [--attr key=value]");
+    Console.WriteLine("  attractor builder inspect <dotfile>");
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// lint — validate DOT files
+// ═════════════════════════════════════════════════════════════════════
+
+static Task<int> RunLint(string[] args)
+{
+    var targets = new List<string>();
+    var recursive = false;
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        var arg = args[i];
+        switch (arg)
+        {
+            case "--all":
+            case "--recursive":
+                recursive = true;
+                break;
+            default:
+                if (!arg.StartsWith("--", StringComparison.Ordinal))
+                    targets.Add(arg);
+                break;
+        }
+    }
+
+    if (targets.Count == 0)
+    {
+        var cwdDot = Directory.GetFiles(Directory.GetCurrentDirectory(), "*.dot");
+        if (cwdDot.Length > 0)
+            targets.AddRange(cwdDot);
+        else
+            targets.Add("dotfiles");
+    }
+
+    var dotFiles = new List<string>();
+    foreach (var target in targets)
+    {
+        var full = Path.GetFullPath(target);
+        if (File.Exists(full))
+        {
+            dotFiles.Add(full);
+            continue;
+        }
+
+        if (Directory.Exists(full))
+        {
+            var option = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            dotFiles.AddRange(Directory.GetFiles(full, "*.dot", option));
+            continue;
+        }
+
+        Console.Error.WriteLine($"lint: target not found: {target}");
+    }
+
+    if (dotFiles.Count == 0)
+    {
+        Console.Error.WriteLine("lint: no .dot files found.");
+        return Task.FromResult(1);
+    }
+
+    var totalErrors = 0;
+    var totalWarnings = 0;
+
+    foreach (var dotFile in dotFiles.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"Linting {dotFile}");
+        try
+        {
+            var source = File.ReadAllText(dotFile);
+            var graph = DotParser.Parse(source);
+            var results = Validator.Validate(graph);
+
+            var errors = results.Where(r => r.Severity == LintSeverity.Error).ToList();
+            var warnings = results.Where(r => r.Severity == LintSeverity.Warning).ToList();
+            totalErrors += errors.Count;
+            totalWarnings += warnings.Count;
+
+            if (results.Count == 0)
+            {
+                Console.WriteLine("  ✓ no issues");
+                continue;
+            }
+
+            foreach (var issue in results)
+            {
+                var location = issue.NodeId ?? issue.EdgeId ?? "graph";
+                var marker = issue.Severity == LintSeverity.Error ? "error" : "warn";
+                Console.WriteLine($"  [{marker}] {issue.Rule} ({location}) {issue.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            totalErrors++;
+            Console.WriteLine($"  [error] parse {ex.Message}");
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"lint summary: {dotFiles.Count} files, {totalErrors} errors, {totalWarnings} warnings");
+
+    return Task.FromResult(totalErrors == 0 ? 0 : 1);
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // run — start a pipeline (existing behavior)
 // ═════════════════════════════════════════════════════════════════════
 
 static async Task<int> RunPipeline(string[] args)
 {
-    var dotFilePath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "betrayal.dot");
-    if (args.Length > 0)
-        dotFilePath = args[0];
+    var options = RunOptions.Parse(args);
+
+    var dotFilePath = options.DotFilePath;
+    if (string.IsNullOrWhiteSpace(dotFilePath))
+        dotFilePath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "betrayal.dot");
 
     dotFilePath = Path.GetFullPath(dotFilePath);
     if (!File.Exists(dotFilePath))
@@ -2116,7 +2873,7 @@ static async Task<int> RunPipeline(string[] args)
     }
 
     var dotName = Path.GetFileNameWithoutExtension(dotFilePath);
-    var workingDir = Path.Combine(Path.GetDirectoryName(dotFilePath)!, "output", dotName);
+    var workingDir = RunCommandSupport.ResolveWorkingDirectory(dotFilePath, options);
     Directory.CreateDirectory(workingDir);
 
     // Convention: dotfile lives at {project}/dotfiles/{name}.dot,
@@ -2129,6 +2886,57 @@ static async Task<int> RunPipeline(string[] args)
     var gatesDir = Path.Combine(workingDir, "gates");
     Directory.CreateDirectory(gatesDir);
 
+    var checkpointPath = Path.Combine(logsDir, "checkpoint.json");
+    var checkpointExists = File.Exists(checkpointPath);
+    var shouldResume = options.Resume || (options.Autoresume && checkpointExists);
+
+    if (options.Resume && !checkpointExists)
+    {
+        Console.Error.WriteLine("Resume requested but no checkpoint exists for this run.");
+        return 1;
+    }
+
+    if (!shouldResume && checkpointExists)
+    {
+        Console.WriteLine("Starting fresh run (autoresume disabled).");
+        try
+        {
+            Directory.Delete(logsDir, recursive: true);
+            Directory.Delete(gatesDir, recursive: true);
+        }
+        catch
+        {
+            // Ignore cleanup failures; we'll recreate directories below.
+        }
+        Directory.CreateDirectory(logsDir);
+        Directory.CreateDirectory(gatesDir);
+        checkpointExists = false;
+    }
+
+    if (!TryAcquireRunLock(Path.Combine(workingDir, "run.lock"), out var lockError))
+    {
+        Console.Error.WriteLine(lockError);
+        return 1;
+    }
+
+    var runId = Guid.NewGuid().ToString("N");
+    var manifestPath = Path.Combine(workingDir, "run-manifest.json");
+    void WriteManifest(string status, string activeStage, string? crash = null)
+    {
+        var manifest = new RunManifest
+        {
+            run_id = runId,
+            pid = Environment.ProcessId,
+            graph_path = dotFilePath,
+            started_at = DateTime.UtcNow.ToString("o"),
+            updated_at = DateTime.UtcNow.ToString("o"),
+            active_stage = activeStage,
+            status = status,
+            crash = crash
+        };
+        File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, JsonOpts()));
+    }
+
     RegisterRun(dotFilePath, workingDir);
 
     Console.WriteLine($"Pipeline:    {dotFilePath}");
@@ -2136,10 +2944,27 @@ static async Task<int> RunPipeline(string[] args)
     Console.WriteLine($"Working dir: {workingDir}");
     Console.WriteLine($"Logs dir:    {logsDir}");
     Console.WriteLine($"Gates dir:   {gatesDir}");
+    Console.WriteLine($"Run ID:      {runId}");
+    Console.WriteLine($"Resume mode: {(shouldResume ? "resume" : "fresh")}");
+    if (!string.IsNullOrWhiteSpace(options.StartAt))
+        Console.WriteLine($"Start-at:    {options.StartAt}");
+    if (!string.IsNullOrWhiteSpace(options.SteerText))
+        Console.WriteLine("Steer text:  [provided]");
     Console.WriteLine();
 
     var dotSource = await File.ReadAllTextAsync(dotFilePath);
     var graph = DotParser.Parse(dotSource);
+
+    if (!string.IsNullOrWhiteSpace(options.StartAt))
+    {
+        if (!RunCommandSupport.TryApplyStartAt(graph, logsDir, options.StartAt, out var startAtError))
+        {
+            Console.Error.WriteLine(startAtError);
+            ReleaseRunLock(Path.Combine(workingDir, "run.lock"));
+            return 1;
+        }
+        shouldResume = true;
+    }
 
     Console.WriteLine($"Graph: {graph.Name}");
     Console.WriteLine($"Goal:  {graph.Goal?[..Math.Min(graph.Goal.Length, 80)]}...");
@@ -2147,7 +2972,7 @@ static async Task<int> RunPipeline(string[] args)
     Console.WriteLine($"Edges: {graph.Edges.Count}");
     Console.WriteLine();
 
-    var backend = new AgentCodergenBackend(workingDir, projectRoot);
+    var backend = new AgentCodergenBackend(workingDir, projectRoot, options.SteerText);
 
     var config = new PipelineConfig(
         LogsRoot: logsDir,
@@ -2164,30 +2989,111 @@ static async Task<int> RunPipeline(string[] args)
 
     Console.WriteLine("Starting pipeline...");
     Console.WriteLine(new string('─', 60));
+    WriteManifest("running", Checkpoint.Load(logsDir)?.CurrentNodeId ?? "start");
 
-    var result = await engine.RunAsync(graph);
-
-    Console.WriteLine(new string('─', 60));
-    Console.WriteLine($"Pipeline finished: {result.Status}");
-    Console.WriteLine($"Completed nodes:  {string.Join(", ", result.CompletedNodes)}");
-
-    foreach (var (nodeId, outcome) in result.NodeOutcomes)
+    try
     {
-        Console.WriteLine($"  {nodeId}: {outcome.Status} - {outcome.Notes}");
+        var result = await engine.RunAsync(graph);
+
+        Console.WriteLine(new string('─', 60));
+        Console.WriteLine($"Pipeline finished: {result.Status}");
+        Console.WriteLine($"Completed nodes:  {string.Join(", ", result.CompletedNodes)}");
+
+        foreach (var (nodeId, outcome) in result.NodeOutcomes)
+        {
+            Console.WriteLine($"  {nodeId}: {outcome.Status} - {outcome.Notes}");
+        }
+
+        // Write result marker so the dashboard can detect completion
+        var resultPayload = new
+        {
+            status = result.Status.ToString().ToLowerInvariant(),
+            completed_nodes = result.CompletedNodes,
+            finished = DateTime.UtcNow.ToString("o")
+        };
+        await File.WriteAllTextAsync(
+            Path.Combine(logsDir, "result.json"),
+            JsonSerializer.Serialize(resultPayload, JsonOpts()));
+
+        WriteManifest(
+            status: result.Status == OutcomeStatus.Success ? "completed" : "failed",
+            activeStage: result.CompletedNodes.LastOrDefault() ?? "unknown");
+
+        return result.Status == OutcomeStatus.Success ? 0 : 1;
     }
-
-    // Write result marker so the dashboard can detect completion
-    var resultPayload = new
+    catch (Exception ex)
     {
-        status = result.Status.ToString().ToLowerInvariant(),
-        completed_nodes = result.CompletedNodes,
-        finished = DateTime.UtcNow.ToString("o")
-    };
-    await File.WriteAllTextAsync(
-        Path.Combine(logsDir, "result.json"),
-        JsonSerializer.Serialize(resultPayload, JsonOpts()));
+        WriteManifest("crashed", Checkpoint.Load(logsDir)?.CurrentNodeId ?? "unknown", ex.Message);
+        Console.Error.WriteLine($"Pipeline crashed: {ex.Message}");
+        return 1;
+    }
+    finally
+    {
+        ReleaseRunLock(Path.Combine(workingDir, "run.lock"));
+        backend.Dispose();
+    }
+}
 
-    return result.Status == OutcomeStatus.Success ? 0 : 1;
+static bool TryAcquireRunLock(string lockPath, out string error)
+{
+    error = string.Empty;
+    try
+    {
+        if (File.Exists(lockPath))
+        {
+            var raw = File.ReadAllText(lockPath);
+            var existing = JsonSerializer.Deserialize<RunLock>(raw);
+            if (existing is not null && existing.pid > 0 && IsProcessAlive(existing.pid))
+            {
+                error = $"Run is already active (pid={existing.pid}). Lock: {lockPath}";
+                return false;
+            }
+        }
+
+        var lockPayload = new RunLock
+        {
+            pid = Environment.ProcessId,
+            started_at = DateTime.UtcNow.ToString("o")
+        };
+        File.WriteAllText(lockPath, JsonSerializer.Serialize(lockPayload, JsonOpts()));
+        return true;
+    }
+    catch (Exception ex)
+    {
+        error = $"Unable to create run lock '{lockPath}': {ex.Message}";
+        return false;
+    }
+}
+
+static void ReleaseRunLock(string lockPath)
+{
+    try
+    {
+        if (!File.Exists(lockPath))
+            return;
+
+        var raw = File.ReadAllText(lockPath);
+        var existing = JsonSerializer.Deserialize<RunLock>(raw);
+        if (existing?.pid == Environment.ProcessId)
+            File.Delete(lockPath);
+    }
+    catch
+    {
+        // Ignore lock release failures.
+    }
+}
+
+static bool IsProcessAlive(int pid)
+{
+    try
+    {
+        var process = Process.GetProcessById(pid);
+        return !process.HasExited;
+    }
+    catch
+    {
+        return false;
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -2199,7 +3105,7 @@ static int ShowHelp()
     Console.WriteLine("attractor — pipeline runner CLI");
     Console.WriteLine();
     Console.WriteLine("Usage:");
-    Console.WriteLine("  attractor run <dotfile>              Start a pipeline");
+    Console.WriteLine("  attractor run <dotfile> [options]    Start a pipeline");
     Console.WriteLine("  attractor <dotfile>                  Shorthand for 'run'");
     Console.WriteLine("  attractor gate [--dir <dir>]         Show the current pending gate");
     Console.WriteLine("  attractor gate answer [<choice>]     Answer a gate (by label, number, or interactive)");
@@ -2207,6 +3113,16 @@ static int ShowHelp()
     Console.WriteLine("  attractor status [--dir <dir>]       Show pipeline progress");
     Console.WriteLine("  attractor logs [<node>] [--dir <dir>]  View node artifacts");
     Console.WriteLine("  attractor web [--dir <dir>] [--port N] Launch web dashboard");
+    Console.WriteLine("  attractor lint [path] [--recursive]  Lint one file or a directory of dotfiles");
+    Console.WriteLine("  attractor builder <subcommand>        Create or edit DOT pipelines");
+    Console.WriteLine();
+    Console.WriteLine("Run options:");
+    Console.WriteLine("  --resume                 Resume only if a checkpoint exists");
+    Console.WriteLine("  --autoresume             Auto-resume when checkpoint exists (default)");
+    Console.WriteLine("  --no-autoresume          Force a fresh run even if checkpoint exists");
+    Console.WriteLine("  --resume-from <dir>      Use a prior run directory as the working directory");
+    Console.WriteLine("  --start-at <node>        Override checkpoint start node");
+    Console.WriteLine("  --steer-text <text>      Inject steering text into the coding session");
     Console.WriteLine();
     Console.WriteLine("Output directory resolution:");
     Console.WriteLine("  1. --dir <path> flag");
@@ -2219,57 +3135,176 @@ static int ShowHelp()
 // AgentCodergenBackend - bridges the Attractor pipeline to the
 // CodingAgent agentic loop, which actually writes code via tools
 // ═════════════════════════════════════════════════════════════════════
-class AgentCodergenBackend : ICodergenBackend
+public class AgentCodergenBackend : ICodergenBackend, IDisposable
 {
+    private const int MaxStatusParseAttempts = 3;
+
     private readonly string _workingDir;
     private readonly string _projectRoot;
+    private readonly string? _initialSteerText;
+    private readonly Func<string?, string?, string?, Session>? _sessionFactory;
+    private readonly SessionPool _sessionPool = new();
+    private int _initialSteerUsed;
 
-    public AgentCodergenBackend(string workingDir, string projectRoot)
+    public AgentCodergenBackend(
+        string workingDir,
+        string projectRoot,
+        string? initialSteerText = null,
+        Func<string?, string?, string?, Session>? sessionFactory = null)
     {
         _workingDir = workingDir;
         _projectRoot = projectRoot;
+        _initialSteerText = initialSteerText;
+        _sessionFactory = sessionFactory;
+    }
+
+    public void Dispose()
+    {
+        _sessionPool.Dispose();
     }
 
     public async Task<CodergenResult> RunAsync(
         string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
     {
-        // Resolve the LLM adapter
-        IProviderAdapter adapter;
-        IProviderProfile profile;
-
+        var hints = ParseRuntimeHints(prompt);
         var resolvedProvider = provider ?? InferProvider(model);
+        var carryoverMode = hints.Fidelity;
+        var shouldPool = ShouldPoolSession(hints);
+        Session? session = null;
+        var pooledSession = false;
 
-        switch (resolvedProvider?.ToLowerInvariant())
+        if (hints.ResumeMode.Equals("resume", StringComparison.OrdinalIgnoreCase) && shouldPool)
         {
-            case "openai":
-                var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
-                    ?? throw new InvalidOperationException("OPENAI_API_KEY not set.");
-                adapter = new OpenAiAdapter(openAiKey);
-                profile = new OpenAiProfile();
-                break;
-
-            case "gemini":
-                var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY")
-                    ?? throw new InvalidOperationException("GEMINI_API_KEY not set.");
-                adapter = new GeminiAdapter(geminiKey);
-                profile = new GeminiProfile();
-                break;
-
-            default: // "anthropic" or unspecified
-                var anthropicKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
-                    ?? throw new InvalidOperationException("ANTHROPIC_API_KEY not set.");
-                adapter = new AnthropicAdapter(anthropicKey);
-                profile = new AnthropicProfile();
-                break;
+            shouldPool = false;
+            carryoverMode = "summary:high";
         }
 
-        // Override the model if specified by the pipeline node
+        try
+        {
+            session = GetSession(
+                shouldPool: shouldPool,
+                hints: hints,
+                resolvedProvider: resolvedProvider,
+                requestedModel: model,
+                reasoningEffort: reasoningEffort,
+                pooledSession: out pooledSession);
+
+            if (!string.IsNullOrWhiteSpace(_initialSteerText) &&
+                Interlocked.CompareExchange(ref _initialSteerUsed, 1, 0) == 0)
+            {
+                session.Steer(_initialSteerText!);
+            }
+
+            var carryover = BuildCarryoverPreamble(hints.ThreadId, carryoverMode);
+            var effectivePrompt = string.IsNullOrWhiteSpace(carryover)
+                ? prompt
+                : carryover + "\n\n" + prompt;
+            var stageStartedAt = DateTimeOffset.UtcNow;
+            var historyStartIndex = session.History.Count;
+
+            Console.WriteLine(
+                $"  [codergen] Starting agent session (model={model ?? "default"}, fidelity={hints.Fidelity}, thread={hints.ThreadId}, pooled={pooledSession})");
+
+            StageStatusContract? parsedStatus = null;
+            var parseError = string.Empty;
+            var firstResponse = string.Empty;
+            var finalResponse = string.Empty;
+            AssistantTurn? finalTurn = null;
+
+            for (var attempt = 1; attempt <= MaxStatusParseAttempts; attempt++)
+            {
+                var input = attempt == 1 ? effectivePrompt : BuildStageStatusReminder(parseError);
+                finalTurn = await session.ProcessInputAsync(input, ct);
+                finalResponse = finalTurn.Content ?? "[no response]";
+                if (attempt == 1)
+                    firstResponse = finalResponse;
+
+                if (StageStatusContract.TryParseAssistantResponse(finalResponse, out parsedStatus, out parseError))
+                    break;
+            }
+
+            if (string.IsNullOrWhiteSpace(firstResponse))
+                firstResponse = finalResponse;
+
+            if (finalTurn is not null)
+                Console.WriteLine($"  [codergen] Session complete ({finalTurn.ToolCalls.Count} tool calls made)");
+
+            var status = parsedStatus?.Status ?? InferStatusFromResponse(finalResponse);
+            var telemetry = BuildStageTelemetry(session, historyStartIndex, stageStartedAt);
+
+            return new CodergenResult(
+                Response: firstResponse,
+                Status: status,
+                ContextUpdates: parsedStatus?.ContextUpdates,
+                PreferredLabel: parsedStatus?.PreferredNextLabel,
+                SuggestedNextIds: parsedStatus?.SuggestedNextIds,
+                StageStatus: parsedStatus,
+                RawAssistantResponse: finalResponse,
+                Telemetry: telemetry);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            if (pooledSession)
+                _sessionPool.Discard(hints.ThreadId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (pooledSession)
+                _sessionPool.Discard(hints.ThreadId);
+            Console.Error.WriteLine($"  [codergen] Error: {ex.Message}");
+            return new CodergenResult(
+                Response: $"Agent error: {ex.Message}",
+                Status: OutcomeStatus.Retry
+            );
+        }
+        finally
+        {
+            if (!pooledSession && session is not null)
+                session.Close();
+        }
+    }
+
+    private Session GetSession(
+        bool shouldPool,
+        RuntimeHints hints,
+        string? resolvedProvider,
+        string? requestedModel,
+        string? reasoningEffort,
+        out bool pooledSession)
+    {
+        pooledSession = false;
+
+        if (!shouldPool)
+            return CreateSession(resolvedProvider, requestedModel, reasoningEffort);
+
+        if (_sessionPool.TryGet(hints.ThreadId, out var existing) &&
+            existing is not null &&
+            IsCompatible(existing, resolvedProvider, requestedModel, reasoningEffort))
+        {
+            pooledSession = true;
+            return existing;
+        }
+
+        if (existing is not null)
+            _sessionPool.Discard(hints.ThreadId);
+
+        pooledSession = true;
+        return _sessionPool.GetOrCreate(
+            hints.ThreadId,
+            () => CreateSession(resolvedProvider, requestedModel, reasoningEffort));
+    }
+
+    private Session CreateSession(string? resolvedProvider, string? model, string? reasoningEffort)
+    {
+        if (_sessionFactory is not null)
+            return _sessionFactory(resolvedProvider, model, reasoningEffort);
+
+        var (adapter, profile) = BuildProvider(resolvedProvider);
+
         if (!string.IsNullOrEmpty(model))
-        {
             SetProfileModel(profile, model);
-        }
 
-        // Create execution environment and session
         var env = new LocalExecutionEnvironment(_projectRoot);
         var sessionConfig = new SessionConfig(
             MaxTurns: 200,
@@ -2280,8 +3315,33 @@ class AgentCodergenBackend : ICodergenBackend
         );
 
         var session = new Session(adapter, profile, env, sessionConfig);
+        SubscribeSessionEvents(session);
+        return session;
+    }
 
-        // Subscribe to events for logging
+    private static (IProviderAdapter Adapter, IProviderProfile Profile) BuildProvider(string? resolvedProvider)
+    {
+        switch (resolvedProvider?.ToLowerInvariant())
+        {
+            case "openai":
+                var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
+                    ?? throw new InvalidOperationException("OPENAI_API_KEY not set.");
+                return (new OpenAiAdapter(openAiKey), new OpenAiProfile());
+
+            case "gemini":
+                var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY")
+                    ?? throw new InvalidOperationException("GEMINI_API_KEY not set.");
+                return (new GeminiAdapter(geminiKey), new GeminiProfile());
+
+            default: // "anthropic" or unspecified
+                var anthropicKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
+                    ?? throw new InvalidOperationException("ANTHROPIC_API_KEY not set.");
+                return (new AnthropicAdapter(anthropicKey), new AnthropicProfile());
+        }
+    }
+
+    private static void SubscribeSessionEvents(Session session)
+    {
         session.EventEmitter.Subscribe(evt =>
         {
             switch (evt.Kind)
@@ -2301,42 +3361,283 @@ class AgentCodergenBackend : ICodergenBackend
             }
             return Task.CompletedTask;
         });
+    }
 
-        // Run the agentic loop
-        Console.WriteLine($"  [codergen] Starting agent session (model={model ?? "default"})");
+    private bool IsCompatible(Session session, string? resolvedProvider, string? requestedModel, string? reasoningEffort)
+    {
+        var requestedProvider = (resolvedProvider ?? "anthropic").ToLowerInvariant();
+        if (!session.ProviderProfile.Id.Equals(requestedProvider, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(requestedModel))
+        {
+            var resolvedModel = Client.ResolveModelAlias(requestedModel);
+            if (!session.ProviderProfile.Model.Equals(resolvedModel, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        if (!string.Equals(session.Config.ReasoningEffort, reasoningEffort, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return session.State != SessionState.Closed;
+    }
+
+    private bool ShouldPoolSession(RuntimeHints hints)
+    {
+        return hints.Fidelity.Equals("full", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string BuildCarryoverPreamble(string threadId, string fidelity)
+    {
+        if (fidelity.Equals("full", StringComparison.OrdinalIgnoreCase))
+            return string.Empty;
+
+        if (!_sessionPool.TryGet(threadId, out var prior) || prior is null || prior.History.Count == 0)
+            return string.Empty;
+
+        var maxTurns = fidelity.StartsWith("summary:high", StringComparison.OrdinalIgnoreCase) ? 8 : 4;
+        if (fidelity.Equals("truncate", StringComparison.OrdinalIgnoreCase))
+            maxTurns = 2;
+
+        var summaryLines = new List<string>();
+        foreach (var turn in prior.History.TakeLast(maxTurns))
+        {
+            switch (turn)
+            {
+                case UserTurn userTurn:
+                    summaryLines.Add($"- User: {TrimLine(userTurn.Content)}");
+                    break;
+                case AssistantTurn assistantTurn:
+                    summaryLines.Add($"- Assistant: {TrimLine(assistantTurn.Content)}");
+                    break;
+                case SteeringTurn steeringTurn:
+                    summaryLines.Add($"- Steering: {TrimLine(steeringTurn.Content)}");
+                    break;
+            }
+        }
+
+        if (summaryLines.Count == 0)
+            return string.Empty;
+
+        return string.Join("\n", new[]
+        {
+            "[CONTEXT CARRYOVER]",
+            $"Thread: {threadId}",
+            $"Mode: {fidelity}",
+            "Prior thread summary:",
+            string.Join("\n", summaryLines),
+            "[/CONTEXT CARRYOVER]"
+        });
+    }
+
+    private static string TrimLine(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var trimmed = value.Replace('\n', ' ').Trim();
+        return trimmed.Length > 240 ? trimmed[..240] + "..." : trimmed;
+    }
+
+    private static string BuildStageStatusReminder(string parseError)
+    {
+        if (string.IsNullOrWhiteSpace(parseError))
+            parseError = "Missing structured stage status JSON.";
+
+        return
+            "Your previous response did not provide valid stage status JSON.\n" +
+            $"Reason: {parseError}\n" +
+            "Reply ONLY with a JSON object containing keys: status, preferred_next_label, suggested_next_ids, context_updates, notes, failure_reason.";
+    }
+
+    private Dictionary<string, object?> BuildStageTelemetry(Session session, int historyStartIndex, DateTimeOffset stageStartedAt)
+    {
+        var stageTurns = session.History.Skip(historyStartIndex).ToList();
+        var assistantTurns = stageTurns.OfType<AssistantTurn>().ToList();
+        var toolCalls = assistantTurns.SelectMany(t => t.ToolCalls).ToList();
+        var toolResults = stageTurns.OfType<ToolResultsTurn>().SelectMany(t => t.Results).ToList();
+
+        var usage = assistantTurns
+            .Select(t => t.Usage)
+            .Aggregate(Usage.Empty, (acc, next) => acc + next);
+
+        var byTool = toolCalls
+            .GroupBy(tc => tc.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => (object?)g.Count(), StringComparer.OrdinalIgnoreCase);
+
+        var touchedFiles = ExtractTouchedFiles(toolCalls)
+            .Take(50)
+            .Cast<object?>()
+            .ToList();
+
+        var telemetry = new Dictionary<string, object?>
+        {
+            ["duration_ms"] = (long)Math.Max(0, (DateTimeOffset.UtcNow - stageStartedAt).TotalMilliseconds),
+            ["assistant_turns"] = assistantTurns.Count,
+            ["tool_calls"] = toolCalls.Count,
+            ["tool_errors"] = toolResults.Count(r => r.IsError),
+            ["tool_by_name"] = byTool,
+            ["touched_files"] = touchedFiles,
+            ["touched_files_count"] = touchedFiles.Count,
+            ["token_usage"] = new Dictionary<string, object?>
+            {
+                ["input_tokens"] = usage.InputTokens,
+                ["output_tokens"] = usage.OutputTokens,
+                ["total_tokens"] = usage.TotalTokens,
+                ["reasoning_tokens"] = usage.ReasoningTokens,
+                ["cache_read_tokens"] = usage.CacheReadTokens,
+                ["cache_write_tokens"] = usage.CacheWriteTokens
+            }
+        };
+
+        return telemetry;
+    }
+
+    private IEnumerable<string> ExtractTouchedFiles(IEnumerable<ToolCallData> toolCalls)
+    {
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var toolCall in toolCalls)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(toolCall.Arguments);
+                var root = doc.RootElement;
+                switch (toolCall.Name.ToLowerInvariant())
+                {
+                    case "write_file":
+                        if (TryGetString(root, out var writePath, "file_path", "path"))
+                            files.Add(NormalizeTouchedPath(writePath));
+                        break;
+                    case "apply_patch":
+                        if (TryGetString(root, out var patchText, "patch"))
+                            AddPatchFiles(patchText, files);
+                        break;
+                }
+            }
+            catch
+            {
+                // Telemetry should not fail stage execution.
+            }
+        }
+
+        return files.OrderBy(f => f, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private string NormalizeTouchedPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return path;
 
         try
         {
-            var turn = await session.ProcessInputAsync(prompt, ct);
-            var response = turn.Content ?? "[no response]";
+            var absolute = Path.IsPathRooted(path)
+                ? Path.GetFullPath(path)
+                : Path.GetFullPath(path, _projectRoot);
 
-            Console.WriteLine($"  [codergen] Session complete ({turn.ToolCalls.Count} tool calls made)");
+            if (absolute.StartsWith(_projectRoot, StringComparison.OrdinalIgnoreCase))
+                return Path.GetRelativePath(_projectRoot, absolute);
 
-            // Detect API errors that were caught internally by the Session
-            var status = OutcomeStatus.Success;
-            if (response.StartsWith("[Error:") || response.StartsWith("[Turn limit reached]"))
-            {
-                Console.Error.WriteLine($"  [codergen] Agent returned error: {response}");
-                status = OutcomeStatus.Retry;
-            }
-
-            return new CodergenResult(
-                Response: response,
-                Status: status
-            );
+            return absolute;
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch
         {
-            throw;
+            return path;
         }
-        catch (Exception ex)
+    }
+
+    private void AddPatchFiles(string patch, HashSet<string> files)
+    {
+        using var reader = new StringReader(patch ?? string.Empty);
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
         {
-            Console.Error.WriteLine($"  [codergen] Error: {ex.Message}");
-            return new CodergenResult(
-                Response: $"Agent error: {ex.Message}",
-                Status: OutcomeStatus.Retry
-            );
+            if (TryExtractPatchPath(line, out var patchPath))
+                files.Add(NormalizeTouchedPath(patchPath));
         }
+    }
+
+    private static bool TryExtractPatchPath(string line, out string path)
+    {
+        path = string.Empty;
+        var prefixes = new[]
+        {
+            "*** Update File: ",
+            "*** Add File: ",
+            "*** Delete File: ",
+            "--- ",
+            "+++ "
+        };
+
+        foreach (var prefix in prefixes)
+        {
+            if (!line.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+
+            var candidate = line[prefix.Length..].Trim();
+            if (candidate.StartsWith("a/", StringComparison.Ordinal) || candidate.StartsWith("b/", StringComparison.Ordinal))
+                candidate = candidate[2..];
+
+            if (candidate == "/dev/null" || string.IsNullOrWhiteSpace(candidate))
+                return false;
+
+            path = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetString(JsonElement root, out string value, params string[] keys)
+    {
+        value = string.Empty;
+        foreach (var key in keys)
+        {
+            if (!root.TryGetProperty(key, out var el) || el.ValueKind != JsonValueKind.String)
+                continue;
+
+            var text = el.GetString();
+            if (string.IsNullOrWhiteSpace(text))
+                continue;
+
+            value = text;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static OutcomeStatus InferStatusFromResponse(string response)
+    {
+        if (response.StartsWith("[Error:", StringComparison.Ordinal) ||
+            response.StartsWith("[Turn limit reached]", StringComparison.Ordinal) ||
+            response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal))
+        {
+            return OutcomeStatus.Retry;
+        }
+
+        return OutcomeStatus.Success;
+    }
+
+    private static RuntimeHints ParseRuntimeHints(string prompt)
+    {
+        var fidelity = ExtractHint(prompt, "Runtime fidelity") ?? "full";
+        var thread = ExtractHint(prompt, "Runtime thread") ?? "default";
+        var resumeMode = ExtractHint(prompt, "Resume mode") ?? "fresh";
+
+        return new RuntimeHints(
+            Fidelity: fidelity.Trim(),
+            ThreadId: thread.Trim(),
+            ResumeMode: resumeMode.Trim());
+    }
+
+    private static string? ExtractHint(string prompt, string key)
+    {
+        var pattern = @"^\s*" + Regex.Escape(key) + @"\s*:\s*(.+?)\s*$";
+        var match = Regex.Match(prompt, pattern, RegexOptions.Multiline | RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[1].Value : null;
     }
 
     private static string? InferProvider(string? model)
@@ -2367,6 +3668,8 @@ class AgentCodergenBackend : ICodergenBackend
                 break;
         }
     }
+
+    private sealed record RuntimeHints(string Fidelity, string ThreadId, string ResumeMode);
 }
 
 class RunEntry
@@ -2375,4 +3678,22 @@ class RunEntry
     public string output_dir { get; set; } = "";
     public string name { get; set; } = "";
     public string started { get; set; } = "";
+}
+
+class RunLock
+{
+    public int pid { get; set; }
+    public string started_at { get; set; } = "";
+}
+
+class RunManifest
+{
+    public string run_id { get; set; } = "";
+    public int pid { get; set; }
+    public string graph_path { get; set; } = "";
+    public string started_at { get; set; } = "";
+    public string updated_at { get; set; } = "";
+    public string active_stage { get; set; } = "";
+    public string status { get; set; } = "";
+    public string? crash { get; set; }
 }

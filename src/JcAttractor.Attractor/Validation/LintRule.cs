@@ -20,6 +20,7 @@ public static class Validator
         ValidateConditionExpressions(graph, results);
         ValidateStuckNodes(graph, results);
         ValidateParallelWithoutFanIn(graph, results);
+        ValidateQueueParallelNodes(graph, results);
         ValidateGoalGateWithoutRetryTarget(graph, results);
 
         return results;
@@ -247,6 +248,44 @@ public static class Validator
             {
                 results.Add(new LintResult("parallel_no_fan_in", LintSeverity.Warning, parallel.Id, null,
                     $"Parallel node '{parallel.Id}' has no corresponding fan-in node (shape=tripleoctagon) to collect results."));
+            }
+        }
+    }
+
+    private static void ValidateQueueParallelNodes(Graph graph, List<LintResult> results)
+    {
+        var queueParallelNodes = graph.Nodes.Values
+            .Where(n => n.Shape.Equals("component", StringComparison.OrdinalIgnoreCase))
+            .Where(n => n.RawAttributes.ContainsKey("queue_source"))
+            .ToList();
+
+        foreach (var parallel in queueParallelNodes)
+        {
+            var queueSource = parallel.RawAttributes.GetValueOrDefault("queue_source", "").Trim();
+            if (string.IsNullOrWhiteSpace(queueSource))
+            {
+                results.Add(new LintResult(
+                    "queue_parallel_source",
+                    LintSeverity.Error,
+                    parallel.Id,
+                    null,
+                    $"Queue-backed parallel node '{parallel.Id}' must provide a non-empty queue_source attribute."));
+            }
+
+            var distinctTargets = graph.Edges
+                .Where(e => e.FromNode == parallel.Id)
+                .Select(e => e.ToNode)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            if (distinctTargets.Count != 1)
+            {
+                results.Add(new LintResult(
+                    "queue_parallel_worker",
+                    LintSeverity.Error,
+                    parallel.Id,
+                    null,
+                    $"Queue-backed parallel node '{parallel.Id}' must have exactly one outgoing worker edge. Found {distinctTargets.Count}."));
             }
         }
     }

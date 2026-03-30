@@ -7,5 +7,6 @@ public record Outcome(
     string PreferredLabel = "",
     List<string>? SuggestedNextIds = null,
     Dictionary<string, string>? ContextUpdates = null,
-    string Notes = ""
+    string Notes = "",
+    Dictionary<string, object?>? Telemetry = null
 );

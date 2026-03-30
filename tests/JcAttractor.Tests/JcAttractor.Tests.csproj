@@ -27,6 +27,7 @@
     <ProjectReference Include="..\..\src\JcAttractor.UnifiedLlm\JcAttractor.UnifiedLlm.csproj" />
     <ProjectReference Include="..\..\src\JcAttractor.CodingAgent\JcAttractor.CodingAgent.csproj" />
     <ProjectReference Include="..\..\src\JcAttractor.Attractor\JcAttractor.Attractor.csproj" />
+    <ProjectReference Include="..\..\runner\Runner.csproj" />
   </ItemGroup>
 
 </Project>

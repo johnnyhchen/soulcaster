@@ -28,7 +28,7 @@ public class ToolHandler : INodeHandler
         }
 
         // Create stage directory
-        string stageDir = Path.Combine(logsRoot, node.Id);
+        string stageDir = RuntimeStageResolver.ResolveStageDir(logsRoot, context, node.Id);
         Directory.CreateDirectory(stageDir);
 
         // Determine effective cancellation token (with timeout if specified)

@@ -1,0 +1,12 @@
+digraph "qa_supervisor" {
+    goal = "Exercise telemetry-driven supervision with a live manager loop."
+
+    "start" [shape="Mdiamond", label="Start"]
+    "seed_events" [shape="parallelogram", label="Seed Telemetry File", tool_command="mkdir -p dotfiles/output/qa-supervisor/logs/seeded && : > dotfiles/output/qa-supervisor/logs/seeded/events.jsonl"]
+    "manager" [shape="house", label="Telemetry Supervisor", max_cycles="1", stall_threshold="1", escalation_threshold="5", poll_interval_ms="0", steer_cooldown="0", telemetry_source="logs/seeded/events.jsonl", prompt="The worker telemetry shows no progress. Return valid stage status JSON with status 'success' and notes containing one concise steering instruction."]
+    "done" [shape="Msquare", label="Done"]
+
+    "start" -> "seed_events"
+    "seed_events" -> "manager"
+    "manager" -> "done"
+}

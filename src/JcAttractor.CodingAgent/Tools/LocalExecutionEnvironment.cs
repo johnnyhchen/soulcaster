@@ -124,7 +124,7 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         return result.ToString().Trim();
     }
 
-    public Task<IReadOnlyList<string>> GlobAsync(string pattern, string? path = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> GlobAsync(string pattern, string? path = null, int? maxResults = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
@@ -132,48 +132,35 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
 
         try
         {
-            // Determine search directory and file pattern from the glob
             var searchDir = path is not null ? ResolvePath(path) : WorkingDirectory;
-            var filePattern = pattern;
-
-            // Handle patterns like "**/*.cs" or "src/**/*.cs"
-            var parts = pattern.Split('/', '\\');
-            var fixedParts = new List<string>();
-            var globStart = 0;
-
-            for (var i = 0; i < parts.Length; i++)
-            {
-                if (parts[i].Contains('*') || parts[i].Contains('?'))
-                {
-                    globStart = i;
-                    break;
-                }
-                fixedParts.Add(parts[i]);
-                globStart = i + 1;
-            }
-
-            if (fixedParts.Count > 0)
-            {
-                var fixedPath = Path.Combine(fixedParts.ToArray());
-                searchDir = Path.Combine(WorkingDirectory, fixedPath);
-            }
-
             if (!Directory.Exists(searchDir))
                 return Task.FromResult<IReadOnlyList<string>>(results);
 
-            var remainingPattern = string.Join("/", parts.Skip(globStart));
-            var isRecursive = remainingPattern.Contains("**");
+            var normalizedPattern = pattern
+                .Replace(Path.DirectorySeparatorChar, '/')
+                .Replace(Path.AltDirectorySeparatorChar, '/');
+            if (normalizedPattern.StartsWith("./", StringComparison.Ordinal))
+                normalizedPattern = normalizedPattern[2..];
 
-            // Extract the file name pattern (last segment)
-            var fileNamePattern = parts.Last();
-            var searchOption = isRecursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            var shouldSearchRecursively =
+                normalizedPattern.Contains("**", StringComparison.Ordinal) ||
+                normalizedPattern.Contains('/', StringComparison.Ordinal);
 
-            var files = Directory.EnumerateFiles(searchDir, fileNamePattern, searchOption);
+            var searchOption = shouldSearchRecursively
+                ? SearchOption.AllDirectories
+                : SearchOption.TopDirectoryOnly;
 
-            foreach (var file in files)
+            var matcher = BuildGlobRegex(normalizedPattern);
+            foreach (var file in Directory.EnumerateFiles(searchDir, "*", searchOption))
             {
                 ct.ThrowIfCancellationRequested();
-                results.Add(file);
+
+                var relativePath = Path.GetRelativePath(searchDir, file)
+                    .Replace(Path.DirectorySeparatorChar, '/')
+                    .Replace(Path.AltDirectorySeparatorChar, '/');
+
+                if (matcher.IsMatch(relativePath))
+                    results.Add(Path.GetFullPath(file));
             }
         }
         catch (DirectoryNotFoundException)
@@ -182,6 +169,9 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
         }
 
         results.Sort(StringComparer.Ordinal);
+        if (maxResults.HasValue && results.Count > maxResults.Value)
+            results.RemoveRange(maxResults.Value, results.Count - maxResults.Value);
+
         return Task.FromResult<IReadOnlyList<string>>(results);
     }
 
@@ -349,5 +339,46 @@ public class LocalExecutionEnvironment : IExecutionEnvironment
     {
         var parts = path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         return parts.Any(p => p.StartsWith('.') && p.Length > 1 && p != "..");
+    }
+
+    private static Regex BuildGlobRegex(string pattern)
+    {
+        var normalized = string.IsNullOrWhiteSpace(pattern) ? "*" : pattern;
+        var sb = new StringBuilder("^");
+
+        for (var i = 0; i < normalized.Length; i++)
+        {
+            var current = normalized[i];
+            switch (current)
+            {
+                case '*':
+                    if (i + 1 < normalized.Length && normalized[i + 1] == '*')
+                    {
+                        var isFollowedBySlash = i + 2 < normalized.Length && normalized[i + 2] == '/';
+                        sb.Append(isFollowedBySlash ? "(?:.*/)?" : ".*");
+                        i += isFollowedBySlash ? 2 : 1;
+                    }
+                    else
+                    {
+                        sb.Append("[^/]*");
+                    }
+                    break;
+
+                case '?':
+                    sb.Append("[^/]");
+                    break;
+
+                case '/':
+                    sb.Append("/");
+                    break;
+
+                default:
+                    sb.Append(Regex.Escape(current.ToString()));
+                    break;
+            }
+        }
+
+        sb.Append("$");
+        return new Regex(sb.ToString(), RegexOptions.Compiled | RegexOptions.CultureInvariant);
     }
 }

@@ -17,6 +17,7 @@ public class Session
     private readonly Queue<string> _steeringQueue = new();
     private readonly Queue<string> _followUpQueue = new();
     private readonly List<SubAgent> _subagents = new();
+    private readonly SemaphoreSlim _processLock = new(1, 1);
 
     public IReadOnlyList<SubAgent> Subagents => _subagents;
     public int Depth { get; init; }
@@ -76,6 +77,21 @@ public class Session
     }
 
     /// <summary>
+    /// Closes this session and all child subagents.
+    /// </summary>
+    public void Close()
+    {
+        if (State == SessionState.Closed)
+            return;
+
+        foreach (var subagent in _subagents.ToList())
+            subagent.Close();
+        _subagents.Clear();
+
+        State = SessionState.Closed;
+    }
+
+    /// <summary>
     /// Queues a steering message to be injected before the next LLM call.
     /// </summary>
     public void Steer(string message)
@@ -97,174 +113,190 @@ public class Session
     /// </summary>
     public async Task<AssistantTurn> ProcessInputAsync(string userInput, CancellationToken ct = default)
     {
-        if (State == SessionState.Closed)
-            throw new InvalidOperationException("Session is closed.");
-
-        State = SessionState.Processing;
-
-        await EventEmitter.EmitAsync(EventKind.UserInput, new Dictionary<string, object?>
-        {
-            ["content"] = userInput
-        });
-
-        // Add user turn to history
-        History.Add(new UserTurn(userInput, DateTimeOffset.UtcNow));
-
-        var totalTurns = 0;
-        var toolRounds = 0;
-
         try
         {
-            while (true)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                // Check turn limit
-                if (Config.MaxTurns > 0 && totalTurns >= Config.MaxTurns)
-                {
-                    await EventEmitter.EmitAsync(EventKind.TurnLimit, new Dictionary<string, object?>
-                    {
-                        ["turns"] = totalTurns,
-                        ["limit"] = Config.MaxTurns
-                    });
-                    return CreateFinalTurn("[Turn limit reached]");
-                }
-
-                // Check tool round limit
-                if (Config.MaxToolRoundsPerInput > 0 && toolRounds >= Config.MaxToolRoundsPerInput)
-                {
-                    await EventEmitter.EmitAsync(EventKind.TurnLimit, new Dictionary<string, object?>
-                    {
-                        ["toolRounds"] = toolRounds,
-                        ["limit"] = Config.MaxToolRoundsPerInput
-                    });
-                    return CreateFinalTurn("[Tool round limit reached]");
-                }
-
-                // Drain steering messages into history
-                await DrainSteeringAsync();
-
-                // Loop detection
-                if (Config.EnableLoopDetection && LoopDetection.DetectLoop(History, Config.LoopDetectionWindow))
-                {
-                    await EventEmitter.EmitAsync(EventKind.LoopDetection);
-
-                    // Inject a steering message to break the loop
-                    History.Add(new SteeringTurn(
-                        "You appear to be in a loop repeating the same tool calls. Please try a different approach or ask the user for clarification.",
-                        DateTimeOffset.UtcNow));
-                }
-
-                // Build messages and call LLM
-                var messages = ConvertHistoryToMessages();
-                var projectDocs = ProjectDocs.Discover(ExecutionEnv.WorkingDirectory);
-                var systemPrompt = ProviderProfile.BuildSystemPrompt(ExecutionEnv, projectDocs.Count > 0 ? projectDocs : null);
-
-                var request = new Request
-                {
-                    Model = ProviderProfile.Model,
-                    Messages = messages,
-                    Tools = ProviderProfile.Tools().ToList(),
-                    ToolChoice = ToolChoice.Auto,
-                    ReasoningEffort = Config.ReasoningEffort,
-                    ProviderOptions = ProviderProfile.ProviderOptions()
-                };
-
-                // Insert system message at position 0
-                request.Messages.Insert(0, Message.SystemMsg(systemPrompt));
-
-                await EventEmitter.EmitAsync(EventKind.AssistantTextStart);
-
-                Response response;
-                try
-                {
-                    response = await LlmClient.CompleteAsync(request, ct);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
-                    {
-                        ["error"] = ex.Message,
-                        ["exception"] = ex
-                    });
-                    return CreateFinalTurn($"[Error: {ex.Message}]");
-                }
-
-                totalTurns++;
-
-                var text = response.Text;
-                var toolCalls = response.ToolCalls;
-                var reasoning = response.Reasoning;
-                var usage = response.Usage;
-                var thinkingParts = response.Message.Content
-                    .Where(p => (p.Kind == ContentKind.Thinking || p.Kind == ContentKind.RedactedThinking) && p.Thinking is not null)
-                    .Select(p => p.Thinking!)
-                    .ToList();
-
-                // Emit text delta if there is text content
-                if (!string.IsNullOrEmpty(text))
-                {
-                    await EventEmitter.EmitAsync(EventKind.AssistantTextDelta, new Dictionary<string, object?>
-                    {
-                        ["text"] = text
-                    });
-                }
-
-                await EventEmitter.EmitAsync(EventKind.AssistantTextEnd);
-
-                // Create assistant turn and add to history
-                var assistantTurn = new AssistantTurn(
-                    text,
-                    toolCalls,
-                    reasoning,
-                    usage,
-                    response.Id,
-                    DateTimeOffset.UtcNow,
-                    thinkingParts.Count > 0 ? thinkingParts : null);
-
-                History.Add(assistantTurn);
-
-                // If no tool calls, this is the final response
-                if (toolCalls.Count == 0)
-                {
-                    // Check for follow-up messages
-                    if (_followUpQueue.Count > 0)
-                    {
-                        var followUp = _followUpQueue.Dequeue();
-                        History.Add(new UserTurn(followUp, DateTimeOffset.UtcNow));
-                        continue;
-                    }
-
-                    State = SessionState.Idle;
-                    return assistantTurn;
-                }
-
-                // Execute tool calls
-                toolRounds++;
-                var toolResults = await ExecuteToolCallsAsync(toolCalls, ct);
-
-                // Add tool results to history
-                History.Add(new ToolResultsTurn(toolResults, DateTimeOffset.UtcNow));
-            }
+            await _processLock.WaitAsync(ct);
         }
         catch (OperationCanceledException)
         {
-            State = SessionState.Closed;
-            throw;
+            throw new OperationCanceledException(ct);
         }
-        catch (Exception ex)
+
+        try
         {
-            await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
+            if (State == SessionState.Closed)
+                throw new InvalidOperationException("Session is closed.");
+
+            State = SessionState.Processing;
+
+            await EventEmitter.EmitAsync(EventKind.UserInput, new Dictionary<string, object?>
             {
-                ["error"] = ex.Message,
-                ["exception"] = ex
+                ["content"] = userInput
             });
-            State = SessionState.Idle;
-            throw;
+
+            // Add user turn to history
+            History.Add(new UserTurn(userInput, DateTimeOffset.UtcNow));
+
+            var totalTurns = 0;
+            var toolRounds = 0;
+
+            try
+            {
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    // Check turn limit
+                    if (Config.MaxTurns > 0 && totalTurns >= Config.MaxTurns)
+                    {
+                        await EventEmitter.EmitAsync(EventKind.TurnLimit, new Dictionary<string, object?>
+                        {
+                            ["turns"] = totalTurns,
+                            ["limit"] = Config.MaxTurns
+                        });
+                        return CreateFinalTurn("[Turn limit reached]");
+                    }
+
+                    // Check tool round limit
+                    if (Config.MaxToolRoundsPerInput > 0 && toolRounds >= Config.MaxToolRoundsPerInput)
+                    {
+                        await EventEmitter.EmitAsync(EventKind.TurnLimit, new Dictionary<string, object?>
+                        {
+                            ["toolRounds"] = toolRounds,
+                            ["limit"] = Config.MaxToolRoundsPerInput
+                        });
+                        return CreateFinalTurn("[Tool round limit reached]");
+                    }
+
+                    // Drain steering messages into history
+                    await DrainSteeringAsync();
+
+                    // Loop detection
+                    if (Config.EnableLoopDetection && LoopDetection.DetectLoop(History, Config.LoopDetectionWindow))
+                    {
+                        await EventEmitter.EmitAsync(EventKind.LoopDetection);
+
+                        // Inject a steering message to break the loop
+                        History.Add(new SteeringTurn(
+                            "You appear to be in a loop repeating the same tool calls. Please try a different approach or ask the user for clarification.",
+                            DateTimeOffset.UtcNow));
+                    }
+
+                    // Build messages and call LLM
+                    var messages = ConvertHistoryToMessages();
+                    var projectDocs = ProjectDocs.Discover(ExecutionEnv.WorkingDirectory);
+                    var systemPrompt = ProviderProfile.BuildSystemPrompt(ExecutionEnv, projectDocs.Count > 0 ? projectDocs : null);
+
+                    var request = new Request
+                    {
+                        Model = ProviderProfile.Model,
+                        Messages = messages,
+                        Tools = ProviderProfile.Tools().ToList(),
+                        ToolChoice = ToolChoice.Auto,
+                        ReasoningEffort = Config.ReasoningEffort,
+                        ProviderOptions = ProviderProfile.ProviderOptions()
+                    };
+
+                    // Insert system message at position 0
+                    request.Messages.Insert(0, Message.SystemMsg(systemPrompt));
+
+                    await EventEmitter.EmitAsync(EventKind.AssistantTextStart);
+
+                    Response response;
+                    try
+                    {
+                        response = await LlmClient.CompleteAsync(request, ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
+                        {
+                            ["error"] = ex.Message,
+                            ["exception"] = ex
+                        });
+                        return CreateFinalTurn($"[Error: {ex.Message}]");
+                    }
+
+                    totalTurns++;
+
+                    var text = response.Text;
+                    var toolCalls = response.ToolCalls;
+                    var reasoning = response.Reasoning;
+                    var usage = response.Usage;
+                    var thinkingParts = response.Message.Content
+                        .Where(p => (p.Kind == ContentKind.Thinking || p.Kind == ContentKind.RedactedThinking) && p.Thinking is not null)
+                        .Select(p => p.Thinking!)
+                        .ToList();
+
+                    // Emit text delta if there is text content
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        await EventEmitter.EmitAsync(EventKind.AssistantTextDelta, new Dictionary<string, object?>
+                        {
+                            ["text"] = text
+                        });
+                    }
+
+                    await EventEmitter.EmitAsync(EventKind.AssistantTextEnd);
+
+                    // Create assistant turn and add to history
+                    var assistantTurn = new AssistantTurn(
+                        text,
+                        toolCalls,
+                        reasoning,
+                        usage,
+                        response.Id,
+                        DateTimeOffset.UtcNow,
+                        thinkingParts.Count > 0 ? thinkingParts : null);
+
+                    History.Add(assistantTurn);
+
+                    // If no tool calls, this is the final response
+                    if (toolCalls.Count == 0)
+                    {
+                        // Check for follow-up messages
+                        if (_followUpQueue.Count > 0)
+                        {
+                            var followUp = _followUpQueue.Dequeue();
+                            History.Add(new UserTurn(followUp, DateTimeOffset.UtcNow));
+                            continue;
+                        }
+
+                        State = SessionState.Idle;
+                        return assistantTurn;
+                    }
+
+                    // Execute tool calls
+                    toolRounds++;
+                    var toolResults = await ExecuteToolCallsAsync(toolCalls, ct);
+
+                    // Add tool results to history
+                    History.Add(new ToolResultsTurn(toolResults, DateTimeOffset.UtcNow));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                State = SessionState.Closed;
+                throw;
+            }
+            catch (Exception ex)
+            {
+                await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
+                {
+                    ["error"] = ex.Message,
+                    ["exception"] = ex
+                });
+                State = SessionState.Idle;
+                throw;
+            }
+        }
+        finally
+        {
+            _processLock.Release();
         }
     }
 

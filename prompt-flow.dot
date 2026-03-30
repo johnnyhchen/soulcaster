@@ -1,0 +1,168 @@
+digraph PromptFlow {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", shape=box, style="rounded,filled", fontsize=11];
+    edge [fontname="Helvetica", fontsize=9];
+
+    /* ── colour legend ── */
+    subgraph cluster_legend {
+        label="Legend";
+        style=dashed;
+        fontsize=10;
+        claude_l  [label="Claude (Opus 4.6)", fillcolor="#D4A8E8", color="#7B2D8E"];
+        codex_l   [label="Codex (GPT-5.x)",   fillcolor="#A8D4E8", color="#2D6B8E"];
+        human_l   [label="Human Gate",         fillcolor="#FFE0A8", color="#B8860B", shape=diamond];
+        artifact_l[label="Artifact",           fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 1 — Claude plans & one-shots implementation
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase1 {
+        label="Phase 1: Plan & One-Shot (Claude Opus 4.6)";
+        style=filled; fillcolor="#F5EEF8"; color="#7B2D8E";
+
+        p1_prompt [label="Prompt → Claude\n\"Examine eng-8083, devise\nhigh-level plan & task breakdown\"",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p1_plan   [label="Claude produces\nPlan + Task Breakdown",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p1_impl   [label="Claude one-shots\nimplementation on branch",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p1_art    [label="Artifacts:\n• plan.md\n• task breakdown\n• code on branch",
+                   fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+
+        p1_prompt -> p1_plan -> p1_impl -> p1_art;
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 2 — Codex harsh critique of Claude's impl
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase2 {
+        label="Phase 2: Harsh Critique (Codex GPT-5.x)";
+        style=filled; fillcolor="#EAF4FA"; color="#2D6B8E";
+
+        p2_prompt [label="Prompt → Codex\n\"Examine plan at .ai/eng-8083.\nDevise your own plan.\nCompare & harsh critique both.\"",
+                   fillcolor="#A8D4E8", color="#2D6B8E"];
+        p2_own    [label="Codex produces\nown plan + task breakdown\n(discovers authz-policy skill)",
+                   fillcolor="#A8D4E8", color="#2D6B8E"];
+        p2_eval   [label="Codex writes\ncodex-plan-evaluation.md\n(harsh critique of both plans)",
+                   fillcolor="#A8D4E8", color="#2D6B8E"];
+        p2_art    [label="Artifacts:\n• codex plan\n• codex-plan-evaluation.md\n• harsh critique",
+                   fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+
+        p2_prompt -> p2_own -> p2_eval -> p2_art;
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 3 — Claude rewrite from scratch + pareto merge
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase3 {
+        label="Phase 3: Rewrite & Pareto Merge (Claude Opus 4.6)";
+        style=filled; fillcolor="#F5EEF8"; color="#7B2D8E";
+
+        p3_prompt [label="Prompt → Claude\n\"Take what you learnt. Rewrite\nplan from scratch. Undo branch\nchanges. Put tasks back in TODO.\"",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p3_rewrite[label="Claude rewrites plan\nfrom scratch (clean slate)",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p3_undo   [label="Claude undoes branch changes\nrestores task MDs to TODO/",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p3_pareto [label="Prompt → Claude\n\"Take pareto optimal suggestions\nfrom codex eval. Merge plans.\nMake final call.\"",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p3_final  [label="Claude produces\nfinal merged plan\n+ decision rationale",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p3_art    [label="Artifacts:\n• rewritten plan\n• merged final plan\n• decision.md",
+                   fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+
+        p3_prompt -> p3_rewrite -> p3_undo -> p3_pareto -> p3_final -> p3_art;
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 4 — Codex sanity check loop
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase4 {
+        label="Phase 4: Consensus Loop (Codex ↔ Claude)";
+        style=filled; fillcolor="#FFF8E8"; color="#B8860B";
+
+        p4_codex  [label="Prompt → Codex (GPT-5.4)\n\"Do you agree with\nthis decision?\"\n(paste Claude's output)",
+                   fillcolor="#A8D4E8", color="#2D6B8E"];
+        p4_gate   [label="Human reviews\nCodex response",
+                   fillcolor="#FFE0A8", color="#B8860B", shape=diamond];
+        p4_claude [label="Feed disagreements\nback to Claude",
+                   fillcolor="#D4A8E8", color="#7B2D8E"];
+        p4_stable [label="Plan is stable\n(human + models agree)",
+                   fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+
+        p4_codex -> p4_gate;
+        p4_gate  -> p4_claude [label="something off"];
+        p4_claude -> p4_codex [label="revised decision"];
+        p4_gate  -> p4_stable [label="plan looks sane"];
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 5 — Codex implements task by task
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase5 {
+        label="Phase 5: Implementation (Codex 5.3)";
+        style=filled; fillcolor="#EAF4FA"; color="#2D6B8E";
+
+        p5_prompt [label="Prompt → Codex 5.3\n\"Implement task plan in\n.ai/eng-8083 task by task.\nDo not commit. Await review.\"",
+                   fillcolor="#A8D4E8", color="#2D6B8E"];
+        p5_task   [label="Codex implements\none task at a time",
+                   fillcolor="#A8D4E8", color="#2D6B8E"];
+        p5_gate   [label="Human reviews\neach task",
+                   fillcolor="#FFE0A8", color="#B8860B", shape=diamond];
+        p5_next   [label="All tasks\nimplemented",
+                   fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+
+        p5_prompt -> p5_task -> p5_gate;
+        p5_gate   -> p5_task [label="continue"];
+        p5_gate   -> p5_next [label="all tasks done"];
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 6 — LLM Judge: Codex harsh code critique
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase6 {
+        label="Phase 6: Code Critique & Pareto Fix (GPT-5.4 → Claude Opus 4.6)";
+        style=filled; fillcolor="#FFF0F0"; color="#8E2D2D";
+
+        p6_critique [label="Prompt → Codex (GPT-5.4)\nHarsh critique of implementation:\n• Requirements coverage\n• Implementation gaps\n• Code quality & refactoring\n• Test coverage gaps",
+                     fillcolor="#A8D4E8", color="#2D6B8E"];
+        p6_art1     [label="Artifacts:\n• code-critique.md\n• gap analysis\n• test coverage report",
+                     fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+        p6_pareto   [label="Prompt → Claude (Opus 4.6)\nTake pareto optimal changes\nfrom Codex critique:\n• MUST FIX (bugs, gaps)\n• SHOULD FIX (quality)\n• NICE TO HAVE\n• REJECT (nitpicks)",
+                     fillcolor="#D4A8E8", color="#7B2D8E"];
+        p6_apply    [label="Claude applies\npareto-optimal fixes",
+                     fillcolor="#D4A8E8", color="#7B2D8E"];
+        p6_art2     [label="Artifacts:\n• pareto-fixes.md\n• updated code",
+                     fillcolor="#D4E8D4", color="#2D8E2D", shape=note];
+
+        p6_critique -> p6_art1 -> p6_pareto -> p6_apply -> p6_art2;
+    }
+
+    /* ═══════════════════════════════════════════════
+       PHASE 7 — Final human review & ship
+       ═══════════════════════════════════════════════ */
+    subgraph cluster_phase7 {
+        label="Phase 7: Final Review & Ship";
+        style=filled; fillcolor="#FFF8E8"; color="#B8860B";
+
+        p7_gate [label="Final human review\nof all changes",
+                 fillcolor="#FFE0A8", color="#B8860B", shape=diamond];
+        p7_ship [label="SHIP IT",
+                 fillcolor="#90EE90", color="#006400", shape=doubleoctagon,
+                 fontsize=14, style="bold,filled"];
+
+        p7_gate -> p7_ship [label="approved"];
+        p7_gate -> p6_critique [label="needs more work", style=dashed, color="#8E2D2D"];
+    }
+
+    /* ── cross-phase edges ── */
+    p1_art  -> p2_prompt [label="Claude's plan +\nimpl fed to Codex", style=bold, color="#333333"];
+    p2_art  -> p3_prompt [label="Codex critique +\neval fed to Claude", style=bold, color="#333333"];
+    p2_art  -> p3_pareto [label="codex-plan-evaluation.md\npareto suggestions", style=dashed, color="#666666"];
+    p3_art  -> p4_codex  [label="Claude's decision\npasted to Codex", style=bold, color="#333333"];
+    p4_stable -> p5_prompt [label="Final agreed plan\nfed to Codex 5.3", style=bold, color="#333333"];
+    p5_next -> p6_critique [label="Completed code\nfed to Codex for critique", style=bold, color="#333333"];
+    p6_art2 -> p7_gate [label="Fixed code +\npareto report", style=bold, color="#333333"];
+}

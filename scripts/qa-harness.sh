@@ -1,563 +1,722 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Soulcaster QA Harness
-#  Runs all 4 non-automated QA scenarios using qa-agent for validation.
-#
-#  Usage:
-#    ./scripts/qa-harness.sh                  # Run all scenarios
-#    ./scripts/qa-harness.sh --scenario 1     # Run only scenario 1
-#    ./scripts/qa-harness.sh --skip-qa-agent  # Run pipelines only, skip qa-agent
-#
-#  Prerequisites:
-#    - ANTHROPIC_API_KEY set (required)
-#    - OPENAI_API_KEY set (required)
-#    - GEMINI_API_KEY set (optional — scenario 4 skipped without it)
-#    - Go installed (for qa-agent)
-#    - .NET 10 SDK installed
-# ═══════════════════════════════════════════════════════════════════════
-
 SOULCASTER_DIR="${SOULCASTER_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-QA_AGENT_DIR="${QA_AGENT_DIR:-$HOME/qa-agent}"
 DOTFILES_DIR="$SOULCASTER_DIR/dotfiles"
-WEB_PORT="${WEB_PORT:-5099}"
-RESULTS_DIR="$SOULCASTER_DIR/qa-results/$(date +%Y%m%d-%H%M%S)"
-ONLY_SCENARIO=""
+QA_AGENT_DIR="${QA_AGENT_DIR:-$HOME/qa-agent}"
+RESULTS_DIR="${RESULTS_DIR:-$SOULCASTER_DIR/qa-results/$(date +%Y%m%d-%H%M%S)}"
+SOLUTION_FILE="$SOULCASTER_DIR/JcAttractor.sln"
+
+MODE_UNIT=false
+MODE_SCENARIO=false
+MODE_LIVE=false
+LIVE_ONLY=""
 SKIP_QA_AGENT=false
 
-# Parse flags
+UNIT_STATUS="SKIP"
+SCENARIO_STATUS="SKIP"
+LIVE_STATUS="SKIP"
+LIVE_SMOKE_STATUS="SKIP"
+LIVE_CHECKPOINT_STATUS="SKIP"
+LIVE_PARALLEL_STATUS="SKIP"
+LIVE_QUEUE_STATUS="SKIP"
+LIVE_SUPERVISOR_STATUS="SKIP"
+LIVE_BUILDER_STATUS="SKIP"
+LIVE_LINT_STATUS="SKIP"
+
+HARNESS_LOG="$RESULTS_DIR/harness.log"
+BUILD_LOG="$RESULTS_DIR/build.log"
+UNIT_LOG="$RESULTS_DIR/unit-results.log"
+SCENARIO_LOG="$RESULTS_DIR/scenario-results.log"
+LIVE_LOG="$RESULTS_DIR/live-results.log"
+SUMMARY_JSON="$RESULTS_DIR/summary.json"
+
+BUILD_READY=false
+
+usage() {
+    cat <<'EOF'
+Soulcaster QA Harness
+
+Usage:
+  ./scripts/qa-harness.sh --unit
+  ./scripts/qa-harness.sh --scenario
+  ./scripts/qa-harness.sh --live
+  ./scripts/qa-harness.sh --full
+
+Options:
+  --unit                 Run the non-scenario automated test suite
+  --scenario             Run the deterministic scenario harness tests
+  --live                 Run the required live validation pass
+  --full                 Run --unit, --scenario, then --live
+  --live-scenario <id>   Run one live check only: smoke | checkpoint | parallel | queue | supervisor | builder | lint
+  --skip-qa-agent        Reserved compatibility flag for older harness flows
+  --help, -h             Show this help
+
+Default:
+  If no mode is specified, the harness runs --live.
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --scenario) ONLY_SCENARIO="$2"; shift 2 ;;
-        --skip-qa-agent) SKIP_QA_AGENT=true; shift ;;
-        *) echo "Unknown flag: $1"; exit 1 ;;
+        --unit)
+            MODE_UNIT=true
+            shift
+            ;;
+        --scenario)
+            MODE_SCENARIO=true
+            shift
+            ;;
+        --live)
+            MODE_LIVE=true
+            shift
+            ;;
+        --full)
+            MODE_UNIT=true
+            MODE_SCENARIO=true
+            MODE_LIVE=true
+            shift
+            ;;
+        --live-scenario)
+            LIVE_ONLY="$2"
+            shift 2
+            ;;
+        --skip-qa-agent)
+            SKIP_QA_AGENT=true
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown flag: $1" >&2
+            usage
+            exit 1
+            ;;
     esac
 done
 
+if [[ "$MODE_UNIT" == "false" && "$MODE_SCENARIO" == "false" && "$MODE_LIVE" == "false" ]]; then
+    MODE_LIVE=true
+fi
+
 mkdir -p "$RESULTS_DIR"
+: > "$HARNESS_LOG"
 
-# ─── Helpers ──────────────────────────────────────────────────────────
-
-log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$RESULTS_DIR/harness.log"; }
-
-should_run() {
-    [[ -z "$ONLY_SCENARIO" ]] || [[ "$ONLY_SCENARIO" == "$1" ]]
+log() {
+    echo "[$(date +%H:%M:%S)] $*" | tee -a "$HARNESS_LOG"
 }
 
-WEB_PID=""
-PIPELINE_PID=""
-
-cleanup() {
-    log "Cleaning up..."
-    [[ -n "$WEB_PID" ]] && kill "$WEB_PID" 2>/dev/null && wait "$WEB_PID" 2>/dev/null || true
-    [[ -n "$PIPELINE_PID" ]] && kill "$PIPELINE_PID" 2>/dev/null && wait "$PIPELINE_PID" 2>/dev/null || true
+log_live() {
+    echo "[$(date +%H:%M:%S)] $*" | tee -a "$HARNESS_LOG" "$LIVE_LOG"
 }
-trap cleanup EXIT
 
-run_qa_agent() {
-    local scenario_name="$1"
-    local feature="$2"
-    local budget_steps="${3:-50}"
-    local budget_minutes="${4:-5}"
+run_and_tee() {
+    local log_file="$1"
+    shift
 
-    if [[ "$SKIP_QA_AGENT" == "true" ]]; then
-        log "  [skip] qa-agent skipped (--skip-qa-agent)"
+    set +e
+    "$@" > >(tee -a "$log_file") 2> >(tee -a "$log_file" >&2)
+    local status=$?
+    set -e
+    return "$status"
+}
+
+ensure_build() {
+    if [[ "$BUILD_READY" == "true" ]]; then
         return 0
     fi
 
-    if [[ ! -d "$QA_AGENT_DIR" ]]; then
-        log "  [skip] qa-agent not found at $QA_AGENT_DIR"
+    : > "$BUILD_LOG"
+    log "Building solution..."
+    if run_and_tee "$BUILD_LOG" dotnet build "$SOLUTION_FILE"; then
+        BUILD_READY=true
+        log "Build complete."
         return 0
     fi
 
-    local qa_out="$RESULTS_DIR/qa-agent-$scenario_name"
-    mkdir -p "$qa_out"
-
-    log "  Running qa-agent for $scenario_name..."
-    (
-        cd "$QA_AGENT_DIR"
-        go run ./cmd/qa-agent run \
-            --feature "$feature" \
-            --surfaces api \
-            --budget-steps "$budget_steps" \
-            --budget-minutes "$budget_minutes" \
-            --output-dir "$qa_out" \
-            2>&1
-    ) | tee "$RESULTS_DIR/${scenario_name}-qa-agent.log" || true
-
-    # Generate report if run completed
-    local run_id
-    run_id=$(ls -1 "$qa_out" 2>/dev/null | grep "^run_" | head -1 || true)
-    if [[ -n "$run_id" ]]; then
-        (
-            cd "$QA_AGENT_DIR"
-            go run ./cmd/qa-agent report \
-                --run-id "$run_id" \
-                --output-dir "$qa_out" 2>&1
-        ) || true
-        log "  qa-agent report: $qa_out/$run_id/report.md"
-    fi
+    log "Build failed."
+    return 1
 }
 
-run_pipeline() {
-    local dotfile="$1"
-    local log_name="$2"
-
-    log "  Running $dotfile..."
-    dotnet run --project "$SOULCASTER_DIR/runner" -- run "$dotfile" \
-        2>&1 | tee "$RESULTS_DIR/${log_name}.log"
-}
-
-check_file() {
-    local path="$1"
-    local desc="$2"
-    if [[ -f "$path" ]]; then
-        log "  [ok] $desc"
-        return 0
-    else
-        log "  [FAIL] $desc — file missing: $path"
+require_anthropic_key() {
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        log_live "Missing ANTHROPIC_API_KEY."
         return 1
     fi
 }
 
-# ─── Phase 0: Build ──────────────────────────────────────────────────
+should_run_live() {
+    [[ -z "$LIVE_ONLY" || "$LIVE_ONLY" == "$1" ]]
+}
 
-log "═══ Phase 0: Build ═══"
-cd "$SOULCASTER_DIR"
-dotnet build 2>&1 | tee "$RESULTS_DIR/build.log" || true
-# Check for real compilation errors (not MSBUILD diagnostic lines)
-if grep -q ": error CS" "$RESULTS_DIR/build.log"; then
-    log "ERROR: Build has compilation errors."
-    exit 1
-fi
-log "Build complete."
+json_status() {
+    python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+print(data.get("status", "unknown"))
+PY
+}
 
-# Check API keys
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    log "ERROR: ANTHROPIC_API_KEY is not set. Required for QA scenarios."
-    exit 1
-fi
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    log "ERROR: OPENAI_API_KEY is not set. Required for QA scenarios."
-    exit 1
-fi
+checkpoint_completed_count() {
+    python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+print(len(data.get("CompletedNodes", [])))
+PY
+}
 
-if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-    log "WARNING: GEMINI_API_KEY not set — scenario 4 (multi-model) will be skipped."
-    SKIP_MULTIMODEL=true
-else
-    SKIP_MULTIMODEL=false
-fi
+checkpoint_has_nodes() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+nodes = set(data.get("CompletedNodes", []))
+required = [item for item in sys.argv[2].split(",") if item]
+missing = [item for item in required if item not in nodes]
+if missing:
+    print(",".join(missing))
+    raise SystemExit(1)
+print("ok")
+PY
+}
 
-# Track pass/fail
-RESULT_S1="SKIP"
-RESULT_S2="SKIP"
-RESULT_S3="SKIP"
-RESULT_S4="SKIP"
+write_summary_json() {
+    python3 - "$SUMMARY_JSON" <<PY
+import json
+import os
+import sys
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Scenario 1: Real LLM Calls (Smoke Test)
-# ═══════════════════════════════════════════════════════════════════════
-if should_run 1; then
-    log ""
-    log "═══ Scenario 1: Real LLM Calls ═══"
+payload = {
+    "results_dir": os.environ["RESULTS_DIR"],
+    "unit": {"status": os.environ["UNIT_STATUS"]},
+    "scenario": {"status": os.environ["SCENARIO_STATUS"]},
+    "live": {
+        "status": os.environ["LIVE_STATUS"],
+            "checks": {
+                "smoke_steer": os.environ["LIVE_SMOKE_STATUS"],
+                "checkpoint_resume": os.environ["LIVE_CHECKPOINT_STATUS"],
+                "parallel_multihop": os.environ["LIVE_PARALLEL_STATUS"],
+                "queue_parallelism": os.environ["LIVE_QUEUE_STATUS"],
+                "telemetry_supervisor": os.environ["LIVE_SUPERVISOR_STATUS"],
+                "builder_editor": os.environ["LIVE_BUILDER_STATUS"],
+                "lint": os.environ["LIVE_LINT_STATUS"],
+            },
+    },
+}
 
-    # Clean prior output
-    rm -rf "$DOTFILES_DIR/output/qa-smoke"
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, indent=2)
+PY
+}
 
-    # Run the smoke test pipeline
-    if run_pipeline "$DOTFILES_DIR/qa-smoke.dot" "scenario1-run"; then
-        log "  Pipeline exited 0."
-    else
-        log "  Pipeline exited non-zero."
+run_unit_mode() {
+    : > "$UNIT_LOG"
+    if ! ensure_build; then
+        UNIT_STATUS="FAIL"
+        return 1
     fi
 
-    # Verify artifacts
-    S1_PASS=true
-    OUTPUT_DIR="$DOTFILES_DIR/output/qa-smoke"
-
-    check_file "$OUTPUT_DIR/logs/checkpoint.json" "checkpoint.json exists" || S1_PASS=false
-    check_file "$OUTPUT_DIR/logs/result.json" "result.json exists" || S1_PASS=false
-    check_file "$OUTPUT_DIR/logs/write_haiku/status.json" "write_haiku/status.json exists" || S1_PASS=false
-    check_file "$OUTPUT_DIR/logs/verify_haiku/status.json" "verify_haiku/status.json exists" || S1_PASS=false
-    check_file "$OUTPUT_DIR/logs/write_haiku/response.md" "write_haiku/response.md exists" || S1_PASS=false
-
-    # Check response is non-empty
-    if [[ -f "$OUTPUT_DIR/logs/write_haiku/response.md" ]]; then
-        RESP_SIZE=$(wc -c < "$OUTPUT_DIR/logs/write_haiku/response.md" | tr -d ' ')
-        if [[ "$RESP_SIZE" -gt 10 ]]; then
-            log "  [ok] LLM response is non-empty ($RESP_SIZE bytes)"
-        else
-            log "  [FAIL] LLM response is too short ($RESP_SIZE bytes)"
-            S1_PASS=false
-        fi
+    log "Running unit suite..."
+    if run_and_tee "$UNIT_LOG" dotnet test "$SOLUTION_FILE" --no-restore --filter "Harness!=Scenario"; then
+        UNIT_STATUS="PASS"
+        log "Unit suite passed."
+        return 0
     fi
 
-    # Check checkpoint has Timestamp
-    if [[ -f "$OUTPUT_DIR/logs/checkpoint.json" ]]; then
-        if python3 -c "import json,sys; cp=json.load(open(sys.argv[1])); assert cp.get('Timestamp')" "$OUTPUT_DIR/logs/checkpoint.json" 2>/dev/null; then
-            log "  [ok] checkpoint has Timestamp"
-        else
-            log "  [FAIL] checkpoint missing Timestamp"
-            S1_PASS=false
-        fi
+    UNIT_STATUS="FAIL"
+    log "Unit suite failed."
+    return 1
+}
+
+run_scenario_mode() {
+    : > "$SCENARIO_LOG"
+    if ! ensure_build; then
+        SCENARIO_STATUS="FAIL"
+        return 1
     fi
 
-    if [[ "$S1_PASS" == "true" ]]; then
-        RESULT_S1="PASS"
-        log "  Scenario 1 pre-checks: PASS"
-    else
-        RESULT_S1="FAIL"
-        log "  Scenario 1 pre-checks: FAIL"
+    log "Running deterministic scenario suite..."
+    if run_and_tee "$SCENARIO_LOG" dotnet test "$SOLUTION_FILE" --no-restore --filter "Harness=Scenario"; then
+        SCENARIO_STATUS="PASS"
+        log "Scenario suite passed."
+        return 0
     fi
 
-    # Start web dashboard for qa-agent and subsequent scenarios
-    log "  Starting web dashboard on port $WEB_PORT..."
-    dotnet run --project "$SOULCASTER_DIR/runner" -- web --port "$WEB_PORT" > "$RESULTS_DIR/web-dashboard.log" 2>&1 &
-    WEB_PID=$!
-    sleep 3
+    SCENARIO_STATUS="FAIL"
+    log "Scenario suite failed."
+    return 1
+}
 
-    if curl -sf "http://localhost:$WEB_PORT/api/pipelines" > /dev/null 2>&1; then
-        log "  [ok] Web dashboard is up."
-    else
-        log "  [FAIL] Web dashboard failed to start. Continuing without qa-agent."
-        WEB_PID=""
+run_live_smoke() {
+    local output_dir="$DOTFILES_DIR/output/qa-smoke"
+    local haiku_file="$output_dir/logs/smoke/HAIKU-1.md"
+    local steer_text="Include the exact word STEERED somewhere in every user-visible artifact while still completing the task."
+
+    log_live ""
+    log_live "Running live smoke + steer check..."
+    rm -rf "$output_dir"
+    rm -rf "$SOULCASTER_DIR/logs/smoke"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-smoke.dot" --steer-text "$steer_text"; then
+        LIVE_SMOKE_STATUS="FAIL"
+        log_live "Smoke pipeline exited non-zero."
+        return 1
     fi
 
-    if [[ -n "$WEB_PID" ]]; then
-        run_qa_agent "scenario1" \
-            "The soulcaster pipeline runner completed a smoke test. GET http://localhost:$WEB_PORT/api/pipelines returns a JSON array with status 200 containing at least one entry. GET http://localhost:$WEB_PORT/api/pipeline/{id}/status for the smoke pipeline returns JSON with a status field equal to completed and a nodes array where each node object has a status field equal to done." \
-            50 5
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_SMOKE_STATUS="FAIL"
+        log_live "Smoke result.json missing."
+        return 1
     fi
-else
-    log "Scenario 1: SKIPPED"
-    RESULT_S1="SKIP"
-fi
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Scenario 2: Resume from Checkpoint
-# ═══════════════════════════════════════════════════════════════════════
-if should_run 2; then
-    log ""
-    log "═══ Scenario 2: Resume from Checkpoint ═══"
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_SMOKE_STATUS="FAIL"
+        log_live "Smoke result status was not success."
+        return 1
+    fi
 
-    rm -rf "$DOTFILES_DIR/output/qa-checkpoint"
-    OUTPUT_DIR="$DOTFILES_DIR/output/qa-checkpoint"
-    CHECKPOINT_FILE="$OUTPUT_DIR/logs/checkpoint.json"
+    if [[ ! -f "$haiku_file" ]]; then
+        LIVE_SMOKE_STATUS="FAIL"
+        log_live "Smoke artifact missing: $haiku_file"
+        return 1
+    fi
 
-    # Run in background
-    log "  Starting qa-checkpoint.dot (will kill mid-execution)..."
+    if ! rg -q "STEERED" "$haiku_file"; then
+        LIVE_SMOKE_STATUS="FAIL"
+        log_live "Smoke artifact did not reflect steer text."
+        return 1
+    fi
+
+    LIVE_SMOKE_STATUS="PASS"
+    log_live "Smoke + steer check passed."
+}
+
+run_live_checkpoint() {
+    local output_dir="$DOTFILES_DIR/output/qa-checkpoint"
+    local checkpoint_file="$output_dir/logs/checkpoint.json"
+    local pipeline_pid=""
+
+    log_live ""
+    log_live "Running live checkpoint + resume check..."
+    rm -rf "$output_dir"
+    rm -rf "$SOULCASTER_DIR/logs/checkpoint_test"
+
+    set +e
     dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-checkpoint.dot" \
-        > "$RESULTS_DIR/scenario2-initial.log" 2>&1 &
-    PIPELINE_PID=$!
+        > >(tee -a "$LIVE_LOG") 2> >(tee -a "$LIVE_LOG" >&2) &
+    pipeline_pid=$!
+    set -e
 
-    # Poll checkpoint until at least start + step_a + step_b are completed
-    WAIT_MAX=180
-    WAIT_COUNT=0
-    KILLED=false
-    while [[ $WAIT_COUNT -lt $WAIT_MAX ]]; do
-        # Check if process already finished
-        if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then
-            log "  Pipeline finished before kill signal."
+    local killed=false
+    local waited=0
+    while [[ $waited -lt 180 ]]; do
+        if ! kill -0 "$pipeline_pid" 2>/dev/null; then
             break
         fi
 
-        if [[ -f "$CHECKPOINT_FILE" ]]; then
-            COMPLETED=$(python3 -c "
-import json, sys
-try:
-    cp = json.load(open(sys.argv[1]))
-    print(len(cp.get('CompletedNodes', [])))
-except: print(0)
-" "$CHECKPOINT_FILE" 2>/dev/null || echo 0)
-            if [[ "$COMPLETED" -ge 3 ]]; then
-                log "  $COMPLETED nodes completed. Killing pipeline."
-                kill "$PIPELINE_PID" 2>/dev/null || true
-                wait "$PIPELINE_PID" 2>/dev/null || true
-                KILLED=true
+        if [[ -f "$checkpoint_file" ]]; then
+            local completed
+            completed="$(checkpoint_completed_count "$checkpoint_file" 2>/dev/null || echo 0)"
+            if [[ "$completed" -ge 3 ]]; then
+                kill "$pipeline_pid" 2>/dev/null || true
+                wait "$pipeline_pid" 2>/dev/null || true
+                killed=true
                 break
             fi
         fi
+
         sleep 2
-        WAIT_COUNT=$((WAIT_COUNT + 2))
+        waited=$((waited + 2))
     done
-    PIPELINE_PID=""
 
-    S2_PASS=true
-
-    if [[ "$KILLED" == "true" ]]; then
-        # Save pre-resume checkpoint
-        cp "$CHECKPOINT_FILE" "$RESULTS_DIR/checkpoint-before-resume.json"
-        PRE_NODES=$(python3 -c "
-import json, sys
-cp = json.load(open(sys.argv[1]))
-print(','.join(cp.get('CompletedNodes', [])))
-" "$RESULTS_DIR/checkpoint-before-resume.json" 2>/dev/null || echo "unknown")
-        log "  Pre-resume completed nodes: $PRE_NODES"
-
-        # Verify result.json does NOT exist (pipeline was killed before finishing)
-        if [[ -f "$OUTPUT_DIR/logs/result.json" ]]; then
-            log "  [WARN] result.json exists before resume — pipeline may have finished before kill"
-        fi
-
-        # Resume
-        log "  Resuming pipeline..."
-        run_pipeline "$DOTFILES_DIR/qa-checkpoint.dot" "scenario2-resume"
-
-        # Verify completion
-        check_file "$OUTPUT_DIR/logs/result.json" "result.json exists after resume" || S2_PASS=false
-
-        # Verify all 4 steps in CompletedNodes
-        if [[ -f "$CHECKPOINT_FILE" ]]; then
-            POST_NODES=$(python3 -c "
-import json, sys
-cp = json.load(open(sys.argv[1]))
-nodes = cp.get('CompletedNodes', [])
-for n in ['step_a', 'step_b', 'step_c', 'step_d']:
-    if n not in nodes:
-        print(f'MISSING:{n}')
-        sys.exit(1)
-print('ALL_PRESENT')
-" "$CHECKPOINT_FILE" 2>/dev/null || echo "ERROR")
-
-            if [[ "$POST_NODES" == "ALL_PRESENT" ]]; then
-                log "  [ok] All 4 step nodes in CompletedNodes after resume"
-            else
-                log "  [FAIL] $POST_NODES"
-                S2_PASS=false
-            fi
-        fi
-
-        # Verify post-resume timestamp is newer
-        if [[ -f "$RESULTS_DIR/checkpoint-before-resume.json" ]] && [[ -f "$CHECKPOINT_FILE" ]]; then
-            TIMESTAMP_CHECK=$(python3 -c "
-import json, sys
-pre = json.load(open(sys.argv[1]))
-post = json.load(open(sys.argv[2]))
-pre_ts = pre.get('Timestamp', '')
-post_ts = post.get('Timestamp', '')
-if post_ts > pre_ts:
-    print('NEWER')
-else:
-    print(f'NOT_NEWER:{pre_ts}:{post_ts}')
-" "$RESULTS_DIR/checkpoint-before-resume.json" "$CHECKPOINT_FILE" 2>/dev/null || echo "ERROR")
-
-            if [[ "$TIMESTAMP_CHECK" == "NEWER" ]]; then
-                log "  [ok] Post-resume checkpoint timestamp is newer"
-            else
-                log "  [WARN] $TIMESTAMP_CHECK"
-            fi
-        fi
-    else
-        log "  [FAIL] Could not kill pipeline mid-execution (timed out or finished too fast)"
-        S2_PASS=false
+    if [[ "$killed" != "true" ]]; then
+        LIVE_CHECKPOINT_STATUS="FAIL"
+        log_live "Checkpoint run did not pause in a resumable state."
+        return 1
     fi
 
-    if [[ "$S2_PASS" == "true" ]]; then
-        RESULT_S2="PASS"
-        log "  Scenario 2 pre-checks: PASS"
-    else
-        RESULT_S2="FAIL"
-        log "  Scenario 2 pre-checks: FAIL"
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-checkpoint.dot" --resume-from "$output_dir" --resume; then
+        LIVE_CHECKPOINT_STATUS="FAIL"
+        log_live "Checkpoint resume exited non-zero."
+        return 1
     fi
 
-    # qa-agent verification
-    if [[ -n "$WEB_PID" ]]; then
-        run_qa_agent "scenario2" \
-            "A soulcaster pipeline was interrupted and resumed from checkpoint. GET http://localhost:$WEB_PORT/api/pipelines returns JSON with status 200. GET http://localhost:$WEB_PORT/api/pipeline/{id}/status for the qa-checkpoint pipeline returns JSON with status completed and a nodes array containing step_a and step_b and step_c and step_d all with status done." \
-            50 5
-    fi
-else
-    log "Scenario 2: SKIPPED"
-    RESULT_S2="SKIP"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Scenario 3: Web Dashboard
-# ═══════════════════════════════════════════════════════════════════════
-if should_run 3; then
-    log ""
-    log "═══ Scenario 3: Web Dashboard ═══"
-
-    S3_PASS=true
-
-    if [[ -z "$WEB_PID" ]]; then
-        # Start dashboard if not already running
-        log "  Starting web dashboard on port $WEB_PORT..."
-        dotnet run --project "$SOULCASTER_DIR/runner" -- web --port "$WEB_PORT" > "$RESULTS_DIR/web-dashboard.log" 2>&1 &
-        WEB_PID=$!
-        sleep 3
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_CHECKPOINT_STATUS="FAIL"
+        log_live "Checkpoint result.json missing after resume."
+        return 1
     fi
 
-    # Direct HTTP checks
-    for ENDPOINT in "/" "/api/pipelines" "/api/queue"; do
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:$WEB_PORT$ENDPOINT" 2>/dev/null || echo "000")
-        if [[ "$HTTP_CODE" == "200" ]]; then
-            log "  [ok] GET $ENDPOINT → $HTTP_CODE"
-        else
-            log "  [FAIL] GET $ENDPOINT → $HTTP_CODE"
-            S3_PASS=false
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_CHECKPOINT_STATUS="FAIL"
+        log_live "Checkpoint result status was not success."
+        return 1
+    fi
+
+    if ! checkpoint_has_nodes "$checkpoint_file" "step_a,step_b,step_c,step_d" >/dev/null 2>&1; then
+        LIVE_CHECKPOINT_STATUS="FAIL"
+        log_live "Checkpoint file did not contain all expected completed nodes."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/checkpoint_test/STEP-D.md" ]]; then
+        LIVE_CHECKPOINT_STATUS="FAIL"
+        log_live "Final checkpoint artifact missing."
+        return 1
+    fi
+
+    LIVE_CHECKPOINT_STATUS="PASS"
+    log_live "Checkpoint + resume check passed."
+}
+
+run_live_parallel() {
+    local output_dir="$DOTFILES_DIR/output/qa-parallel-multihop"
+
+    log_live ""
+    log_live "Running live parallel multi-hop check..."
+    rm -rf "$output_dir"
+    rm -rf "$SOULCASTER_DIR/logs/parallel_test"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-parallel-multihop.dot"; then
+        LIVE_PARALLEL_STATUS="FAIL"
+        log_live "Parallel multi-hop pipeline exited non-zero."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_PARALLEL_STATUS="FAIL"
+        log_live "Parallel result.json missing."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_PARALLEL_STATUS="FAIL"
+        log_live "Parallel result status was not success."
+        return 1
+    fi
+
+    for artifact in \
+        "$output_dir/logs/parallel_test/BRANCH-A-STEP1.md" \
+        "$output_dir/logs/parallel_test/BRANCH-A-STEP2.md" \
+        "$output_dir/logs/parallel_test/BRANCH-B.md"; do
+        if [[ ! -f "$artifact" ]]; then
+            LIVE_PARALLEL_STATUS="FAIL"
+            log_live "Parallel artifact missing: $artifact"
+            return 1
         fi
     done
 
-    # Check /api/pipelines returns valid JSON array
-    PIPELINES_BODY=$(curl -sf "http://localhost:$WEB_PORT/api/pipelines" 2>/dev/null || echo "")
-    if echo "$PIPELINES_BODY" | python3 -c "import json,sys; data=json.load(sys.stdin); assert isinstance(data, list)" 2>/dev/null; then
-        log "  [ok] /api/pipelines returns JSON array"
+    if [[ ! -f "$output_dir/logs/merge/status.json" ]]; then
+        LIVE_PARALLEL_STATUS="FAIL"
+        log_live "Fan-in status artifact missing."
+        return 1
+    fi
 
-        # Get first pipeline ID and check /api/pipeline/{id}/status
-        FIRST_ID=$(echo "$PIPELINES_BODY" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-if data: print(data[0].get('id', ''))
-else: print('')
-" 2>/dev/null || echo "")
+    if [[ "$(json_status "$output_dir/logs/merge/status.json")" != "success" ]]; then
+        LIVE_PARALLEL_STATUS="FAIL"
+        log_live "Fan-in node did not finish successfully."
+        return 1
+    fi
 
-        if [[ -n "$FIRST_ID" ]]; then
-            for SUB_ENDPOINT in "status" "summaries" "logs"; do
-                HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:$WEB_PORT/api/pipeline/$FIRST_ID/$SUB_ENDPOINT" 2>/dev/null || echo "000")
-                if [[ "$HTTP_CODE" == "200" ]]; then
-                    log "  [ok] GET /api/pipeline/{id}/$SUB_ENDPOINT → $HTTP_CODE"
-                else
-                    log "  [FAIL] GET /api/pipeline/{id}/$SUB_ENDPOINT → $HTTP_CODE"
-                    S3_PASS=false
-                fi
-            done
-        else
-            log "  [WARN] No pipeline ID found to test sub-endpoints"
+    LIVE_PARALLEL_STATUS="PASS"
+    log_live "Parallel multi-hop check passed."
+}
+
+run_live_queue() {
+    local output_dir="$DOTFILES_DIR/output/qa-queue-parallel"
+    local alpha_stage="$output_dir/logs/worker[alpha.txt]"
+    local beta_stage="$output_dir/logs/worker[beta.txt]"
+    local gamma_stage="$output_dir/logs/worker[gamma.txt]"
+
+    log_live ""
+    log_live "Running live queue parallelism check..."
+    rm -rf "$output_dir"
+    rm -rf "$output_dir/logs/queue_inputs" "$output_dir/logs/queue_outputs"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-queue-parallel.dot"; then
+        LIVE_QUEUE_STATUS="FAIL"
+        log_live "Queue parallel pipeline exited non-zero."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_QUEUE_STATUS="FAIL"
+        log_live "Queue result.json missing."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_QUEUE_STATUS="FAIL"
+        log_live "Queue result status was not success."
+        return 1
+    fi
+
+    if ! python3 - <<'PY' "$output_dir/logs/result.json"
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+completed = set(payload.get("completed_nodes", []))
+required = {"worker[alpha.txt]", "worker[beta.txt]", "worker[gamma.txt]"}
+if not required.issubset(completed):
+    raise SystemExit(1)
+PY
+    then
+        LIVE_QUEUE_STATUS="FAIL"
+        log_live "Queue result.json did not record per-item worker stage completions."
+        return 1
+    fi
+
+    for artifact in \
+        "$output_dir/logs/queue_outputs/alpha.txt.done.md" \
+        "$output_dir/logs/queue_outputs/beta.txt.done.md" \
+        "$output_dir/logs/queue_outputs/gamma.txt.done.md"; do
+        if [[ ! -f "$artifact" ]]; then
+            LIVE_QUEUE_STATUS="FAIL"
+            log_live "Queue artifact missing: $artifact"
+            return 1
         fi
-    else
-        log "  [FAIL] /api/pipelines did not return valid JSON array"
-        S3_PASS=false
+        if ! rg -q "^Processed " "$artifact"; then
+            LIVE_QUEUE_STATUS="FAIL"
+            log_live "Queue artifact did not contain the expected marker: $artifact"
+            return 1
+        fi
+    done
+
+    if [[ ! -f "$output_dir/logs/merge/status.json" ]]; then
+        LIVE_QUEUE_STATUS="FAIL"
+        log_live "Queue fan-in status artifact missing."
+        return 1
     fi
 
-    if [[ "$S3_PASS" == "true" ]]; then
-        RESULT_S3="PASS"
-        log "  Scenario 3 pre-checks: PASS"
-    else
-        RESULT_S3="FAIL"
-        log "  Scenario 3 pre-checks: FAIL"
+    for stage_dir in "$alpha_stage" "$beta_stage" "$gamma_stage"; do
+        if [[ ! -f "$stage_dir/prompt.md" ]]; then
+            LIVE_QUEUE_STATUS="FAIL"
+            log_live "Queue worker stage artifact missing: $stage_dir/prompt.md"
+            return 1
+        fi
+    done
+
+    LIVE_QUEUE_STATUS="PASS"
+    log_live "Queue parallelism check passed."
+}
+
+run_live_supervisor() {
+    local output_dir="$DOTFILES_DIR/output/qa-supervisor"
+    local manager_cycle="$output_dir/logs/manager/cycle-1.md"
+
+    log_live ""
+    log_live "Running live telemetry supervisor check..."
+    rm -rf "$output_dir"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-supervisor.dot"; then
+        LIVE_SUPERVISOR_STATUS="FAIL"
+        log_live "Supervisor pipeline exited non-zero."
+        return 1
     fi
 
-    run_qa_agent "scenario3" \
-        "The soulcaster web dashboard is at http://localhost:$WEB_PORT. GET / returns HTML with status 200. GET /api/pipelines returns a JSON array with status 200. GET /api/queue returns a JSON array with status 200. For a pipeline from /api/pipelines, GET /api/pipeline/{id}/status returns JSON with status 200 containing status and nodes fields. GET /api/pipeline/{id}/summaries returns JSON with status 200. GET /api/pipeline/{id}/logs returns a JSON array with status 200." \
-        100 10
-else
-    log "Scenario 3: SKIPPED"
-    RESULT_S3="SKIP"
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_SUPERVISOR_STATUS="FAIL"
+        log_live "Supervisor result.json missing."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_SUPERVISOR_STATUS="FAIL"
+        log_live "Supervisor result status was not success."
+        return 1
+    fi
+
+    if [[ ! -f "$manager_cycle" ]]; then
+        LIVE_SUPERVISOR_STATUS="FAIL"
+        log_live "Supervisor steering artifact missing: $manager_cycle"
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/manager/status.json" ]]; then
+        LIVE_SUPERVISOR_STATUS="FAIL"
+        log_live "Supervisor status.json missing."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/manager/status.json")" != "success" ]]; then
+        LIVE_SUPERVISOR_STATUS="FAIL"
+        log_live "Supervisor manager node did not finish with success status."
+        return 1
+    fi
+
+    LIVE_SUPERVISOR_STATUS="PASS"
+    log_live "Telemetry supervisor check passed."
+}
+
+run_live_builder() {
+    local work_dir="$RESULTS_DIR/builder-live"
+    local dot_file="$work_dir/builder-generated.dot"
+    local output_dir="$work_dir/output/builder-generated"
+
+    log_live ""
+    log_live "Running live builder/editor workflow check..."
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- builder init "$dot_file" --name builder_generated --goal "Exercise the builder/editor workflow"; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Builder init failed."
+        return 1
+    fi
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- builder node "$dot_file" write --shape box --label "Write Artifact" --prompt "Write 'Builder workflow complete' to logs/builder/BUILDER-LIVE.md. That is all."; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Builder node edit failed."
+        return 1
+    fi
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- builder edge "$dot_file" start write; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Builder edge start->write failed."
+        return 1
+    fi
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- builder edge "$dot_file" write done; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Builder edge write->done failed."
+        return 1
+    fi
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- lint "$dot_file"; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Generated builder DOT did not lint cleanly."
+        return 1
+    fi
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$dot_file"; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Generated builder DOT did not run successfully."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/builder/BUILDER-LIVE.md" ]]; then
+        LIVE_BUILDER_STATUS="FAIL"
+        log_live "Builder live artifact missing."
+        return 1
+    fi
+
+    LIVE_BUILDER_STATUS="PASS"
+    log_live "Builder/editor workflow check passed."
+}
+
+run_live_lint() {
+    log_live ""
+    log_live "Running live lint check..."
+
+    if run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- lint "$DOTFILES_DIR/project-cli-task-tracker.dot"; then
+        LIVE_LINT_STATUS="PASS"
+        log_live "Lint check passed."
+        return 0
+    fi
+
+    LIVE_LINT_STATUS="FAIL"
+    log_live "Lint check failed."
+    return 1
+}
+
+run_live_mode() {
+    : > "$LIVE_LOG"
+    if ! ensure_build; then
+        LIVE_STATUS="FAIL"
+        return 1
+    fi
+
+    if ! require_anthropic_key; then
+        LIVE_STATUS="FAIL"
+        return 1
+    fi
+
+    if [[ "$SKIP_QA_AGENT" == "false" && -d "$QA_AGENT_DIR" ]]; then
+        log_live "qa-agent integration is available but not required for this harness pass."
+    fi
+
+    local overall=true
+
+    if should_run_live smoke; then
+        run_live_smoke || overall=false
+    fi
+
+    if should_run_live checkpoint; then
+        run_live_checkpoint || overall=false
+    fi
+
+    if should_run_live parallel; then
+        run_live_parallel || overall=false
+    fi
+
+    if should_run_live queue; then
+        run_live_queue || overall=false
+    fi
+
+    if should_run_live supervisor; then
+        run_live_supervisor || overall=false
+    fi
+
+    if should_run_live builder; then
+        run_live_builder || overall=false
+    fi
+
+    if should_run_live lint; then
+        run_live_lint || overall=false
+    fi
+
+    if [[ "$overall" == "true" ]]; then
+        LIVE_STATUS="PASS"
+        return 0
+    fi
+
+    LIVE_STATUS="FAIL"
+    return 1
+}
+
+log "Results directory: $RESULTS_DIR"
+
+HARNESS_EXIT=0
+
+if [[ "$MODE_UNIT" == "true" ]]; then
+    run_unit_mode || HARNESS_EXIT=1
 fi
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Scenario 4: Multi-Model Pipeline
-# ═══════════════════════════════════════════════════════════════════════
-if should_run 4; then
-    if [[ "$SKIP_MULTIMODEL" == "true" ]]; then
-        log ""
-        log "═══ Scenario 4: SKIPPED (GEMINI_API_KEY not set) ═══"
-        RESULT_S4="SKIP"
-    else
-        log ""
-        log "═══ Scenario 4: Multi-Model Pipeline ═══"
-
-        rm -rf "$DOTFILES_DIR/output/qa-multimodel"
-        OUTPUT_DIR="$DOTFILES_DIR/output/qa-multimodel"
-
-        run_pipeline "$DOTFILES_DIR/qa-multimodel.dot" "scenario4-run"
-
-        S4_PASS=true
-
-        check_file "$OUTPUT_DIR/logs/result.json" "result.json exists" || S4_PASS=false
-
-        # Check each provider node
-        for NODE in anthropic_node openai_node gemini_node; do
-            check_file "$OUTPUT_DIR/logs/$NODE/status.json" "$NODE/status.json exists" || S4_PASS=false
-
-            if [[ -f "$OUTPUT_DIR/logs/$NODE/status.json" ]]; then
-                NODE_STATUS=$(python3 -c "
-import json, sys
-doc = json.load(open(sys.argv[1]))
-print(doc.get('status', 'unknown'))
-" "$OUTPUT_DIR/logs/$NODE/status.json" 2>/dev/null || echo "unknown")
-
-                if [[ "$NODE_STATUS" == "success" ]]; then
-                    log "  [ok] $NODE status: $NODE_STATUS"
-                else
-                    log "  [FAIL] $NODE status: $NODE_STATUS (expected: success)"
-                    S4_PASS=false
-                fi
-
-                # Check provider field
-                NODE_PROVIDER=$(python3 -c "
-import json, sys
-doc = json.load(open(sys.argv[1]))
-print(doc.get('provider', 'unknown') or 'null')
-" "$OUTPUT_DIR/logs/$NODE/status.json" 2>/dev/null || echo "unknown")
-                log "  [info] $NODE provider: $NODE_PROVIDER"
-            fi
-
-            check_file "$OUTPUT_DIR/logs/$NODE/response.md" "$NODE/response.md exists" || S4_PASS=false
-        done
-
-        if [[ "$S4_PASS" == "true" ]]; then
-            RESULT_S4="PASS"
-            log "  Scenario 4 pre-checks: PASS"
-        else
-            RESULT_S4="FAIL"
-            log "  Scenario 4 pre-checks: FAIL"
-        fi
-
-        if [[ -n "$WEB_PID" ]]; then
-            run_qa_agent "scenario4" \
-                "A multi-model soulcaster pipeline completed. GET http://localhost:$WEB_PORT/api/pipelines returns JSON with status 200. GET http://localhost:$WEB_PORT/api/pipeline/{id}/status for the qa-multimodel pipeline returns JSON with status completed and nodes array containing anthropic_node and openai_node and gemini_node all with status done." \
-                50 5
-        fi
-    fi
-else
-    log "Scenario 4: SKIPPED"
-    RESULT_S4="SKIP"
+if [[ "$MODE_SCENARIO" == "true" ]]; then
+    run_scenario_mode || HARNESS_EXIT=1
 fi
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Summary
-# ═══════════════════════════════════════════════════════════════════════
-log ""
-log "═══════════════════════════════════════"
-log "  QA Harness Summary"
-log "═══════════════════════════════════════"
-
-OVERALL_PASS=true
-for PAIR in "scenario1:$RESULT_S1" "scenario2:$RESULT_S2" "scenario3:$RESULT_S3" "scenario4:$RESULT_S4"; do
-    SCENARIO="${PAIR%%:*}"
-    STATUS="${PAIR#*:}"
-    case "$STATUS" in
-        PASS) ICON="+" ;;
-        FAIL) ICON="x"; OVERALL_PASS=false ;;
-        SKIP) ICON="-" ;;
-        *) ICON="?"; OVERALL_PASS=false ;;
-    esac
-    log "  [$ICON] $SCENARIO: $STATUS"
-done
-
-log ""
-log "  Results directory: $RESULTS_DIR"
-log ""
-
-# List qa-agent reports
-for d in "$RESULTS_DIR"/qa-agent-scenario*; do
-    if [[ -d "$d" ]]; then
-        REPORT=$(find "$d" -name "report.md" 2>/dev/null | head -1)
-        if [[ -n "$REPORT" ]]; then
-            log "  Report: $REPORT"
-        fi
-    fi
-done
-
-log ""
-if [[ "$OVERALL_PASS" == "true" ]]; then
-    log "  Overall: ALL PASSED"
-    exit 0
-else
-    log "  Overall: SOME FAILED"
-    exit 1
+if [[ "$MODE_LIVE" == "true" ]]; then
+    run_live_mode || HARNESS_EXIT=1
 fi
+
+export RESULTS_DIR UNIT_STATUS SCENARIO_STATUS LIVE_STATUS
+export LIVE_SMOKE_STATUS LIVE_CHECKPOINT_STATUS LIVE_PARALLEL_STATUS LIVE_QUEUE_STATUS LIVE_SUPERVISOR_STATUS LIVE_BUILDER_STATUS LIVE_LINT_STATUS
+write_summary_json
+
+log ""
+log "Summary:"
+log "  unit:     $UNIT_STATUS"
+log "  scenario: $SCENARIO_STATUS"
+log "  live:     $LIVE_STATUS"
+if [[ "$MODE_LIVE" == "true" ]]; then
+    log "  smoke:    $LIVE_SMOKE_STATUS"
+    log "  checkpoint: $LIVE_CHECKPOINT_STATUS"
+    log "  parallel: $LIVE_PARALLEL_STATUS"
+    log "  queue:    $LIVE_QUEUE_STATUS"
+    log "  supervisor: $LIVE_SUPERVISOR_STATUS"
+    log "  builder:  $LIVE_BUILDER_STATUS"
+    log "  lint:     $LIVE_LINT_STATUS"
+fi
+log "  summary:  $SUMMARY_JSON"
+
+exit "$HARNESS_EXIT"

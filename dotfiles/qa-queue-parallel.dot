@@ -1,0 +1,18 @@
+digraph "qa_queue_parallel" {
+    goal = "Exercise queue-backed parallelism with real agent output."
+
+    "start" [shape="Mdiamond", label="Start"]
+    "seed_queue" [shape="parallelogram", label="Seed Queue", tool_command="mkdir -p dotfiles/output/qa-queue-parallel/logs/queue_inputs && printf 'alpha\\n' > dotfiles/output/qa-queue-parallel/logs/queue_inputs/alpha.txt && printf 'beta\\n' > dotfiles/output/qa-queue-parallel/logs/queue_inputs/beta.txt && printf 'gamma\\n' > dotfiles/output/qa-queue-parallel/logs/queue_inputs/gamma.txt"]
+    "parallel_queue" [shape="component", label="Queue Workers", queue_source="logs/queue_inputs", max_parallel="2"]
+    "worker" [shape="box", label="Process Item", prompt="Read ${context.queue.item.path}. Then write a file at logs/queue_outputs/${context.queue.item.name}.done.md containing exactly:\nProcessed ${context.queue.item.id}\nSource: ${context.queue.item.name}\nThat is all."]
+    "merge" [shape="tripleoctagon", label="Merge Queue Results"]
+    "verify" [shape="box", label="Verify Queue Outputs", prompt="Read the following files and confirm that each exists and begins with the word 'Processed':\n- logs/queue_outputs/alpha.txt.done.md\n- logs/queue_outputs/beta.txt.done.md\n- logs/queue_outputs/gamma.txt.done.md\nReturn success only if all three checks pass."]
+    "done" [shape="Msquare", label="Done"]
+
+    "start" -> "seed_queue"
+    "seed_queue" -> "parallel_queue"
+    "parallel_queue" -> "worker"
+    "worker" -> "merge"
+    "merge" -> "verify"
+    "verify" -> "done"
+}

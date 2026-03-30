@@ -102,14 +102,16 @@ public class OpenAiProfile : IProviderProfile
                 new List<ToolParameter>
                 {
                     new("pattern", "string", "The glob pattern to match files against", true),
-                    new("path", "string", "Directory to search in (defaults to working directory)", false)
+                    new("path", "string", "Directory to search in (defaults to working directory)", false),
+                    new("max_results", "integer", "Maximum number of results to return", false)
                 }),
             async (args, env) =>
             {
                 var json = JsonDocument.Parse(args);
                 var pattern = json.RootElement.GetProperty("pattern").GetString()!;
                 string? path = json.RootElement.TryGetProperty("path", out var p) ? p.GetString() : null;
-                var results = await env.GlobAsync(pattern, path);
+                int? maxResults = json.RootElement.TryGetProperty("max_results", out var mr) ? mr.GetInt32() : null;
+                var results = await env.GlobAsync(pattern, path, maxResults);
                 return results.Count > 0 ? string.Join('\n', results) : "No files found matching pattern.";
             }));
 

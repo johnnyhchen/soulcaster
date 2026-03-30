@@ -2690,7 +2690,13 @@ internal class FailThenSucceedBackend : ICodergenBackend
         return Task.FromResult(new CodergenResult(
             Response: $"Success on attempt {CallCount}",
             Status: OutcomeStatus.Success,
-            ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" }
+            ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" },
+            StageStatus: new StageStatusContract(
+                Status: OutcomeStatus.Success,
+                PreferredNextLabel: "",
+                SuggestedNextIds: new List<string>(),
+                ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" },
+                Notes: "ok")
         ));
     }
 }
@@ -2718,7 +2724,13 @@ internal class RetryThenSucceedBackend : ICodergenBackend
         return Task.FromResult(new CodergenResult(
             Response: $"Success on attempt {CallCount}",
             Status: OutcomeStatus.Success,
-            ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" }
+            ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" },
+            StageStatus: new StageStatusContract(
+                Status: OutcomeStatus.Success,
+                PreferredNextLabel: "",
+                SuggestedNextIds: new List<string>(),
+                ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" },
+                Notes: "ok")
         ));
     }
 }
@@ -3169,9 +3181,9 @@ public class QaDotfileParsingTests
     [InlineData("qa-smoke.dot", 4, 3)]
     [InlineData("qa-checkpoint.dot", 6, 5)]
     [InlineData("qa-multimodel.dot", 5, 4)]
-    [InlineData("project-cli-task-tracker.dot", 12, 15)]
-    [InlineData("project-markdown-static-site.dot", 12, 15)]
-    [InlineData("project-http-load-tester.dot", 12, 15)]
+    [InlineData("project-cli-task-tracker.dot", 13, 16)]
+    [InlineData("project-markdown-static-site.dot", 13, 16)]
+    [InlineData("project-http-load-tester.dot", 13, 16)]
     public void QaDotfile_ParsesAndValidates(string filename, int expectedNodes, int expectedEdges)
     {
         var dotfilePath = Path.Combine(
