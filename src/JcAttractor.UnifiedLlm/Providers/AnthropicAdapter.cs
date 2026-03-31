@@ -5,7 +5,7 @@ using System.Text.Json.Nodes;
 
 namespace JcAttractor.UnifiedLlm;
 
-public sealed class AnthropicAdapter : IProviderAdapter
+public sealed class AnthropicAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 {
     private const string DefaultBaseUrl = "https://api.anthropic.com";
     private const string ApiVersion = "2023-06-01";
@@ -21,6 +21,76 @@ public sealed class AnthropicAdapter : IProviderAdapter
         _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
         _baseUrl = baseUrl.TrimEnd('/');
         _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
+    }
+
+    public async Task<ProviderPingResult> PingAsync(CancellationToken ct = default)
+    {
+        var endpoint = $"{_baseUrl}/v1/models";
+
+        try
+        {
+            var models = await ListModelsAsync(ct).ConfigureAwait(false);
+            return new ProviderPingResult(Name, true, endpoint, StatusCode: 200, ModelCount: models.Count);
+        }
+        catch (ProviderError ex)
+        {
+            return new ProviderPingResult(Name, false, endpoint, StatusCode: (int)ex.StatusCode, Message: ex.Message);
+        }
+        catch (Exception ex)
+        {
+            return new ProviderPingResult(Name, false, endpoint, Message: ex.Message);
+        }
+    }
+
+    public async Task<IReadOnlyList<ProviderModelDescriptor>> ListModelsAsync(CancellationToken ct = default)
+    {
+        var models = new List<ProviderModelDescriptor>();
+        string? afterId = null;
+
+        while (true)
+        {
+            using var httpReq = CreateModelsRequest(afterId);
+            using var httpRes = await _http.SendAsync(httpReq, ct).ConfigureAwait(false);
+            var responseBody = await httpRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            EnsureSuccess(httpRes, responseBody);
+
+            using var doc = JsonDocument.Parse(responseBody);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in data.EnumerateArray())
+                {
+                    var id = ProviderDiscoveryJson.GetString(item, "id");
+                    if (string.IsNullOrWhiteSpace(id))
+                        continue;
+
+                    models.Add(new ProviderModelDescriptor(
+                        Provider: Name,
+                        Id: id,
+                        DisplayName: ProviderDiscoveryJson.GetString(item, "display_name", "name"),
+                        ContextWindow: ProviderDiscoveryJson.GetInt32(item, "context_window", "input_token_limit"),
+                        MaxOutput: ProviderDiscoveryJson.GetInt32(item, "max_output_tokens", "output_token_limit"),
+                        SupportsTools: ProviderDiscoveryJson.GetBool(item, "supports_tools"),
+                        SupportsVision: ProviderDiscoveryJson.GetBool(item, "supports_vision"),
+                        SupportsReasoning: ProviderDiscoveryJson.GetBool(item, "supports_reasoning"),
+                        RawJson: item.GetRawText()));
+
+                    afterId = id;
+                }
+            }
+
+            var hasMore = root.TryGetProperty("has_more", out var hasMoreElement) &&
+                hasMoreElement.ValueKind == JsonValueKind.True;
+            if (!hasMore || string.IsNullOrWhiteSpace(afterId))
+                break;
+        }
+
+        return models
+            .DistinctBy(m => m.Id, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList()
+            .AsReadOnly();
     }
 
     // ── CompleteAsync ──────────────────────────────────────────────────
@@ -509,6 +579,18 @@ public sealed class AnthropicAdapter : IProviderAdapter
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────────
+
+    private HttpRequestMessage CreateModelsRequest(string? afterId)
+    {
+        var url = $"{_baseUrl}/v1/models?limit=100";
+        if (!string.IsNullOrWhiteSpace(afterId))
+            url += $"&after_id={Uri.EscapeDataString(afterId)}";
+
+        var httpReq = new HttpRequestMessage(HttpMethod.Get, url);
+        httpReq.Headers.Add("x-api-key", _apiKey);
+        httpReq.Headers.Add("anthropic-version", ApiVersion);
+        return httpReq;
+    }
 
     private HttpRequestMessage CreateHttpRequest(Request request, JsonObject body)
     {

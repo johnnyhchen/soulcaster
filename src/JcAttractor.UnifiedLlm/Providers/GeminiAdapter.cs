@@ -5,7 +5,7 @@ using System.Text.Json.Nodes;
 
 namespace JcAttractor.UnifiedLlm;
 
-public sealed class GeminiAdapter : IProviderAdapter
+public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 {
     private const string DefaultBaseUrl = "https://generativelanguage.googleapis.com";
 
@@ -21,6 +21,78 @@ public sealed class GeminiAdapter : IProviderAdapter
         _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
         _baseUrl = baseUrl.TrimEnd('/');
         _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
+    }
+
+    public async Task<ProviderPingResult> PingAsync(CancellationToken ct = default)
+    {
+        var endpoint = $"{_baseUrl}/v1beta/models";
+
+        try
+        {
+            var models = await ListModelsAsync(ct).ConfigureAwait(false);
+            return new ProviderPingResult(Name, true, endpoint, StatusCode: 200, ModelCount: models.Count);
+        }
+        catch (ProviderError ex)
+        {
+            return new ProviderPingResult(Name, false, endpoint, StatusCode: (int)ex.StatusCode, Message: ex.Message);
+        }
+        catch (Exception ex)
+        {
+            return new ProviderPingResult(Name, false, endpoint, Message: ex.Message);
+        }
+    }
+
+    public async Task<IReadOnlyList<ProviderModelDescriptor>> ListModelsAsync(CancellationToken ct = default)
+    {
+        var models = new List<ProviderModelDescriptor>();
+        string? nextPageToken = null;
+
+        while (true)
+        {
+            using var httpReq = CreateModelsRequest(nextPageToken);
+            using var httpRes = await _http.SendAsync(httpReq, ct).ConfigureAwait(false);
+            var responseBody = await httpRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            EnsureSuccess(httpRes, responseBody);
+
+            using var doc = JsonDocument.Parse(responseBody);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("models", out var payloadModels) && payloadModels.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in payloadModels.EnumerateArray())
+                {
+                    var rawId = ProviderDiscoveryJson.GetString(item, "name", "id");
+                    var normalizedId = NormalizeModelId(rawId);
+                    if (string.IsNullOrWhiteSpace(normalizedId))
+                        continue;
+
+                    models.Add(new ProviderModelDescriptor(
+                        Provider: Name,
+                        Id: normalizedId,
+                        DisplayName: ProviderDiscoveryJson.GetString(item, "displayName", "display_name"),
+                        ContextWindow: ProviderDiscoveryJson.GetInt32(item, "inputTokenLimit", "contextWindow"),
+                        MaxOutput: ProviderDiscoveryJson.GetInt32(item, "outputTokenLimit", "maxOutputTokens"),
+                        SupportsTools: ProviderDiscoveryJson.GetBool(item, "supportsTools"),
+                        SupportsVision: ProviderDiscoveryJson.GetBool(item, "supportsVision"),
+                        SupportsReasoning: ProviderDiscoveryJson.GetBool(item, "supportsReasoning", "thinking"),
+                        RawJson: item.GetRawText()));
+                }
+            }
+
+            nextPageToken = root.TryGetProperty("nextPageToken", out var pageTokenElement) &&
+                pageTokenElement.ValueKind == JsonValueKind.String
+                ? pageTokenElement.GetString()
+                : null;
+
+            if (string.IsNullOrWhiteSpace(nextPageToken))
+                break;
+        }
+
+        return models
+            .DistinctBy(m => m.Id, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList()
+            .AsReadOnly();
     }
 
     // ── CompleteAsync ──────────────────────────────────────────────────
@@ -632,5 +704,25 @@ public sealed class GeminiAdapter : IProviderAdapter
     {
         var id = Interlocked.Increment(ref _syntheticCallIdCounter);
         return $"gemini_call_{id:D4}";
+    }
+
+    private HttpRequestMessage CreateModelsRequest(string? nextPageToken)
+    {
+        var url = $"{_baseUrl}/v1beta/models?key={Uri.EscapeDataString(_apiKey)}&pageSize=100";
+        if (!string.IsNullOrWhiteSpace(nextPageToken))
+            url += $"&pageToken={Uri.EscapeDataString(nextPageToken)}";
+
+        return new HttpRequestMessage(HttpMethod.Get, url);
+    }
+
+    private static string NormalizeModelId(string? rawId)
+    {
+        if (string.IsNullOrWhiteSpace(rawId))
+            return string.Empty;
+
+        const string prefix = "models/";
+        return rawId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? rawId[prefix.Length..]
+            : rawId;
     }
 }

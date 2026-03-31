@@ -87,6 +87,20 @@ public static class ModelCatalog
             OutputCostPerMillion: 4.40m,
             Aliases: ["gpt-5.2-mini-2025-01-21"]),
 
+        // GPT-5.4 is accepted explicitly for routing and selection in this runtime.
+        // Cost metadata is intentionally left unset until OpenAI publishes a model card.
+        new ModelInfo(
+            Id: "gpt-5.4",
+            Provider: "openai",
+            DisplayName: "GPT-5.4",
+            ContextWindow: 200_000,
+            MaxOutput: 32_768,
+            SupportsTools: true,
+            SupportsVision: true,
+            SupportsReasoning: true,
+            InputCostPerMillion: null,
+            OutputCostPerMillion: null),
+
         new ModelInfo(
             Id: "gpt-5.2-codex",
             Provider: "openai",
@@ -101,7 +115,7 @@ public static class ModelCatalog
             Aliases: ["codex-5.2"]),
 
         new ModelInfo(
-            Id: "codex-5.3",
+            Id: "gpt-5.3-codex",
             Provider: "openai",
             DisplayName: "Codex 5.3",
             ContextWindow: 200_000,
@@ -111,7 +125,7 @@ public static class ModelCatalog
             SupportsReasoning: true,
             InputCostPerMillion: 10.00m,
             OutputCostPerMillion: 30.00m,
-            Aliases: ["gpt-5.3-codex"]),
+            Aliases: ["codex-5.3"]),
 
         // ── Google Gemini ──────────────────────────────────────────────
         new ModelInfo(
@@ -139,6 +153,18 @@ public static class ModelCatalog
             InputCostPerMillion: 0.15m,
             OutputCostPerMillion: 0.60m,
             Aliases: ["gemini-3-flash"]),
+
+        new ModelInfo(
+            Id: "gemini-2.5-pro",
+            Provider: "gemini",
+            DisplayName: "Gemini 2.5 Pro",
+            ContextWindow: 1_048_576,
+            MaxOutput: 65_536,
+            SupportsTools: null,
+            SupportsVision: null,
+            SupportsReasoning: true,
+            InputCostPerMillion: null,
+            OutputCostPerMillion: null),
     ];
 
     /// <summary>
@@ -182,9 +208,9 @@ public static class ModelCatalog
         {
             candidates = capability.ToLowerInvariant() switch
             {
-                "tools" => candidates.Where(m => m.SupportsTools),
-                "vision" => candidates.Where(m => m.SupportsVision),
-                "reasoning" => candidates.Where(m => m.SupportsReasoning),
+                "tools" => candidates.Where(m => m.SupportsTools == true),
+                "vision" => candidates.Where(m => m.SupportsVision == true),
+                "reasoning" => candidates.Where(m => m.SupportsReasoning == true),
                 _ => candidates
             };
         }

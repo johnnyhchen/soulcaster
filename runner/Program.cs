@@ -18,6 +18,7 @@ var command = args.Length > 0 ? args[0] : "help";
 return command switch
 {
     "run" => await RunPipeline(args[1..]),
+    "providers" => await RunProviders(args[1..]),
     "gate" when args.Length > 1 && args[1] == "answer" => await GateAnswer(args[2..]),
     "gate" when args.Length > 1 && args[1] == "watch" => await GateWatch(args[2..]),
     "gate" => await GateShow(args[1..]),
@@ -155,6 +156,228 @@ static bool TryReadLong(JsonElement root, string property, out long value)
     }
 
     return false;
+}
+
+static async Task<int> RunProviders(string[] args)
+{
+    var subcommand = args.Length > 0 ? args[0] : "help";
+
+    return subcommand switch
+    {
+        "ping" => await RunProvidersPing(args[1..]),
+        "sync-models" => await RunProvidersSyncModels(args[1..]),
+        "help" or "--help" or "-h" => ShowProvidersHelp(),
+        _ => ShowProvidersHelp()
+    };
+}
+
+static async Task<int> RunProvidersPing(string[] args)
+{
+    string? provider = null;
+    var json = false;
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--provider" when i + 1 < args.Length:
+                provider = args[++i];
+                break;
+            case "--json":
+                json = true;
+                break;
+            default:
+                Console.Error.WriteLine($"Unknown providers ping option: {args[i]}");
+                return 1;
+        }
+    }
+
+    var adapters = ProviderCommandSupport.CreateDiscoveryAdaptersFromEnv();
+    if (adapters.Count == 0)
+    {
+        Console.Error.WriteLine("No provider API keys found in environment.");
+        return 1;
+    }
+
+    var selectedProviders = new List<string>();
+    if (string.IsNullOrWhiteSpace(provider))
+    {
+        selectedProviders.AddRange(adapters.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase));
+    }
+    else
+    {
+        var normalizedProvider = ProviderCommandSupport.NormalizeProvider(provider);
+        if (!adapters.ContainsKey(normalizedProvider))
+        {
+            Console.Error.WriteLine($"Provider '{normalizedProvider}' is not configured in this environment.");
+            return 1;
+        }
+
+        selectedProviders.Add(normalizedProvider);
+    }
+
+    var results = new List<ProviderPingResult>();
+    foreach (var selectedProvider in selectedProviders)
+    {
+        var result = await adapters[selectedProvider].PingAsync();
+        results.Add(result);
+    }
+
+    if (json)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(results, JsonOpts()));
+    }
+    else
+    {
+        foreach (var result in results)
+        {
+            var status = result.Success ? "ok" : "fail";
+            var modelCount = result.ModelCount is null ? "?" : result.ModelCount.Value.ToString();
+            var statusCode = result.StatusCode is null ? "" : $" http={result.StatusCode}";
+            var message = string.IsNullOrWhiteSpace(result.Message) ? "" : $" message={result.Message}";
+            Console.WriteLine($"{result.Provider,-10} {status,-4} models={modelCount,-4}{statusCode} endpoint={result.Endpoint}{message}");
+        }
+    }
+
+    return results.All(result => result.Success) ? 0 : 1;
+}
+
+static async Task<int> RunProvidersSyncModels(string[] args)
+{
+    string? provider = null;
+    string? name = null;
+    int? maxModels = null;
+    var run = false;
+    var json = false;
+    var requestedModels = new List<string>();
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--provider" when i + 1 < args.Length:
+                provider = args[++i];
+                break;
+            case "--name" when i + 1 < args.Length:
+                name = args[++i];
+                break;
+            case "--max-models" when i + 1 < args.Length:
+            case "--limit" when i + 1 < args.Length:
+                if (!int.TryParse(args[++i], out var parsedMaxModels) || parsedMaxModels <= 0)
+                {
+                    Console.Error.WriteLine("Expected a positive integer after --max-models/--limit.");
+                    return 1;
+                }
+
+                maxModels = parsedMaxModels;
+                break;
+            case "--model" when i + 1 < args.Length:
+                requestedModels.Add(args[++i]);
+                break;
+            case "--run":
+                run = true;
+                break;
+            case "--json":
+                json = true;
+                break;
+            default:
+                Console.Error.WriteLine($"Unknown providers sync-models option: {args[i]}");
+                return 1;
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(provider))
+    {
+        Console.Error.WriteLine("providers sync-models requires --provider <anthropic|openai|gemini>.");
+        return 1;
+    }
+
+    try
+    {
+        var normalizedProvider = ProviderCommandSupport.NormalizeProvider(provider);
+        var adapters = ProviderCommandSupport.CreateDiscoveryAdaptersFromEnv();
+        if (!adapters.TryGetValue(normalizedProvider, out var adapter))
+        {
+            Console.Error.WriteLine($"Provider '{normalizedProvider}' is not configured in this environment.");
+            return 1;
+        }
+
+        var repositoryRoot = ProviderCommandSupport.ResolveRepositoryRoot(Directory.GetCurrentDirectory());
+        var discoveredModels = await adapter.ListModelsAsync();
+        var selection = ProviderCommandSupport.BuildSyncSelection(
+            normalizedProvider,
+            discoveredModels,
+            maxModels,
+            requestedModels);
+        var artifacts = ProviderCommandSupport.WriteSyncArtifacts(repositoryRoot, selection, name);
+
+        int? runExitCode = null;
+        if (run)
+            runExitCode = await RunPipeline([artifacts.DotfilePath, "--no-autoresume"]);
+
+        var payload = new
+        {
+            provider = normalizedProvider,
+            discovered_count = selection.DiscoveredModels.Count,
+            candidate_count = selection.CandidateModels.Count,
+            unknown_count = selection.UnknownModels.Count,
+            unknown_models = selection.UnknownModels.Select(model => model.Id).ToList(),
+            dotfile = artifacts.DotfilePath,
+            manifest = artifacts.ManifestPath,
+            output_dir = artifacts.OutputDirectory,
+            validation_report = artifacts.ValidationReportPath,
+            orchestrator_provider = artifacts.OrchestratorProvider,
+            orchestrator_model = artifacts.OrchestratorModel,
+            run_requested = run,
+            run_exit_code = runExitCode
+        };
+
+        if (json)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(payload, JsonOpts()));
+        }
+        else
+        {
+            Console.WriteLine($"Provider:        {normalizedProvider}");
+            Console.WriteLine($"Discovered:      {selection.DiscoveredModels.Count}");
+            Console.WriteLine($"Candidates:      {selection.CandidateModels.Count}");
+            Console.WriteLine($"Unknown:         {selection.UnknownModels.Count}");
+            Console.WriteLine($"Orchestrator:    {artifacts.OrchestratorProvider}/{artifacts.OrchestratorModel}");
+            Console.WriteLine($"Manifest:        {artifacts.ManifestPath}");
+            Console.WriteLine($"Dotfile:         {artifacts.DotfilePath}");
+            Console.WriteLine($"Output dir:      {artifacts.OutputDirectory}");
+            Console.WriteLine($"Validation file: {artifacts.ValidationReportPath}");
+            if (selection.UnknownModels.Count > 0)
+                Console.WriteLine($"Models:          {string.Join(", ", selection.UnknownModels.Select(model => model.Id))}");
+            else
+                Console.WriteLine("Models:          none (no unknown sync candidates)");
+
+            if (runExitCode is not null)
+                Console.WriteLine($"Run exit code:   {runExitCode}");
+        }
+
+        return runExitCode ?? 0;
+    }
+    catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or ProviderError)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
+
+static int ShowProvidersHelp()
+{
+    Console.WriteLine("attractor providers");
+    Console.WriteLine();
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  attractor providers ping [--provider <name>] [--json]");
+    Console.WriteLine("  attractor providers sync-models --provider <name> [--model <id>] [--max-models N] [--name <run-name>] [--run] [--json]");
+    Console.WriteLine();
+    Console.WriteLine("Notes:");
+    Console.WriteLine("  ping checks provider reachability by listing models.");
+    Console.WriteLine("  sync-models discovers provider models, filters unknown catalog candidates,");
+    Console.WriteLine("  writes a manifest plus a dotfile under dotfiles/, and optionally runs it.");
+    return 0;
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -3113,6 +3336,7 @@ static int ShowHelp()
     Console.WriteLine("  attractor status [--dir <dir>]       Show pipeline progress");
     Console.WriteLine("  attractor logs [<node>] [--dir <dir>]  View node artifacts");
     Console.WriteLine("  attractor web [--dir <dir>] [--port N] Launch web dashboard");
+    Console.WriteLine("  attractor providers <subcommand>      Ping providers or sync new provider models");
     Console.WriteLine("  attractor lint [path] [--recursive]  Lint one file or a directory of dotfiles");
     Console.WriteLine("  attractor builder <subcommand>        Create or edit DOT pipelines");
     Console.WriteLine();

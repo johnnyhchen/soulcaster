@@ -45,6 +45,41 @@ public class CodexIntegrationTests
         Assert.Equal("gpt-5.2-codex", resolved);
     }
 
+    [Fact]
+    public void ResolveModelAlias_ResolvesCodex53()
+    {
+        var resolved = Client.ResolveModelAlias("codex-5.3");
+        Assert.Equal("gpt-5.3-codex", resolved);
+    }
+
+    [Fact]
+    public void ResolveModelAlias_PassesThroughGpt54CanonicalId()
+    {
+        var resolved = Client.ResolveModelAlias("gpt-5.4");
+        Assert.Equal("gpt-5.4", resolved);
+    }
+
+    [Fact]
+    public async Task Client_InfersOpenAiProvider_ForGpt54Model()
+    {
+        var openai = new FakeProvider("openai");
+        var anthropic = new FakeProvider("anthropic");
+        var client = new Client(new Dictionary<string, IProviderAdapter>
+        {
+            ["openai"] = openai,
+            ["anthropic"] = anthropic
+        });
+
+        await client.CompleteAsync(new Request
+        {
+            Model = "gpt-5.4",
+            Messages = [Message.UserMsg("hi")]
+        });
+
+        Assert.True(openai.CallCount > 0, "Expected gpt-5.4 to route to OpenAI provider");
+        Assert.Equal(0, anthropic.CallCount);
+    }
+
     [SkippableFact]
     public async Task Codex52_SendTrivialRequest_GetsResponse()
     {

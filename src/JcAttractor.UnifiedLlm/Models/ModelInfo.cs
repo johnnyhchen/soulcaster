@@ -6,9 +6,9 @@ public record ModelInfo(
     string DisplayName,
     int ContextWindow,
     int? MaxOutput,
-    bool SupportsTools,
-    bool SupportsVision,
-    bool SupportsReasoning,
+    bool? SupportsTools,
+    bool? SupportsVision,
+    bool? SupportsReasoning,
     decimal? InputCostPerMillion,
     decimal? OutputCostPerMillion,
     List<string>? Aliases = null);

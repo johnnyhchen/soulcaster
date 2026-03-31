@@ -6,7 +6,7 @@ using System.Text.Json.Nodes;
 
 namespace JcAttractor.UnifiedLlm;
 
-public sealed class OpenAiAdapter : IProviderAdapter
+public sealed class OpenAiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 {
     private const string DefaultBaseUrl = "https://api.openai.com";
 
@@ -21,6 +21,62 @@ public sealed class OpenAiAdapter : IProviderAdapter
         _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
         _baseUrl = baseUrl.TrimEnd('/');
         _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
+    }
+
+    public async Task<ProviderPingResult> PingAsync(CancellationToken ct = default)
+    {
+        var endpoint = $"{_baseUrl}/v1/models";
+
+        try
+        {
+            var models = await ListModelsAsync(ct).ConfigureAwait(false);
+            return new ProviderPingResult(Name, true, endpoint, StatusCode: 200, ModelCount: models.Count);
+        }
+        catch (ProviderError ex)
+        {
+            return new ProviderPingResult(Name, false, endpoint, StatusCode: (int)ex.StatusCode, Message: ex.Message);
+        }
+        catch (Exception ex)
+        {
+            return new ProviderPingResult(Name, false, endpoint, Message: ex.Message);
+        }
+    }
+
+    public async Task<IReadOnlyList<ProviderModelDescriptor>> ListModelsAsync(CancellationToken ct = default)
+    {
+        using var httpReq = CreateModelsRequest();
+        using var httpRes = await _http.SendAsync(httpReq, ct).ConfigureAwait(false);
+        var responseBody = await httpRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        EnsureSuccess(httpRes, responseBody);
+
+        using var doc = JsonDocument.Parse(responseBody);
+        var models = new List<ProviderModelDescriptor>();
+
+        if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in data.EnumerateArray())
+            {
+                var id = ProviderDiscoveryJson.GetString(item, "id");
+                if (string.IsNullOrWhiteSpace(id))
+                    continue;
+
+                models.Add(new ProviderModelDescriptor(
+                    Provider: Name,
+                    Id: id,
+                    DisplayName: ProviderDiscoveryJson.GetString(item, "display_name", "name"),
+                    ContextWindow: ProviderDiscoveryJson.GetInt32(item, "context_window", "input_token_limit"),
+                    MaxOutput: ProviderDiscoveryJson.GetInt32(item, "max_output_tokens", "output_token_limit"),
+                    SupportsTools: ProviderDiscoveryJson.GetBool(item, "supports_tools"),
+                    SupportsVision: ProviderDiscoveryJson.GetBool(item, "supports_vision"),
+                    SupportsReasoning: ProviderDiscoveryJson.GetBool(item, "supports_reasoning"),
+                    RawJson: item.GetRawText()));
+            }
+        }
+
+        return models
+            .OrderBy(m => m.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList()
+            .AsReadOnly();
     }
 
     // ── CompleteAsync ──────────────────────────────────────────────────
@@ -484,6 +540,13 @@ public sealed class OpenAiAdapter : IProviderAdapter
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────────
+
+    private HttpRequestMessage CreateModelsRequest()
+    {
+        var httpReq = new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/v1/models");
+        httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+        return httpReq;
+    }
 
     private HttpRequestMessage CreateHttpRequest(JsonObject body)
     {

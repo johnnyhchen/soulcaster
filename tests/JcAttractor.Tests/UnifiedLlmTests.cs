@@ -454,6 +454,7 @@ public class ModelCatalogTests
         var info = ModelCatalog.GetModelInfo("codex-5.3");
         Assert.NotNull(info);
         Assert.Equal("openai", info.Provider);
+        Assert.Equal("gpt-5.3-codex", info.Id);
         Assert.Equal("Codex 5.3", info.DisplayName);
     }
 
@@ -462,7 +463,51 @@ public class ModelCatalogTests
     {
         var info = ModelCatalog.GetModelInfo("gpt-5.3-codex");
         Assert.NotNull(info);
-        Assert.Equal("codex-5.3", info.Id);
+        Assert.Equal("gpt-5.3-codex", info.Id);
+    }
+
+    [Fact]
+    public void GetModelInfo_FindsGpt54_ById()
+    {
+        var info = ModelCatalog.GetModelInfo("gpt-5.4");
+        Assert.NotNull(info);
+        Assert.Equal("openai", info.Provider);
+        Assert.Equal("gpt-5.4", info.Id);
+        Assert.Equal("GPT-5.4", info.DisplayName);
+        Assert.True(info.SupportsReasoning);
+    }
+
+    [Fact]
+    public void GetModelInfo_Gpt54_HasNoPublishedCostInfo()
+    {
+        var info = ModelCatalog.GetModelInfo("gpt-5.4");
+        Assert.NotNull(info);
+        Assert.Null(info.InputCostPerMillion);
+        Assert.Null(info.OutputCostPerMillion);
+    }
+
+    [Fact]
+    public void GetModelInfo_FindsGemini25Pro_ById()
+    {
+        var info = ModelCatalog.GetModelInfo("gemini-2.5-pro");
+        Assert.NotNull(info);
+        Assert.Equal("gemini", info.Provider);
+        Assert.Equal("gemini-2.5-pro", info.Id);
+        Assert.Equal("Gemini 2.5 Pro", info.DisplayName);
+        Assert.Equal(1_048_576, info.ContextWindow);
+        Assert.Equal(65_536, info.MaxOutput);
+        Assert.True(info.SupportsReasoning == true);
+    }
+
+    [Fact]
+    public void GetModelInfo_Gemini25Pro_PreservesUnknownCapabilitiesAndCostAsNull()
+    {
+        var info = ModelCatalog.GetModelInfo("gemini-2.5-pro");
+        Assert.NotNull(info);
+        Assert.Null(info.SupportsTools);
+        Assert.Null(info.SupportsVision);
+        Assert.Null(info.InputCostPerMillion);
+        Assert.Null(info.OutputCostPerMillion);
     }
 }
 
@@ -730,6 +775,26 @@ public class T13_ProviderOptionsPassThroughTests
     }
 
     [Fact]
+    public void OpenAiAdapter_EmitsXHighReasoningEffort()
+    {
+        var adapter = new OpenAiAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gpt-5.4",
+            Messages = new List<Message> { Message.UserMsg("test") },
+            ReasoningEffort = "xhigh"
+        };
+
+        var method = typeof(OpenAiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+        Assert.Equal("xhigh", body!["reasoning"]!["effort"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void GeminiAdapter_MergesProviderOptions_IntoBody()
     {
         var adapter = new GeminiAdapter("test-key");
@@ -773,4 +838,3 @@ internal class ModelCapturingProvider : IProviderAdapter
         await Task.CompletedTask;
     }
 }
-
