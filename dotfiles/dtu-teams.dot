@@ -1,6 +1,6 @@
 digraph attractor_run {
     // ─── Pipeline Configuration ──────────────────────────────────────
-    goal = "Implement a Microsoft Teams mock service adapter (dtu-teams) in the Digital Twin Universe repo at /Users/johnny.chen/ai-digital-twin-rs. Follow the exact same patterns as the existing dtu-slack, dtu-okta, and dtu-jira service adapters. The adapter must include: (1) domain types — Team, Channel, ChatMessage, Member, Presence, Meeting, TeamsApp, Webhook, with proper ID types; (2) in-memory store with RwLock<HashMap> per entity, matching dtu-slack's store pattern; (3) deterministic seeder using the Go-compatible RNG from dtu-core; (4) MessagePack snapshot support via VersionedState; (5) identity subscriber for Okta→Teams user sync with handle collision resolution matching dtu-slack's pattern; (6) Axum HTTP routes mounted under /api/teams/ in dtu-http, with X-Instance-ID routing; (7) SSE event stream for real-time message/presence updates; (8) Bot Framework basics — app registration, bot tokens, incoming webhook delivery with HMAC v0 signing; (9) a React+TypeScript embedded UI under ui/teams/ following the Slack UI patterns; (10) workspace Cargo.toml and Makefile integration; (11) unit tests and integration tests. Refer to crates/dtu-slack/ as the primary pattern to follow, and crates/dtu-http/src/slack/ for HTTP route mounting."
+    goal = "Implement a Microsoft Teams mock service adapter (dtu-teams) in the Digital Twin Universe repo checkout configured for this run. Follow the exact same patterns as the existing dtu-slack, dtu-okta, and dtu-jira service adapters. The adapter must include: (1) domain types — Team, Channel, ChatMessage, Member, Presence, Meeting, TeamsApp, Webhook, with proper ID types; (2) in-memory store with RwLock<HashMap> per entity, matching dtu-slack's store pattern; (3) deterministic seeder using the Go-compatible RNG from dtu-core; (4) MessagePack snapshot support via VersionedState; (5) identity subscriber for Okta→Teams user sync with handle collision resolution matching dtu-slack's pattern; (6) Axum HTTP routes mounted under /api/teams/ in dtu-http, with X-Instance-ID routing; (7) SSE event stream for real-time message/presence updates; (8) Bot Framework basics — app registration, bot tokens, incoming webhook delivery with HMAC v0 signing; (9) a React+TypeScript embedded UI under ui/teams/ following the Slack UI patterns; (10) workspace Cargo.toml and Makefile integration; (11) unit tests and integration tests. Refer to crates/dtu-slack/ as the primary pattern to follow, and crates/dtu-http/src/slack/ for HTTP route mounting."
 
     label = "DTU Microsoft Teams Adapter"
     default_max_retry = 3
@@ -35,7 +35,7 @@ digraph attractor_run {
     orient [
         class="opus",
         label="Orient: Assess DTU Codebase",
-        prompt="Read the project codebase at /Users/johnny.chen/ai-digital-twin-rs to understand the current state relevant to this goal: $goal
+        prompt="Read the project codebase from your current working directory to understand the current state relevant to this goal: $goal
 
 Explore deeply:
 1. Project structure — workspace crates, ui/ directories, Makefile, Cargo.toml
@@ -209,14 +209,14 @@ Write the breakdown to logs/breakdown/BREAKDOWN-{N}.md where N is the next seque
         class="codex",
         label="Implement: Commit by Commit",
         timeout="1800s",
-        prompt="CRITICAL: All pipeline log files are at /Users/johnny.chen/soulcaster/dotfiles/output/logs/ (NOT in the repo).
+        prompt="CRITICAL: Use the [PIPELINE CONTEXT] section above for the exact logs root and stage directories.
 
-Read the breakdown: /Users/johnny.chen/soulcaster/dotfiles/output/logs/breakdown/BREAKDOWN-1.md
-Also read the plan for context: /Users/johnny.chen/soulcaster/dotfiles/output/logs/plan/PLAN-1.md
+Read the latest breakdown from the pipeline logs root: `logs/breakdown/BREAKDOWN-*.md`
+Also read the latest plan for context: `logs/plan/PLAN-*.md`
 
-If /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-*.md exists, read the latest. Skip any commits marked DONE. Resume from the first commit marked TODO or FAILED.
+If `logs/implement/PROGRESS-*.md` exists, read the latest. Skip any commits marked DONE. Resume from the first commit marked TODO or FAILED.
 
-Working directory for code changes: /Users/johnny.chen/ai-digital-twin-rs
+Working directory for code changes: your current working directory (the target repo checkout for this run)
 
 For each commit in the breakdown:
 1. Read the commit description, file list, and QA plan
@@ -232,12 +232,12 @@ For each commit in the breakdown:
 6. IMMEDIATELY after each commit, append its status to the progress log
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
-IMPORTANT: All CODE file references must use absolute paths rooted at /Users/johnny.chen/ai-digital-twin-rs.
-IMPORTANT: All LOG file references must use absolute paths rooted at /Users/johnny.chen/soulcaster/dotfiles/output/logs/.
+IMPORTANT: Use the exact absolute log paths from [PIPELINE CONTEXT] when reading or writing pipeline artifacts.
+IMPORTANT: Use paths relative to the current working directory for source files unless an absolute path is necessary.
 IMPORTANT: Run cargo fmt after each commit to maintain formatting.
 IMPORTANT: Run cargo clippy --workspace to catch lint issues early.
 
-Progress log format — write to /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-{N}.md where N matches the BREAKDOWN number:
+Progress log format — write to `logs/implement/PROGRESS-{N}.md` under the pipeline logs root, where N matches the BREAKDOWN number:
 
 ```markdown
 # Implementation Progress — Run {N}
@@ -277,14 +277,14 @@ Append a summary section to the progress log."
         timeout="1800s",
         prompt="You are a validation agent for the DTU Microsoft Teams adapter.
 
-CRITICAL: Pipeline log files are at /Users/johnny.chen/soulcaster/dotfiles/output/logs/ (NOT in the repo).
-Code changes are in: /Users/johnny.chen/ai-digital-twin-rs
+CRITICAL: Use the [PIPELINE CONTEXT] section above for the exact logs root and stage directories.
+Code changes are in your current working directory.
 
-Read /Users/johnny.chen/soulcaster/dotfiles/output/logs/plan/PLAN-1.md to understand what was planned.
-Read /Users/johnny.chen/soulcaster/dotfiles/output/logs/breakdown/BREAKDOWN-1.md to understand what was intended.
-Read the latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-*.md to understand what was actually completed.
+Read the latest `logs/plan/PLAN-*.md` to understand what was planned.
+Read the latest `logs/breakdown/BREAKDOWN-*.md` to understand what was intended.
+Read the latest `logs/implement/PROGRESS-*.md` to understand what was actually completed.
 
-Check for existing validation runs at /Users/johnny.chen/soulcaster/dotfiles/output/logs/validate/. If previous runs exist, focus on previously failing items while also checking for regressions.
+Check for existing validation runs under `logs/validate/`. If previous runs exist, focus on previously failing items while also checking for regressions.
 
 Execute this validation matrix:
 
@@ -335,7 +335,7 @@ INTEGRATION:
 - Verify Makefile targets exist and work
 - Verify dtu-http server starts with Teams routes mounted
 
-Write results to /Users/johnny.chen/soulcaster/dotfiles/output/logs/validate/VALIDATION-RUN-{N}.md.
+Write results to `logs/validate/VALIDATION-RUN-{N}.md` under the pipeline logs root.
 
 Your outcome MUST be:
 - SUCCESS if all tests pass
@@ -355,19 +355,19 @@ Your outcome MUST be:
         label="Critique: Tear It Down",
         prompt="You are a harsh, adversarial code reviewer. Your job is to find every possible weakness in the new dtu-teams adapter.
 
-CRITICAL: Pipeline log files are at /Users/johnny.chen/soulcaster/dotfiles/output/logs/ (NOT in the repo).
-Code changes are in: /Users/johnny.chen/ai-digital-twin-rs
+CRITICAL: Use the [PIPELINE CONTEXT] section above for the exact logs root and stage directories.
+Code changes are in your current working directory.
 
 Read:
-- /Users/johnny.chen/soulcaster/dotfiles/output/logs/plan/PLAN-1.md
-- /Users/johnny.chen/soulcaster/dotfiles/output/logs/breakdown/BREAKDOWN-1.md
-- The latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/implement/PROGRESS-*.md
-- The latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/validate/VALIDATION-RUN-*.md
-- All source files in /Users/johnny.chen/ai-digital-twin-rs/crates/dtu-teams/src/
-- All source files in /Users/johnny.chen/ai-digital-twin-rs/crates/dtu-http/src/teams/
-- All source files in /Users/johnny.chen/ai-digital-twin-rs/ui/teams/src/
+- The latest `logs/plan/PLAN-*.md`
+- The latest `logs/breakdown/BREAKDOWN-*.md`
+- The latest `logs/implement/PROGRESS-*.md`
+- The latest `logs/validate/VALIDATION-RUN-*.md`
+- All source files in `crates/dtu-teams/src/`
+- All source files in `crates/dtu-http/src/teams/`
+- All source files in `ui/teams/src/`
 
-If prior critique runs exist at /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-PARETO-*.md, check whether previously identified MUST FIX and SHOULD FIX items were addressed.
+If prior critique runs exist under `logs/critique/CRITIQUE-PARETO-*.md`, check whether previously identified MUST FIX and SHOULD FIX items were addressed.
 
 Write a brutal, thorough critique covering:
 1. Correctness — logic bugs, off-by-one errors, race conditions, deadlocks
@@ -385,13 +385,15 @@ Be specific. Reference exact files, functions, and code patterns.
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write to /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-HARSH-{N}.md."
+Write to `logs/critique/CRITIQUE-HARSH-{N}.md` under the pipeline logs root."
     ]
 
     critique_pareto [
         class="opus",
         label="Critique: Pareto Optimal Changes",
-        prompt="Read the latest /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-HARSH-*.md.
+        prompt="Use the [PIPELINE CONTEXT] section above for the exact logs root.
+
+Read the latest `logs/critique/CRITIQUE-HARSH-*.md`.
 
 This was a deliberately adversarial review — harsh by design. Extract signal from noise.
 
@@ -411,7 +413,7 @@ If zero MUST FIX and zero SHOULD FIX items, explicitly state: 'No changes requir
 
 IMPORTANT: For files over 100 lines, use the bash tool with a heredoc instead of write_file.
 
-Write to /Users/johnny.chen/soulcaster/dotfiles/output/logs/critique/CRITIQUE-PARETO-{N}.md."
+Write to `logs/critique/CRITIQUE-PARETO-{N}.md` under the pipeline logs root."
     ]
 
     critique_gate [

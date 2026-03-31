@@ -17,11 +17,11 @@ Fixes made to soulcaster attractor and/or dotfiles while running the betrayal-ho
 ## Fix 2: Implement prompt uses relative artifact paths
 
 **Date:** 2026-02-18
-**Symptom:** Codex 5.2 agent said "I couldn't find any BREAKDOWN-*.md files under /Users/johnny.chen/betrayal-house"
-**Root cause:** The implement node's prompt said `Read the latest logs/breakdown/BREAKDOWN-*.md` (relative). The runner sets the agent's working directory to `dotfiles/output/`, so `logs/` should resolve to `dotfiles/output/logs/`. However, the prompt also said `The project is at /Users/johnny.chen/betrayal-house` — Codex interpreted `logs/` as relative to the project root, not the working directory. The BREAKDOWN file was at `dotfiles/output/logs/breakdown/BREAKDOWN-1.md` but Codex searched `/Users/johnny.chen/betrayal-house/logs/breakdown/`.
-**Fix:** Changed all artifact paths in the implement node prompt to absolute paths:
-- `logs/breakdown/BREAKDOWN-*.md` → `/Users/johnny.chen/betrayal-house/dotfiles/output/logs/breakdown/BREAKDOWN-1.md`
-- `logs/implement/PROGRESS-{N}.md` → `/Users/johnny.chen/betrayal-house/dotfiles/output/logs/implement/PROGRESS-{N}.md`
+**Symptom:** Codex 5.2 agent said "I couldn't find any BREAKDOWN-*.md files under `<betrayal-house-root>`"
+**Root cause:** The implement node's prompt said `Read the latest logs/breakdown/BREAKDOWN-*.md` (relative). The runner sets the agent's working directory to `dotfiles/output/`, so `logs/` should resolve to `dotfiles/output/logs/`. However, the prompt also said `The project is at <betrayal-house-root>`; Codex interpreted `logs/` as relative to the project root, not the working directory. The BREAKDOWN file was at `<run-logs-root>/breakdown/BREAKDOWN-1.md` but Codex searched `<betrayal-house-root>/logs/breakdown/`.
+**Fix:** Changed all artifact paths in the implement node prompt to absolute paths under the run logs root:
+- `logs/breakdown/BREAKDOWN-*.md` → `<run-logs-root>/breakdown/BREAKDOWN-1.md`
+- `logs/implement/PROGRESS-{N}.md` → `<run-logs-root>/implement/PROGRESS-{N}.md`
 - Added explicit `ARTIFACT LOCATIONS` and `PROJECT LOCATION` sections to the prompt
 **File:** `dotfiles/betrayal-run.dot` (implement node prompt)
 
@@ -31,7 +31,7 @@ Fixes made to soulcaster attractor and/or dotfiles while running the betrayal-ho
 
 **Date:** 2026-02-18
 **Symptom:** Codex ran ~95 tool calls including many `apply_patch` calls, builds reported PASS in progress log, but `git diff` showed zero source modifications. Only `write_file` calls (new files) persisted.
-**Root cause:** `OpenAiProfile.ApplyPatchAsync()` unconditionally uses `patch -p1`. Codex generates patches with absolute paths like `--- a/Users/johnny.chen/betrayal-house/src/...`. With `-p1`, `patch` strips the first component (`a`) leaving `/Users/johnny.chen/...` which is correct for absolute paths. However, the patch content is passed via `echo '...'` shell escaping which breaks on single quotes and special characters in the patch body. The real fix needed is `-p0` when paths are already absolute (no `a/b/` prefix) or ensuring proper escaping.
+**Root cause:** `OpenAiProfile.ApplyPatchAsync()` unconditionally uses `patch -p1`. Codex generates patches with absolute paths like `--- a/<betrayal-house-root>/src/...`. With `-p1`, `patch` strips the first component (`a`) leaving `<betrayal-house-root>/...` which is correct for absolute paths. However, the patch content is passed via `echo '...'` shell escaping which breaks on single quotes and special characters in the patch body. The real fix needed is `-p0` when paths are already absolute (no `a/b/` prefix) or ensuring proper escaping.
 **Fix:** Changed `ApplyPatchAsync` in `OpenAiProfile.cs` to detect absolute paths and use `-p0`:
 ```csharp
 var useP0 = targetFile.StartsWith('/');
