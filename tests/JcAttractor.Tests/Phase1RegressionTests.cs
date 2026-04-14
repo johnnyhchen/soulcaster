@@ -274,21 +274,46 @@ public class CodergenPromptPathRegressionTests
 public class RunCommandSupportTests
 {
     [Fact]
-    public void RunOptions_Parse_RecognizesResumeStartAtAndSteerText()
+    public void RunOptions_Parse_RecognizesResumeStartAtSteerAndBackendFlags()
     {
         var options = RunOptions.Parse(
-            ["qa-smoke.dot", "--resume-from", "/tmp/existing-run", "--start-at", "verify", "--steer-text", "Focus on tests"]);
+            [
+                "qa-smoke.dot",
+                "--resume-from", "/tmp/existing-run",
+                "--start-at", "verify",
+                "--steer-text", "Focus on tests",
+                "--autoresume-policy", "always",
+                "--steer-file", "/tmp/steer.txt",
+                "--backend", "scripted",
+                "--backend-script", "/tmp/backend.json",
+                "--crash-after-stage", "verify"
+            ]);
 
         Assert.Equal("qa-smoke.dot", options.DotFilePath);
         Assert.Equal("/tmp/existing-run", options.ResumeFrom);
         Assert.Equal("verify", options.StartAt);
         Assert.Equal("Focus on tests", options.SteerText);
+        Assert.Equal(AutoResumePolicy.Always, options.AutoResumePolicy);
+        Assert.Equal("/tmp/steer.txt", options.SteerFilePath);
+        Assert.Equal("scripted", options.BackendMode);
+        Assert.Equal("/tmp/backend.json", options.BackendScriptPath);
+        Assert.Equal("verify", options.CrashAfterStage);
     }
 
     [Fact]
     public void ResolveWorkingDirectory_UsesResumeFromDirectory()
     {
-        var options = new RunOptions("qa-smoke.dot", Resume: false, Autoresume: true, ResumeFrom: "/tmp/existing-run", StartAt: null, SteerText: null);
+        var options = new RunOptions(
+            "qa-smoke.dot",
+            Resume: false,
+            AutoResumePolicy: AutoResumePolicy.On,
+            ResumeFrom: "/tmp/existing-run",
+            StartAt: null,
+            SteerText: null,
+            SteerFilePath: null,
+            BackendMode: "live",
+            BackendScriptPath: null,
+            CrashAfterStage: null);
         var workingDir = RunCommandSupport.ResolveWorkingDirectory("/repo/dotfiles/qa-smoke.dot", options);
 
         Assert.Equal(Path.GetFullPath("/tmp/existing-run"), workingDir);

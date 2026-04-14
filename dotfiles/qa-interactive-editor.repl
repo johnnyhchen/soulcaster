@@ -1,0 +1,10 @@
+goal Exercise the interactive editor workflow
+stage write shape=box label="Write Artifact"
+prompt write
+Write the exact text 'Interactive editor workflow complete' to logs/interactive/INTERACTIVE.md. Return success after the file is written.
+.
+edge start write
+edge write done
+save
+run
+quit

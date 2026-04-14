@@ -5,13 +5,19 @@ using System.Text.Json;
 /// <summary>
 /// Canonical structured stage output contract used for routing and context propagation.
 /// </summary>
+public sealed record BlockingQuestion(
+    string Text,
+    string? Context = null,
+    string? DesiredFormat = null);
+
 public sealed record StageStatusContract(
     OutcomeStatus Status,
     string PreferredNextLabel,
     List<string> SuggestedNextIds,
     Dictionary<string, string> ContextUpdates,
     string Notes,
-    string? FailureReason = null)
+    string? FailureReason = null,
+    BlockingQuestion? BlockingQuestion = null)
 {
     public static StageStatusContract FromLegacy(CodergenResult result, string? fallbackReason = null)
     {
@@ -25,7 +31,8 @@ public sealed record StageStatusContract(
             SuggestedNextIds: result.SuggestedNextIds ?? new List<string>(),
             ContextUpdates: result.ContextUpdates ?? new Dictionary<string, string>(),
             Notes: notes,
-            FailureReason: fallbackReason);
+            FailureReason: fallbackReason,
+            BlockingQuestion: null);
     }
 
     public Outcome ToOutcome()
@@ -54,6 +61,14 @@ public sealed record StageStatusContract(
             ["context_updates"] = ContextUpdates,
             ["notes"] = Notes,
             ["failure_reason"] = FailureReason,
+            ["blocking_question"] = BlockingQuestion is null
+                ? null
+                : new Dictionary<string, object?>
+                {
+                    ["text"] = BlockingQuestion.Text,
+                    ["context"] = BlockingQuestion.Context,
+                    ["desired_format"] = BlockingQuestion.DesiredFormat
+                },
             ["model"] = model,
             ["provider"] = provider,
             ["contract_validated"] = true,
@@ -108,6 +123,7 @@ public sealed record StageStatusContract(
             var preferred = ReadString(root, "preferred_next_label", "preferred_label") ?? string.Empty;
             var notes = ReadString(root, "notes") ?? string.Empty;
             var failureReason = ReadString(root, "failure_reason", "reason");
+            var blockingQuestion = ReadBlockingQuestion(root);
 
             var suggested = new List<string>();
             if (TryReadProperty(root, out var suggestedEl, "suggested_next_ids", "suggestedNextIds") &&
@@ -143,7 +159,8 @@ public sealed record StageStatusContract(
                 SuggestedNextIds: suggested,
                 ContextUpdates: updates,
                 Notes: notes,
-                FailureReason: failureReason);
+                FailureReason: failureReason,
+                BlockingQuestion: blockingQuestion);
 
             return true;
         }
@@ -236,6 +253,36 @@ public sealed record StageStatusContract(
             JsonValueKind.Null => null,
             _ => value.ToString()
         };
+    }
+
+    private static BlockingQuestion? ReadBlockingQuestion(JsonElement root)
+    {
+        if (!TryReadProperty(root, out var questionValue, "blocking_question", "blockingQuestion", "question"))
+            return null;
+
+        return questionValue.ValueKind switch
+        {
+            JsonValueKind.String => CreateBlockingQuestion(questionValue.GetString()),
+            JsonValueKind.Object => ReadBlockingQuestionObject(questionValue),
+            _ => null
+        };
+    }
+
+    private static BlockingQuestion? ReadBlockingQuestionObject(JsonElement value)
+    {
+        var text = ReadString(value, "text", "prompt", "question");
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        return new BlockingQuestion(
+            Text: text,
+            Context: ReadString(value, "context", "details"),
+            DesiredFormat: ReadString(value, "desired_format", "desiredFormat", "format"));
+    }
+
+    private static BlockingQuestion? CreateBlockingQuestion(string? text)
+    {
+        return string.IsNullOrWhiteSpace(text) ? null : new BlockingQuestion(text);
     }
 
     private static bool TryReadProperty(JsonElement root, out JsonElement value, params string[] keys)

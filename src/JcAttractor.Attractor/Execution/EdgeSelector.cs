@@ -18,9 +18,14 @@ public static class EdgeSelector
         if (outgoingEdges.Count == 0)
             return null;
 
-        // If only one edge, return it (no need for complex selection)
+        // A single edge still needs to honor its condition when one is present.
         if (outgoingEdges.Count == 1)
-            return outgoingEdges[0];
+        {
+            var only = outgoingEdges[0];
+            return string.IsNullOrWhiteSpace(only.Condition) || ConditionEvaluator.Evaluate(only.Condition, outcome, context)
+                ? only
+                : null;
+        }
 
         // Step 1: Condition-matching edges
         var conditionalEdges = outgoingEdges.Where(e => !string.IsNullOrWhiteSpace(e.Condition)).ToList();

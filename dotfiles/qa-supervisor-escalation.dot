@@ -1,0 +1,26 @@
+digraph attractor_run {
+    goal = "Exercise supervisor escalation when a worker never progresses."
+    label = "QA Supervisor Escalation"
+    default_max_retry = 1
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    manager [
+        shape=house,
+        label="Manager",
+        child_dotfile="qa-supervisor-stalled-child.dot",
+        max_cycles="4",
+        stall_threshold="1",
+        escalation_threshold="2",
+        poll_interval_ms="500",
+        steer_cooldown="0",
+        prompt="Write one concise steering instruction for the stalled worker."
+    ]
+
+    start -> manager
+    manager -> done [condition="outcome=success"]
+}

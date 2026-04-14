@@ -7,7 +7,9 @@ public record PipelineConfig(
     IInterviewer? Interviewer = null,
     ICodergenBackend? Backend = null,
     List<IGraphTransform>? Transforms = null,
-    Dictionary<string, INodeHandler>? CustomHandlers = null
+    Dictionary<string, INodeHandler>? CustomHandlers = null,
+    IPipelineRuntimeObserver? RuntimeObserver = null,
+    ISupervisorController? SupervisorController = null
 );
 
 public record PipelineResult(
@@ -25,7 +27,7 @@ public class PipelineEngine
     public PipelineEngine(PipelineConfig config)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
-        _registry = new HandlerRegistry(_config.Backend, _config.Interviewer);
+        _registry = new HandlerRegistry(_config.Backend, _config.Interviewer, _config.SupervisorController);
 
         // Register custom handlers
         if (_config.CustomHandlers != null)
@@ -154,7 +156,7 @@ public class PipelineEngine
                 context.Set("pipeline.duration_ms", ((long)duration.TotalMilliseconds).ToString());
                 context.Set("pipeline.nodes_executed", completedNodes.Count.ToString());
                 context.Set("pipeline.status", "success");
-                SaveCheckpoint(currentNodeId, completedNodes, context, retryCounts);
+                await SaveCheckpointAsync(currentNodeId, currentNodeId, selectedEdge: null, completedNodes, context, retryCounts, ct);
 
                 return new PipelineResult(
                     Status: OutcomeStatus.Success,
@@ -167,6 +169,9 @@ public class PipelineEngine
             // Fidelity degradation on resume: if resuming and this is the first node,
             // degrade fidelity from "full" to "summary:high"
             currentNode = ResolveRuntimeNode(currentNode, currentNodeId, incomingEdge, graph, context);
+
+            if (_config.RuntimeObserver is not null)
+                await _config.RuntimeObserver.OnStageStartedAsync(currentNodeId, currentNode, context, ct);
 
             if (isResuming)
             {
@@ -263,7 +268,7 @@ public class PipelineEngine
                         },
                         ct: ct);
 
-                    SaveCheckpoint(retryTarget, completedNodes, context, retryCounts);
+                    await SaveCheckpointAsync(currentNodeId, retryTarget, selectedEdge: null, completedNodes, context, retryCounts, ct);
                     currentNodeId = retryTarget;
                     incomingEdge = null;
                     continue;
@@ -292,7 +297,7 @@ public class PipelineEngine
                 if (fallbackTarget != null && graph.Nodes.ContainsKey(fallbackTarget))
                 {
                     retryCounts[currentNodeId] = 0; // Reset retry count
-                    SaveCheckpoint(fallbackTarget, completedNodes, context, retryCounts);
+                    await SaveCheckpointAsync(currentNodeId, fallbackTarget, selectedEdge: null, completedNodes, context, retryCounts, ct);
                     currentNodeId = fallbackTarget;
                     incomingEdge = null;
                     continue;
@@ -350,7 +355,7 @@ public class PipelineEngine
                     {
                         // Step 4: Pipeline termination
                         completedNodes.Add(currentNodeId);
-                        SaveCheckpoint(currentNodeId, completedNodes, context, retryCounts);
+                        await SaveCheckpointAsync(currentNodeId, currentNodeId, selectedEdge: null, completedNodes, context, retryCounts, ct);
 
                         return new PipelineResult(
                             Status: OutcomeStatus.Fail,
@@ -367,7 +372,7 @@ public class PipelineEngine
             var directNextNode = TryResolveDirectNextNode(outcome, graph);
             if (!string.IsNullOrWhiteSpace(directNextNode))
             {
-                SaveCheckpoint(directNextNode!, completedNodes, context, retryCounts);
+                await SaveCheckpointAsync(currentNodeId, directNextNode!, selectedEdge: null, completedNodes, context, retryCounts, ct);
                 currentNodeId = directNextNode!;
                 incomingEdge = null;
                 continue;
@@ -405,7 +410,8 @@ public class PipelineEngine
                 retryCounts.Remove(selectedEdge.ToNode);
             }
 
-            SaveCheckpoint(selectedEdge.ToNode, completedNodes, context, retryCounts);
+            ApplyContextReset(selectedEdge, graph, context);
+            await SaveCheckpointAsync(currentNodeId, selectedEdge.ToNode, selectedEdge, completedNodes, context, retryCounts, ct);
 
             // Step 6: Advance to next node
             currentNodeId = selectedEdge.ToNode;
@@ -549,12 +555,32 @@ public class PipelineEngine
         }
     }
 
-    private void SaveCheckpoint(string currentNodeId, List<string> completedNodes, PipelineContext context, Dictionary<string, int> retryCounts)
+    private void ApplyContextReset(GraphEdge selectedEdge, Graph graph, PipelineContext context)
+    {
+        if (!selectedEdge.ContextReset || _config.Backend is not ISessionControlBackend sessionControl)
+            return;
+
+        if (!graph.Nodes.TryGetValue(selectedEdge.ToNode, out var nextNode))
+            return;
+
+        var threadId = ResolveThreadId(nextNode, selectedEdge.ToNode, selectedEdge, graph);
+        if (!string.IsNullOrWhiteSpace(threadId) && sessionControl.ResetThread(threadId))
+            context.Set($"edge.{selectedEdge.FromNode}->{selectedEdge.ToNode}.context_reset", "true");
+    }
+
+    private async Task SaveCheckpointAsync(
+        string currentNodeId,
+        string nextNodeId,
+        GraphEdge? selectedEdge,
+        List<string> completedNodes,
+        PipelineContext context,
+        Dictionary<string, int> retryCounts,
+        CancellationToken ct)
     {
         try
         {
             var checkpoint = new Checkpoint(
-                CurrentNodeId: currentNodeId,
+                CurrentNodeId: nextNodeId,
                 CompletedNodes: new List<string>(completedNodes),
                 ContextData: context.All.ToDictionary(kv => kv.Key, kv => kv.Value),
                 RetryCounts: new Dictionary<string, int>(retryCounts)
@@ -565,6 +591,9 @@ public class PipelineEngine
         {
             // Non-critical: don't fail the pipeline if checkpoint save fails
         }
+
+        if (_config.RuntimeObserver is not null)
+            await _config.RuntimeObserver.OnCheckpointSavedAsync(currentNodeId, nextNodeId, selectedEdge, context, ct);
     }
 
     private static async Task ApplyBackoffAsync(int retryCount, CancellationToken ct)

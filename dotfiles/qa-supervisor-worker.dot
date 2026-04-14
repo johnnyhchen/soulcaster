@@ -1,0 +1,27 @@
+digraph attractor_run {
+    goal = "Exercise manager-driven supervisor/worker orchestration with real Soulcaster child processes."
+    label = "QA Supervisor Worker"
+    default_max_retry = 1
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    manager [
+        shape=house,
+        label="Manager",
+        child_dotfile="qa-supervisor-worker-child.dot",
+        max_cycles="6",
+        stall_threshold="1",
+        escalation_threshold="4",
+        poll_interval_ms="500",
+        steer_cooldown="0",
+        stop_condition="context.manager.last_completed_node=do_work",
+        prompt="Write one concise steering instruction telling the worker to continue as soon as steering is available."
+    ]
+
+    start -> manager
+    manager -> done
+}

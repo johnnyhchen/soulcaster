@@ -109,6 +109,8 @@ public static class DotWriter
             attributes["thread_id"] = edge.ThreadId;
         if (edge.LoopRestart)
             attributes["loop_restart"] = "true";
+        if (edge.ContextReset)
+            attributes["context_reset"] = "true";
         return attributes;
     }
 

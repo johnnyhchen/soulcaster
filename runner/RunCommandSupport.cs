@@ -5,19 +5,29 @@ namespace JcAttractor.Runner;
 public sealed record RunOptions(
     string DotFilePath,
     bool Resume,
-    bool Autoresume,
+    AutoResumePolicy AutoResumePolicy,
     string? ResumeFrom,
     string? StartAt,
-    string? SteerText)
+    string? SteerText,
+    string? SteerFilePath,
+    string BackendMode,
+    string? BackendScriptPath,
+    string? CrashAfterStage)
 {
+    public bool Autoresume => AutoResumePolicy != AutoResumePolicy.Off;
+
     public static RunOptions Parse(string[] args)
     {
         string? dotFile = null;
         string? resumeFrom = null;
         string? startAt = null;
         string? steerText = null;
+        string? steerFilePath = null;
+        string? backendScriptPath = null;
+        string? crashAfterStage = null;
+        var backendMode = "live";
         var resume = false;
-        var autoresume = true;
+        var autoResumePolicy = AutoResumePolicy.On;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -27,11 +37,20 @@ public sealed record RunOptions(
                 case "--resume":
                     resume = true;
                     break;
+                case "--autoresume" when i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal):
+                    autoResumePolicy = RunCommandSupport.ParseAutoResumePolicy(args[++i]);
+                    break;
                 case "--autoresume":
-                    autoresume = true;
+                    autoResumePolicy = AutoResumePolicy.On;
+                    break;
+                case var policyArg when policyArg.StartsWith("--autoresume=", StringComparison.Ordinal):
+                    autoResumePolicy = RunCommandSupport.ParseAutoResumePolicy(policyArg["--autoresume=".Length..]);
+                    break;
+                case "--autoresume-policy" when i + 1 < args.Length:
+                    autoResumePolicy = RunCommandSupport.ParseAutoResumePolicy(args[++i]);
                     break;
                 case "--no-autoresume":
-                    autoresume = false;
+                    autoResumePolicy = AutoResumePolicy.Off;
                     break;
                 case "--resume-from" when i + 1 < args.Length:
                     resumeFrom = args[++i];
@@ -41,6 +60,18 @@ public sealed record RunOptions(
                     break;
                 case "--steer-text" when i + 1 < args.Length:
                     steerText = args[++i];
+                    break;
+                case "--steer-file" when i + 1 < args.Length:
+                    steerFilePath = args[++i];
+                    break;
+                case "--backend" when i + 1 < args.Length:
+                    backendMode = args[++i];
+                    break;
+                case "--backend-script" when i + 1 < args.Length:
+                    backendScriptPath = args[++i];
+                    break;
+                case "--crash-after-stage" when i + 1 < args.Length:
+                    crashAfterStage = args[++i];
                     break;
                 default:
                     if (!arg.StartsWith("--", StringComparison.Ordinal))
@@ -52,10 +83,14 @@ public sealed record RunOptions(
         return new RunOptions(
             DotFilePath: dotFile ?? string.Empty,
             Resume: resume,
-            Autoresume: autoresume,
+            AutoResumePolicy: autoResumePolicy,
             ResumeFrom: resumeFrom,
             StartAt: startAt,
-            SteerText: steerText);
+            SteerText: steerText,
+            SteerFilePath: steerFilePath,
+            BackendMode: backendMode,
+            BackendScriptPath: backendScriptPath,
+            CrashAfterStage: crashAfterStage);
     }
 }
 
@@ -91,5 +126,16 @@ public static class RunCommandSupport
 
         remapped.Save(logsDir);
         return true;
+    }
+
+    public static AutoResumePolicy ParseAutoResumePolicy(string? rawPolicy)
+    {
+        return rawPolicy?.Trim().ToLowerInvariant() switch
+        {
+            null or "" or "on" or "true" => AutoResumePolicy.On,
+            "off" or "false" => AutoResumePolicy.Off,
+            "always" => AutoResumePolicy.Always,
+            _ => throw new ArgumentException($"Unknown autoresume policy '{rawPolicy}'.", nameof(rawPolicy))
+        };
     }
 }

@@ -11,10 +11,12 @@ using System.Text.Json;
 public class ManagerLoopHandler : INodeHandler
 {
     private readonly ICodergenBackend? _backend;
+    private readonly ISupervisorController? _supervisorController;
 
-    public ManagerLoopHandler(ICodergenBackend? backend = null)
+    public ManagerLoopHandler(ICodergenBackend? backend = null, ISupervisorController? supervisorController = null)
     {
         _backend = backend;
+        _supervisorController = supervisorController;
     }
 
     public async Task<Outcome> ExecuteAsync(GraphNode node, PipelineContext context, Graph graph, string logsRoot, CancellationToken ct = default)
@@ -32,7 +34,7 @@ public class ManagerLoopHandler : INodeHandler
         var stageDir = Path.Combine(logsRoot, node.Id);
         Directory.CreateDirectory(stageDir);
 
-        if (string.IsNullOrWhiteSpace(telemetrySource))
+        if (string.IsNullOrWhiteSpace(telemetrySource) && string.IsNullOrWhiteSpace(childDotfile))
             return await ExecuteLegacyLoopAsync(node, context, graph, logsRoot, stageDir, maxCycles, stopCondition, steerCooldownMs, ct);
 
         return await ExecuteTelemetryLoopAsync(
@@ -107,10 +109,19 @@ public class ManagerLoopHandler : INodeHandler
                 await Task.Delay(steerCooldownMs, ct);
         }
 
-        await WriteStatusAsync(stageDir, node.Id, currentCycle, maxCycles, cycleLog, telemetrySource: null, escalated: false, ct: ct);
-
         var reachedMax = currentCycle >= maxCycles;
         var status = reachedMax ? OutcomeStatus.PartialSuccess : OutcomeStatus.Success;
+
+        await WriteStatusAsync(
+            stageDir,
+            node.Id,
+            currentCycle,
+            maxCycles,
+            cycleLog,
+            telemetrySource: null,
+            escalated: false,
+            finalStatus: status,
+            ct: ct);
 
         return new Outcome(
             Status: status,
@@ -146,6 +157,7 @@ public class ManagerLoopHandler : INodeHandler
             : Math.Max(stallThreshold + 1, 3);
 
         var cycleLog = new List<Dictionary<string, object?>>();
+        SupervisorWorkerRuntime? workerRuntime = null;
         var telemetryPath = ResolveTelemetryPath(logsRoot, telemetrySource, childDotfile);
         var lastSnapshot = (SupervisorTelemetrySnapshot?)null;
         var stallStreak = 0;
@@ -160,6 +172,16 @@ public class ManagerLoopHandler : INodeHandler
         {
             ct.ThrowIfCancellationRequested();
             currentCycle++;
+
+            if (_supervisorController is not null && !string.IsNullOrWhiteSpace(childDotfile))
+            {
+                workerRuntime ??= await _supervisorController.EnsureWorkerAsync(node, graph, logsRoot, context, ct);
+                telemetryPath = workerRuntime.TelemetryPath;
+                context.Set($"{node.Id}.worker_dotfile", workerRuntime.DotFilePath);
+                context.Set($"{node.Id}.worker_run_dir", workerRuntime.WorkingDir);
+                context.Set($"{node.Id}.worker_logs_dir", workerRuntime.LogsDir);
+                context.Set($"{node.Id}.worker_steer_path", workerRuntime.SteerPath);
+            }
 
             var snapshot = SupervisorTelemetry.Read(telemetryPath);
             var progressed = snapshot.HasProgressSince(lastSnapshot);
@@ -182,6 +204,12 @@ public class ManagerLoopHandler : INodeHandler
                     if (result.ContextUpdates is not null)
                         context.MergeUpdates(result.ContextUpdates);
 
+                    if (workerRuntime is not null)
+                        await _supervisorController!.WriteSteeringAsync(
+                            workerRuntime,
+                            result.StageStatus?.Notes ?? result.Response,
+                            ct);
+
                     steeringApplied = true;
                     steeringCount++;
                     lastSteerAt = DateTimeOffset.UtcNow;
@@ -199,6 +227,9 @@ public class ManagerLoopHandler : INodeHandler
                 context.Set($"{node.Id}.escalated", "true");
                 context.Set($"{node.Id}.stall_status", "escalated");
                 cycleStatus = "escalated";
+
+                if (workerRuntime is not null && _supervisorController is not null)
+                    await _supervisorController.StopWorkerAsync(workerRuntime, ct);
             }
 
             cycleLog.Add(new Dictionary<string, object?>
@@ -230,8 +261,6 @@ public class ManagerLoopHandler : INodeHandler
             lastSnapshot = snapshot;
         }
 
-        await WriteStatusAsync(stageDir, node.Id, currentCycle, maxCycles, cycleLog, telemetryPath, escalated, ct);
-
         var reachedMax = currentCycle >= maxCycles && !escalated;
         var finalStatus = escalated
             ? OutcomeStatus.Retry
@@ -240,6 +269,8 @@ public class ManagerLoopHandler : INodeHandler
                 : reachedMax
                     ? OutcomeStatus.PartialSuccess
                     : OutcomeStatus.Success;
+
+        await WriteStatusAsync(stageDir, node.Id, currentCycle, maxCycles, cycleLog, telemetryPath, escalated, finalStatus, ct);
 
         return new Outcome(
             Status: finalStatus,
@@ -372,15 +403,18 @@ public class ManagerLoopHandler : INodeHandler
         List<Dictionary<string, object?>> cycleLog,
         string? telemetrySource,
         bool escalated,
+        OutcomeStatus finalStatus,
         CancellationToken ct)
     {
         var statusData = new Dictionary<string, object?>
         {
             ["node_id"] = nodeId,
+            ["status"] = StageStatusContract.ToStatusString(finalStatus),
             ["total_cycles"] = currentCycle,
             ["max_cycles"] = maxCycles,
             ["telemetry_source"] = telemetrySource,
             ["escalated"] = escalated,
+            ["contract_validated"] = true,
             ["cycles"] = cycleLog
         };
         await File.WriteAllTextAsync(

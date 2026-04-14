@@ -185,7 +185,8 @@ public static class BuilderCommandSupport
             Weight = int.TryParse(attributes.GetValueOrDefault("weight", "0"), out var weight) ? weight : 0,
             Fidelity = attributes.GetValueOrDefault("fidelity", ""),
             ThreadId = attributes.GetValueOrDefault("thread_id", ""),
-            LoopRestart = attributes.GetValueOrDefault("loop_restart", "false").Equals("true", StringComparison.OrdinalIgnoreCase)
+            LoopRestart = attributes.GetValueOrDefault("loop_restart", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
+            ContextReset = attributes.GetValueOrDefault("context_reset", "false").Equals("true", StringComparison.OrdinalIgnoreCase)
         };
     }
 
@@ -204,6 +205,8 @@ public static class BuilderCommandSupport
             attributes["thread_id"] = edge.ThreadId;
         if (edge.LoopRestart)
             attributes["loop_restart"] = "true";
+        if (edge.ContextReset)
+            attributes["context_reset"] = "true";
         return attributes;
     }
 }

@@ -1,0 +1,16 @@
+digraph attractor_run {
+    goal = "Child workflow that stalls long enough for the supervisor to escalate."
+    label = "QA Supervisor Stalled Child"
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    wait_forever [
+        shape=parallelogram,
+        label="Wait Forever",
+        tool_command="mkdir -p \"$SOULCASTER_WORKER_LOGS_DIR/control\" && printf 'waiting\\n' > \"$SOULCASTER_WORKER_LOGS_DIR/control/waiting.txt\" && sleep 30"
+    ]
+
+    start -> wait_forever
+    wait_forever -> done
+}

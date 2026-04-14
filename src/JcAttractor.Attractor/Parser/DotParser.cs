@@ -364,7 +364,8 @@ public class DotParser
             Weight = int.TryParse(attrs.GetValueOrDefault("weight", "0"), out var w) ? w : 0,
             Fidelity = attrs.GetValueOrDefault("fidelity", ""),
             ThreadId = attrs.GetValueOrDefault("thread_id", ""),
-            LoopRestart = attrs.GetValueOrDefault("loop_restart", "false").Equals("true", StringComparison.OrdinalIgnoreCase)
+            LoopRestart = attrs.GetValueOrDefault("loop_restart", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
+            ContextReset = attrs.GetValueOrDefault("context_reset", "false").Equals("true", StringComparison.OrdinalIgnoreCase)
         };
     }
 }

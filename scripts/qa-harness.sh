@@ -23,6 +23,12 @@ LIVE_QUEUE_STATUS="SKIP"
 LIVE_SUPERVISOR_STATUS="SKIP"
 LIVE_BUILDER_STATUS="SKIP"
 LIVE_LINT_STATUS="SKIP"
+LIVE_CONTEXT_RESET_STATUS="SKIP"
+LIVE_AUTOANSWER_STATUS="SKIP"
+LIVE_AUTORESUME_CRASH_STATUS="SKIP"
+LIVE_SUPERVISOR_WORKER_STATUS="SKIP"
+LIVE_SUPERVISOR_ESCALATION_STATUS="SKIP"
+LIVE_INTERACTIVE_STATUS="SKIP"
 
 HARNESS_LOG="$RESULTS_DIR/harness.log"
 BUILD_LOG="$RESULTS_DIR/build.log"
@@ -48,7 +54,7 @@ Options:
   --scenario             Run the deterministic scenario harness tests
   --live                 Run the required live validation pass
   --full                 Run --unit, --scenario, then --live
-  --live-scenario <id>   Run one live check only: smoke | checkpoint | parallel | queue | supervisor | builder | lint
+  --live-scenario <id>   Run one live check only: smoke | checkpoint | parallel | queue | supervisor | builder | lint | context-reset | autoanswer | autoresume-crash | supervisor-worker | supervisor-escalation | interactive
   --skip-qa-agent        Reserved compatibility flag for older harness flows
   --help, -h             Show this help
 
@@ -205,6 +211,12 @@ payload = {
                 "telemetry_supervisor": os.environ["LIVE_SUPERVISOR_STATUS"],
                 "builder_editor": os.environ["LIVE_BUILDER_STATUS"],
                 "lint": os.environ["LIVE_LINT_STATUS"],
+                "context_reset": os.environ["LIVE_CONTEXT_RESET_STATUS"],
+                "autoanswer": os.environ["LIVE_AUTOANSWER_STATUS"],
+                "autoresume_crash": os.environ["LIVE_AUTORESUME_CRASH_STATUS"],
+                "supervisor_worker": os.environ["LIVE_SUPERVISOR_WORKER_STATUS"],
+                "supervisor_escalation": os.environ["LIVE_SUPERVISOR_ESCALATION_STATUS"],
+                "interactive_editor": os.environ["LIVE_INTERACTIVE_STATUS"],
             },
     },
 }
@@ -613,6 +625,260 @@ run_live_builder() {
     log_live "Builder/editor workflow check passed."
 }
 
+run_live_context_reset() {
+    local output_dir="$DOTFILES_DIR/output/qa-context-reset"
+
+    log_live ""
+    log_live "Running live context_reset check..."
+    rm -rf "$output_dir"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-context-reset.dot"; then
+        LIVE_CONTEXT_RESET_STATUS="FAIL"
+        log_live "Context reset pipeline exited non-zero."
+        return 1
+    fi
+
+    for artifact in \
+        "$output_dir/logs/result.json" \
+        "$output_dir/logs/checkpoint.json" \
+        "$output_dir/logs/events.jsonl" \
+        "$output_dir/logs/carry/status.json" \
+        "$output_dir/logs/fresh/status.json"; do
+        if [[ ! -f "$artifact" ]]; then
+            LIVE_CONTEXT_RESET_STATUS="FAIL"
+            log_live "Context reset artifact missing: $artifact"
+            return 1
+        fi
+    done
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_CONTEXT_RESET_STATUS="FAIL"
+        log_live "Context reset result status was not success."
+        return 1
+    fi
+
+    LIVE_CONTEXT_RESET_STATUS="PASS"
+    log_live "Context reset check passed."
+}
+
+run_live_autoanswer() {
+    local output_dir="$DOTFILES_DIR/output/qa-autoanswer"
+    local asker_dir="$output_dir/logs/asker"
+
+    log_live ""
+    log_live "Running live auto-answer check..."
+    rm -rf "$output_dir"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-autoanswer.dot"; then
+        LIVE_AUTOANSWER_STATUS="FAIL"
+        log_live "Auto-answer pipeline exited non-zero."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_AUTOANSWER_STATUS="FAIL"
+        log_live "Auto-answer result.json missing."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_AUTOANSWER_STATUS="FAIL"
+        log_live "Auto-answer result status was not success."
+        return 1
+    fi
+
+    if [[ ! -f "$asker_dir/helper-answer-1.md" ]]; then
+        LIVE_AUTOANSWER_STATUS="FAIL"
+        log_live "Auto-answer helper artifact missing."
+        return 1
+    fi
+
+    if find "$output_dir/gates" -mindepth 1 -print -quit | grep -q .; then
+        LIVE_AUTOANSWER_STATUS="FAIL"
+        log_live "Auto-answer run unexpectedly created a human gate."
+        return 1
+    fi
+
+    LIVE_AUTOANSWER_STATUS="PASS"
+    log_live "Auto-answer check passed."
+}
+
+run_live_autoresume_crash() {
+    local output_dir="$DOTFILES_DIR/output/qa-autoresume-crash"
+    local manifest_path="$output_dir/run-manifest.json"
+    local status=0
+
+    log_live ""
+    log_live "Running live autoresume crash check..."
+    rm -rf "$output_dir"
+
+    set +e
+    dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-autoresume-crash.dot" \
+        --autoresume-policy always \
+        --crash-after-stage crash_point \
+        > >(tee -a "$LIVE_LOG") 2> >(tee -a "$LIVE_LOG" >&2)
+    status=$?
+    set -e
+
+    if [[ "$status" -eq 0 ]]; then
+        LIVE_AUTORESUME_CRASH_STATUS="FAIL"
+        log_live "Autoresume crash run unexpectedly exited 0 on the first process."
+        return 1
+    fi
+
+    local waited=0
+    while [[ $waited -lt 120 ]]; do
+        if [[ -f "$output_dir/logs/result.json" ]]; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_AUTORESUME_CRASH_STATUS="FAIL"
+        log_live "Autoresume crash result.json never appeared."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_AUTORESUME_CRASH_STATUS="FAIL"
+        log_live "Autoresume crash result status was not success."
+        return 1
+    fi
+
+    if ! python3 - "$manifest_path" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if payload.get("status") != "completed":
+    raise SystemExit(1)
+if int(payload.get("respawn_count", 0)) < 1:
+    raise SystemExit(1)
+PY
+    then
+        LIVE_AUTORESUME_CRASH_STATUS="FAIL"
+        log_live "Autoresume crash manifest did not record a completed respawned run."
+        return 1
+    fi
+
+    LIVE_AUTORESUME_CRASH_STATUS="PASS"
+    log_live "Autoresume crash check passed."
+}
+
+run_live_supervisor_worker() {
+    local output_dir="$DOTFILES_DIR/output/qa-supervisor-worker"
+    local worker_dir="$output_dir/workers/qa-supervisor-worker-child"
+
+    log_live ""
+    log_live "Running live supervisor/worker orchestration check..."
+    rm -rf "$output_dir"
+
+    if ! run_and_tee "$LIVE_LOG" dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-supervisor-worker.dot"; then
+        LIVE_SUPERVISOR_WORKER_STATUS="FAIL"
+        log_live "Supervisor/worker pipeline exited non-zero."
+        return 1
+    fi
+
+    for artifact in \
+        "$output_dir/logs/result.json" \
+        "$output_dir/logs/manager/status.json" \
+        "$worker_dir/logs/control/steer_applied.txt" \
+        "$worker_dir/logs/worker/WORKER-DONE.md"; do
+        if [[ ! -f "$artifact" ]]; then
+            LIVE_SUPERVISOR_WORKER_STATUS="FAIL"
+            log_live "Supervisor/worker artifact missing: $artifact"
+            return 1
+        fi
+    done
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_SUPERVISOR_WORKER_STATUS="FAIL"
+        log_live "Supervisor/worker result status was not success."
+        return 1
+    fi
+
+    LIVE_SUPERVISOR_WORKER_STATUS="PASS"
+    log_live "Supervisor/worker check passed."
+}
+
+run_live_supervisor_escalation() {
+    local output_dir="$DOTFILES_DIR/output/qa-supervisor-escalation"
+    local status=0
+
+    log_live ""
+    log_live "Running live supervisor escalation check..."
+    rm -rf "$output_dir"
+
+    set +e
+    dotnet run --project "$SOULCASTER_DIR/runner" -- run "$DOTFILES_DIR/qa-supervisor-escalation.dot" \
+        > >(tee -a "$LIVE_LOG") 2> >(tee -a "$LIVE_LOG" >&2)
+    status=$?
+    set -e
+
+    if [[ "$status" -eq 0 ]]; then
+        LIVE_SUPERVISOR_ESCALATION_STATUS="FAIL"
+        log_live "Supervisor escalation run unexpectedly exited 0."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/manager/status.json" ]]; then
+        LIVE_SUPERVISOR_ESCALATION_STATUS="FAIL"
+        log_live "Supervisor escalation manager status.json missing."
+        return 1
+    fi
+
+    if ! python3 - "$output_dir/logs/manager/status.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if payload.get("status") != "retry":
+    raise SystemExit(1)
+if payload.get("escalated") is not True:
+    raise SystemExit(1)
+PY
+    then
+        LIVE_SUPERVISOR_ESCALATION_STATUS="FAIL"
+        log_live "Supervisor escalation artifacts did not record retry+escalated."
+        return 1
+    fi
+
+    LIVE_SUPERVISOR_ESCALATION_STATUS="PASS"
+    log_live "Supervisor escalation check passed."
+}
+
+run_live_interactive() {
+    local work_dir="$RESULTS_DIR/interactive-live"
+    local dot_file="$work_dir/interactive-generated.dot"
+    local output_dir="$work_dir/output/interactive-generated"
+
+    log_live ""
+    log_live "Running live interactive editor workflow check..."
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    if ! run_and_tee "$LIVE_LOG" bash -lc "dotnet run --project \"$SOULCASTER_DIR/runner\" -- interactive \"$dot_file\" < \"$DOTFILES_DIR/qa-interactive-editor.repl\""; then
+        LIVE_INTERACTIVE_STATUS="FAIL"
+        log_live "Interactive editor run failed."
+        return 1
+    fi
+
+    if [[ ! -f "$output_dir/logs/result.json" ]]; then
+        LIVE_INTERACTIVE_STATUS="FAIL"
+        log_live "Interactive editor result.json missing."
+        return 1
+    fi
+
+    if [[ "$(json_status "$output_dir/logs/result.json")" != "success" ]]; then
+        LIVE_INTERACTIVE_STATUS="FAIL"
+        log_live "Interactive editor result status was not success."
+        return 1
+    fi
+
+    LIVE_INTERACTIVE_STATUS="PASS"
+    log_live "Interactive editor check passed."
+}
+
 run_live_lint() {
     log_live ""
     log_live "Running live lint check..."
@@ -670,6 +936,30 @@ run_live_mode() {
         run_live_builder || overall=false
     fi
 
+    if should_run_live context-reset; then
+        run_live_context_reset || overall=false
+    fi
+
+    if should_run_live autoanswer; then
+        run_live_autoanswer || overall=false
+    fi
+
+    if should_run_live autoresume-crash; then
+        run_live_autoresume_crash || overall=false
+    fi
+
+    if should_run_live supervisor-worker; then
+        run_live_supervisor_worker || overall=false
+    fi
+
+    if should_run_live supervisor-escalation; then
+        run_live_supervisor_escalation || overall=false
+    fi
+
+    if should_run_live interactive; then
+        run_live_interactive || overall=false
+    fi
+
     if should_run_live lint; then
         run_live_lint || overall=false
     fi
@@ -701,6 +991,7 @@ fi
 
 export RESULTS_DIR UNIT_STATUS SCENARIO_STATUS LIVE_STATUS
 export LIVE_SMOKE_STATUS LIVE_CHECKPOINT_STATUS LIVE_PARALLEL_STATUS LIVE_QUEUE_STATUS LIVE_SUPERVISOR_STATUS LIVE_BUILDER_STATUS LIVE_LINT_STATUS
+export LIVE_CONTEXT_RESET_STATUS LIVE_AUTOANSWER_STATUS LIVE_AUTORESUME_CRASH_STATUS LIVE_SUPERVISOR_WORKER_STATUS LIVE_SUPERVISOR_ESCALATION_STATUS LIVE_INTERACTIVE_STATUS
 write_summary_json
 
 log ""
@@ -715,6 +1006,12 @@ if [[ "$MODE_LIVE" == "true" ]]; then
     log "  queue:    $LIVE_QUEUE_STATUS"
     log "  supervisor: $LIVE_SUPERVISOR_STATUS"
     log "  builder:  $LIVE_BUILDER_STATUS"
+    log "  context-reset: $LIVE_CONTEXT_RESET_STATUS"
+    log "  autoanswer: $LIVE_AUTOANSWER_STATUS"
+    log "  autoresume-crash: $LIVE_AUTORESUME_CRASH_STATUS"
+    log "  supervisor-worker: $LIVE_SUPERVISOR_WORKER_STATUS"
+    log "  supervisor-escalation: $LIVE_SUPERVISOR_ESCALATION_STATUS"
+    log "  interactive: $LIVE_INTERACTIVE_STATUS"
     log "  lint:     $LIVE_LINT_STATUS"
 fi
 log "  summary:  $SUMMARY_JSON"

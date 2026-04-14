@@ -1,0 +1,23 @@
+digraph attractor_run {
+    goal = "Child workflow that waits for a supervisor steering file, then completes work."
+    label = "QA Supervisor Worker Child"
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    wait_for_steer [
+        shape=parallelogram,
+        label="Wait For Steer",
+        tool_command="mkdir -p \"$SOULCASTER_WORKER_LOGS_DIR/control\" \"$SOULCASTER_WORKER_LOGS_DIR/worker\" && while [ ! -f \"$SOULCASTER_WORKER_STEER_FILE\" ]; do sleep 1; done && cp \"$SOULCASTER_WORKER_STEER_FILE\" \"$SOULCASTER_WORKER_LOGS_DIR/control/steer_applied.txt\""
+    ]
+
+    do_work [
+        shape=parallelogram,
+        label="Do Work",
+        tool_command="printf 'worker complete\\n' > \"$SOULCASTER_WORKER_LOGS_DIR/worker/WORKER-DONE.md\""
+    ]
+
+    start -> wait_for_steer
+    wait_for_steer -> do_work
+    do_work -> done
+}

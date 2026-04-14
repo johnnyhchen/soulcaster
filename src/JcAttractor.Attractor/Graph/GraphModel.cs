@@ -51,4 +51,5 @@ public record GraphEdge
     public string Fidelity { get; init; } = "";
     public string ThreadId { get; init; } = "";
     public bool LoopRestart { get; init; } = false;
+    public bool ContextReset { get; init; } = false;
 }

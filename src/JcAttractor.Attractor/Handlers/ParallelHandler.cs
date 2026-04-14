@@ -5,10 +5,12 @@ using System.Text.Json;
 public class ParallelHandler : INodeHandler
 {
     private readonly HandlerRegistry _registry;
+    private readonly ICodergenBackend? _backend;
 
-    public ParallelHandler(HandlerRegistry registry)
+    public ParallelHandler(HandlerRegistry registry, ICodergenBackend? backend = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+        _backend = backend;
     }
 
     public async Task<Outcome> ExecuteAsync(GraphNode node, PipelineContext context, Graph graph, string logsRoot, CancellationToken ct = default)
@@ -352,6 +354,7 @@ public class ParallelHandler : INodeHandler
                     queueItem);
             }
 
+            ApplyContextReset(selectedEdge, graph, branchContext, queueItem);
             incomingEdge = selectedEdge;
             currentNodeId = selectedEdge.ToNode;
         }
@@ -493,5 +496,25 @@ public class ParallelHandler : INodeHandler
             .Replace(Path.AltDirectorySeparatorChar, '_');
 
         return string.IsNullOrWhiteSpace(token) ? $"item-{queueItem.Index}" : token;
+    }
+
+    private void ApplyContextReset(
+        GraphEdge selectedEdge,
+        Graph graph,
+        PipelineContext context,
+        QueueWorkItem? queueItem)
+    {
+        if (!selectedEdge.ContextReset || _backend is not ISessionControlBackend sessionControl)
+            return;
+
+        if (!graph.Nodes.TryGetValue(selectedEdge.ToNode, out var nextNode))
+            return;
+
+        var threadId = ResolveThreadId(nextNode, selectedEdge.ToNode, selectedEdge, graph);
+        if (queueItem is not null)
+            threadId = BuildQueueScopedThreadId(threadId, queueItem);
+
+        if (!string.IsNullOrWhiteSpace(threadId) && sessionControl.ResetThread(threadId))
+            context.Set($"edge.{selectedEdge.FromNode}->{selectedEdge.ToNode}.context_reset", "true");
     }
 }

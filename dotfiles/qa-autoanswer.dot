@@ -1,0 +1,28 @@
+digraph attractor_run {
+    goal = "Exercise helper-session auto-answering when a coding stage asks a blocking question."
+    label = "QA Auto Answer"
+    default_max_retry = 1
+    helper_reasoning_effort = "high"
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    node [shape=box]
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    asker [
+        label="Ask Then Continue",
+        prompt="If you do not already know the target filename, first return valid stage status JSON with status 'retry' and a blocking_question asking what filename to use. After you receive an answer, write a short note to the requested filename under logs/autoanswer/ and return success."
+    ]
+
+    verify [
+        label="Verify Auto Answer",
+        prompt="Read logs/autoanswer/AUTOANSWER.md and confirm the file exists. Return success only if the run continued without requiring a human gate."
+    ]
+
+    start -> asker
+    asker -> verify
+    verify -> done
+}

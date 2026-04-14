@@ -1,0 +1,33 @@
+digraph attractor_run {
+    goal = "Exercise crash autoresume with a forced runner crash after checkpointing."
+    label = "QA Autoresume Crash"
+    default_max_retry = 1
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    node [shape=box]
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    stage_a [
+        label="Stage A",
+        prompt="Write 'stage-a' to logs/autoresume/A.md and return success."
+    ]
+
+    crash_point [
+        label="Crash Point",
+        prompt="Read logs/autoresume/A.md, then write 'stage-b' to logs/autoresume/B.md and return success."
+    ]
+
+    verify [
+        label="Verify Resume",
+        prompt="Read logs/autoresume/B.md, then write 'stage-c' to logs/autoresume/C.md and return success."
+    ]
+
+    start -> stage_a
+    stage_a -> crash_point
+    crash_point -> verify
+    verify -> done
+}

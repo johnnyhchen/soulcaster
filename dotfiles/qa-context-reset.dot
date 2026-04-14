@@ -1,0 +1,43 @@
+digraph attractor_run {
+    goal = "Exercise context_reset semantics within a single Soulcaster run."
+    label = "QA Context Reset"
+    default_max_retry = 1
+    helper_reasoning_effort = "high"
+    model_stylesheet = "
+        * { provider = \"anthropic\"; model = \"claude-haiku-4-5\" }
+    "
+
+    node [shape=box]
+
+    start [shape=Mdiamond, label="Start"]
+    done  [shape=Msquare, label="Done"]
+
+    seed [
+        label="Seed Shared Thread",
+        thread_id="shared_thread",
+        prompt="Write the exact text 'TOKEN-SEED' to logs/context_reset/seed.md. Return success when the file is written."
+    ]
+
+    carry [
+        label="Carry Forward",
+        thread_id="shared_thread",
+        prompt="Read logs/context_reset/seed.md. Continue the same conversation and state whether earlier context from the same thread is still available before returning stage status JSON."
+    ]
+
+    fresh [
+        label="Fresh After Reset",
+        thread_id="shared_thread",
+        prompt="Read logs/context_reset/seed.md. Continue independently and state whether earlier context from the same thread is available before returning stage status JSON."
+    ]
+
+    verify [
+        label="Verify Reset",
+        prompt="Summarize the difference between the carry-forward stage and the fresh-after-reset stage. Return success only if both behaviors are clearly distinguishable."
+    ]
+
+    start -> seed
+    seed -> carry
+    carry -> fresh [context_reset=true]
+    fresh -> verify
+    verify -> done
+}

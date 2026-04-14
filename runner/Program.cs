@@ -27,6 +27,7 @@ return command switch
     "web" => await RunWeb(args[1..]),
     "lint" => await RunLint(args[1..]),
     "builder" => await RunBuilder(args[1..]),
+    "interactive" or "editor" => await RunInteractive(args[1..]),
     "help" or "--help" or "-h" => ShowHelp(),
     _ when command.EndsWith(".dot") => await RunPipeline(args), // backwards compat
     _ => ShowHelp()
@@ -3095,7 +3096,6 @@ static async Task<int> RunPipeline(string[] args)
         return 1;
     }
 
-    var dotName = Path.GetFileNameWithoutExtension(dotFilePath);
     var workingDir = RunCommandSupport.ResolveWorkingDirectory(dotFilePath, options);
     Directory.CreateDirectory(workingDir);
 
@@ -3111,7 +3111,9 @@ static async Task<int> RunPipeline(string[] args)
 
     var checkpointPath = Path.Combine(logsDir, "checkpoint.json");
     var checkpointExists = File.Exists(checkpointPath);
-    var shouldResume = options.Resume || (options.Autoresume && checkpointExists);
+    var manifestPath = Path.Combine(workingDir, "run-manifest.json");
+    var resumeDecision = AutoResumeSupport.DecideResume(options, checkpointPath, manifestPath);
+    var shouldResume = resumeDecision.ShouldResume;
 
     if (options.Resume && !checkpointExists)
     {
@@ -3142,23 +3144,21 @@ static async Task<int> RunPipeline(string[] args)
         return 1;
     }
 
-    var runId = Guid.NewGuid().ToString("N");
-    var manifestPath = Path.Combine(workingDir, "run-manifest.json");
-    void WriteManifest(string status, string activeStage, string? crash = null)
-    {
-        var manifest = new RunManifest
-        {
-            run_id = runId,
-            pid = Environment.ProcessId,
-            graph_path = dotFilePath,
-            started_at = DateTime.UtcNow.ToString("o"),
-            updated_at = DateTime.UtcNow.ToString("o"),
-            active_stage = activeStage,
-            status = status,
-            crash = crash
-        };
-        File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, JsonOpts()));
-    }
+    var manifest = resumeDecision.ExistingManifest ?? new RunManifest();
+    var resultPath = Path.Combine(logsDir, "result.json");
+    manifest.run_id = string.IsNullOrWhiteSpace(manifest.run_id) ? Guid.NewGuid().ToString("N") : manifest.run_id;
+    manifest.pid = Environment.ProcessId;
+    manifest.graph_path = dotFilePath;
+    manifest.started_at = string.IsNullOrWhiteSpace(manifest.started_at) ? DateTime.UtcNow.ToString("o") : manifest.started_at;
+    manifest.updated_at = DateTime.UtcNow.ToString("o");
+    manifest.active_stage = Checkpoint.Load(logsDir)?.CurrentNodeId ?? "start";
+    manifest.status = "starting";
+    manifest.crash = null;
+    manifest.auto_resume_policy = AutoResumeSupport.FormatPolicy(options.AutoResumePolicy);
+    manifest.resume_source = string.IsNullOrWhiteSpace(options.StartAt) ? resumeDecision.ResumeSource : "start-at";
+    manifest.checkpoint_path = checkpointPath;
+    manifest.result_path = resultPath;
+    manifest.Save(manifestPath);
 
     RegisterRun(dotFilePath, workingDir);
 
@@ -3167,16 +3167,22 @@ static async Task<int> RunPipeline(string[] args)
     Console.WriteLine($"Working dir: {workingDir}");
     Console.WriteLine($"Logs dir:    {logsDir}");
     Console.WriteLine($"Gates dir:   {gatesDir}");
-    Console.WriteLine($"Run ID:      {runId}");
+    Console.WriteLine($"Run ID:      {manifest.run_id}");
     Console.WriteLine($"Resume mode: {(shouldResume ? "resume" : "fresh")}");
+    Console.WriteLine($"Autoresume:  {AutoResumeSupport.FormatPolicy(options.AutoResumePolicy)}");
     if (!string.IsNullOrWhiteSpace(options.StartAt))
         Console.WriteLine($"Start-at:    {options.StartAt}");
     if (!string.IsNullOrWhiteSpace(options.SteerText))
         Console.WriteLine("Steer text:  [provided]");
+    if (!string.IsNullOrWhiteSpace(options.SteerFilePath))
+        Console.WriteLine($"Steer file:  {options.SteerFilePath}");
+    if (!string.Equals(options.BackendMode, "live", StringComparison.OrdinalIgnoreCase))
+        Console.WriteLine($"Backend:     {options.BackendMode}");
     Console.WriteLine();
 
     var dotSource = await File.ReadAllTextAsync(dotFilePath);
     var graph = DotParser.Parse(dotSource);
+    graph.Attributes["source_path"] = dotFilePath;
 
     if (!string.IsNullOrWhiteSpace(options.StartAt))
     {
@@ -3195,7 +3201,9 @@ static async Task<int> RunPipeline(string[] args)
     Console.WriteLine($"Edges: {graph.Edges.Count}");
     Console.WriteLine();
 
-    var backend = new AgentCodergenBackend(workingDir, projectRoot, options.SteerText);
+    var backend = RunnerBackendFactory.Create(workingDir, projectRoot, options);
+    var runtimeObserver = new RunnerRuntimeObserver(manifest, manifestPath, checkpointPath, options.CrashAfterStage);
+    var supervisorController = new SupervisorController(options, projectRoot, dotFilePath);
 
     var config = new PipelineConfig(
         LogsRoot: logsDir,
@@ -3205,15 +3213,22 @@ static async Task<int> RunPipeline(string[] args)
         {
             new StylesheetTransform(),
             new VariableExpansionTransform()
-        }
+        },
+        RuntimeObserver: runtimeObserver,
+        SupervisorController: supervisorController
     );
 
     var engine = new PipelineEngine(config);
 
     Console.WriteLine("Starting pipeline...");
     Console.WriteLine(new string('─', 60));
-    WriteManifest("running", Checkpoint.Load(logsDir)?.CurrentNodeId ?? "start");
+    manifest.status = "running";
+    manifest.active_stage = Checkpoint.Load(logsDir)?.CurrentNodeId ?? "start";
+    manifest.updated_at = DateTime.UtcNow.ToString("o");
+    manifest.Save(manifestPath);
 
+    var exitCode = 0;
+    var shouldRespawn = false;
     try
     {
         var result = await engine.RunAsync(graph);
@@ -3234,27 +3249,54 @@ static async Task<int> RunPipeline(string[] args)
             completed_nodes = result.CompletedNodes,
             finished = DateTime.UtcNow.ToString("o")
         };
-        await File.WriteAllTextAsync(
-            Path.Combine(logsDir, "result.json"),
-            JsonSerializer.Serialize(resultPayload, JsonOpts()));
+        await File.WriteAllTextAsync(resultPath, JsonSerializer.Serialize(resultPayload, RunnerJson.Options));
 
-        WriteManifest(
-            status: result.Status == OutcomeStatus.Success ? "completed" : "failed",
-            activeStage: result.CompletedNodes.LastOrDefault() ?? "unknown");
+        manifest.status = result.Status == OutcomeStatus.Success ? "completed" : "failed";
+        manifest.active_stage = result.CompletedNodes.LastOrDefault() ?? "unknown";
+        manifest.updated_at = DateTime.UtcNow.ToString("o");
+        manifest.result_path = resultPath;
+        manifest.Save(manifestPath);
 
-        return result.Status == OutcomeStatus.Success ? 0 : 1;
+        exitCode = result.Status == OutcomeStatus.Success ? 0 : 1;
     }
     catch (Exception ex)
     {
-        WriteManifest("crashed", Checkpoint.Load(logsDir)?.CurrentNodeId ?? "unknown", ex.Message);
+        manifest.status = options.AutoResumePolicy == AutoResumePolicy.Always ? "respawning" : "crashed";
+        manifest.active_stage = Checkpoint.Load(logsDir)?.CurrentNodeId ?? manifest.active_stage;
+        manifest.updated_at = DateTime.UtcNow.ToString("o");
+        manifest.crash = ex.Message;
+        if (options.AutoResumePolicy == AutoResumePolicy.Always)
+        {
+            manifest.respawn_count += 1;
+            manifest.last_respawned_at = DateTime.UtcNow.ToString("o");
+            shouldRespawn = true;
+        }
+        manifest.Save(manifestPath);
         Console.Error.WriteLine($"Pipeline crashed: {ex.Message}");
-        return 1;
+        exitCode = options.AutoResumePolicy == AutoResumePolicy.Always ? 134 : 1;
     }
     finally
     {
         ReleaseRunLock(Path.Combine(workingDir, "run.lock"));
         backend.Dispose();
     }
+
+    if (shouldRespawn)
+    {
+        if (!AutoResumeSupport.TrySpawnResumeProcess(options, dotFilePath, workingDir, environmentOverrides: null, out var respawnProcess, out var respawnError))
+        {
+            manifest.status = "crashed";
+            manifest.updated_at = DateTime.UtcNow.ToString("o");
+            manifest.crash = $"{manifest.crash} | Respawn failed: {respawnError}";
+            manifest.Save(manifestPath);
+            Console.Error.WriteLine($"Unable to respawn runner: {respawnError}");
+            return 1;
+        }
+
+        Console.Error.WriteLine($"Respawned runner pid {respawnProcess!.Id} for autoresume.");
+    }
+
+    return exitCode;
 }
 
 static bool TryAcquireRunLock(string lockPath, out string error)
@@ -3339,14 +3381,20 @@ static int ShowHelp()
     Console.WriteLine("  attractor providers <subcommand>      Ping providers or sync new provider models");
     Console.WriteLine("  attractor lint [path] [--recursive]  Lint one file or a directory of dotfiles");
     Console.WriteLine("  attractor builder <subcommand>        Create or edit DOT pipelines");
+    Console.WriteLine("  attractor interactive <dotfile>       Open the line-oriented workflow editor");
     Console.WriteLine();
     Console.WriteLine("Run options:");
     Console.WriteLine("  --resume                 Resume only if a checkpoint exists");
-    Console.WriteLine("  --autoresume             Auto-resume when checkpoint exists (default)");
+    Console.WriteLine("  --autoresume             Auto-resume incomplete runs (default: on)");
+    Console.WriteLine("  --autoresume-policy <policy>  Set autoresume policy: off | on | always");
     Console.WriteLine("  --no-autoresume          Force a fresh run even if checkpoint exists");
     Console.WriteLine("  --resume-from <dir>      Use a prior run directory as the working directory");
     Console.WriteLine("  --start-at <node>        Override checkpoint start node");
     Console.WriteLine("  --steer-text <text>      Inject steering text into the coding session");
+    Console.WriteLine("  --steer-file <path>      Read steering instructions from a file before each stage");
+    Console.WriteLine("  --backend <mode>         Backend mode: live | scripted");
+    Console.WriteLine("  --backend-script <path>  JSON plan for the scripted backend");
+    Console.WriteLine("  --crash-after-stage <id> Inject a crash after checkpointing a stage (QA/test)");
     Console.WriteLine();
     Console.WriteLine("Output directory resolution:");
     Console.WriteLine("  1. --dir <path> flag");
@@ -3355,545 +3403,9 @@ static int ShowHelp()
     return 0;
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// AgentCodergenBackend - bridges the Attractor pipeline to the
-// CodingAgent agentic loop, which actually writes code via tools
-// ═════════════════════════════════════════════════════════════════════
-public class AgentCodergenBackend : ICodergenBackend, IDisposable
+static Task<int> RunInteractive(string[] args)
 {
-    private const int MaxStatusParseAttempts = 3;
-
-    private readonly string _workingDir;
-    private readonly string _projectRoot;
-    private readonly string? _initialSteerText;
-    private readonly Func<string?, string?, string?, Session>? _sessionFactory;
-    private readonly SessionPool _sessionPool = new();
-    private int _initialSteerUsed;
-
-    public AgentCodergenBackend(
-        string workingDir,
-        string projectRoot,
-        string? initialSteerText = null,
-        Func<string?, string?, string?, Session>? sessionFactory = null)
-    {
-        _workingDir = workingDir;
-        _projectRoot = projectRoot;
-        _initialSteerText = initialSteerText;
-        _sessionFactory = sessionFactory;
-    }
-
-    public void Dispose()
-    {
-        _sessionPool.Dispose();
-    }
-
-    public async Task<CodergenResult> RunAsync(
-        string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
-    {
-        var hints = ParseRuntimeHints(prompt);
-        var resolvedProvider = provider ?? InferProvider(model);
-        var carryoverMode = hints.Fidelity;
-        var shouldPool = ShouldPoolSession(hints);
-        Session? session = null;
-        var pooledSession = false;
-
-        if (hints.ResumeMode.Equals("resume", StringComparison.OrdinalIgnoreCase) && shouldPool)
-        {
-            shouldPool = false;
-            carryoverMode = "summary:high";
-        }
-
-        try
-        {
-            session = GetSession(
-                shouldPool: shouldPool,
-                hints: hints,
-                resolvedProvider: resolvedProvider,
-                requestedModel: model,
-                reasoningEffort: reasoningEffort,
-                pooledSession: out pooledSession);
-
-            if (!string.IsNullOrWhiteSpace(_initialSteerText) &&
-                Interlocked.CompareExchange(ref _initialSteerUsed, 1, 0) == 0)
-            {
-                session.Steer(_initialSteerText!);
-            }
-
-            var carryover = BuildCarryoverPreamble(hints.ThreadId, carryoverMode);
-            var effectivePrompt = string.IsNullOrWhiteSpace(carryover)
-                ? prompt
-                : carryover + "\n\n" + prompt;
-            var stageStartedAt = DateTimeOffset.UtcNow;
-            var historyStartIndex = session.History.Count;
-
-            Console.WriteLine(
-                $"  [codergen] Starting agent session (model={model ?? "default"}, fidelity={hints.Fidelity}, thread={hints.ThreadId}, pooled={pooledSession})");
-
-            StageStatusContract? parsedStatus = null;
-            var parseError = string.Empty;
-            var firstResponse = string.Empty;
-            var finalResponse = string.Empty;
-            AssistantTurn? finalTurn = null;
-
-            for (var attempt = 1; attempt <= MaxStatusParseAttempts; attempt++)
-            {
-                var input = attempt == 1 ? effectivePrompt : BuildStageStatusReminder(parseError);
-                finalTurn = await session.ProcessInputAsync(input, ct);
-                finalResponse = finalTurn.Content ?? "[no response]";
-                if (attempt == 1)
-                    firstResponse = finalResponse;
-
-                if (StageStatusContract.TryParseAssistantResponse(finalResponse, out parsedStatus, out parseError))
-                    break;
-            }
-
-            if (string.IsNullOrWhiteSpace(firstResponse))
-                firstResponse = finalResponse;
-
-            if (finalTurn is not null)
-                Console.WriteLine($"  [codergen] Session complete ({finalTurn.ToolCalls.Count} tool calls made)");
-
-            var status = parsedStatus?.Status ?? InferStatusFromResponse(finalResponse);
-            var telemetry = BuildStageTelemetry(session, historyStartIndex, stageStartedAt);
-
-            return new CodergenResult(
-                Response: firstResponse,
-                Status: status,
-                ContextUpdates: parsedStatus?.ContextUpdates,
-                PreferredLabel: parsedStatus?.PreferredNextLabel,
-                SuggestedNextIds: parsedStatus?.SuggestedNextIds,
-                StageStatus: parsedStatus,
-                RawAssistantResponse: finalResponse,
-                Telemetry: telemetry);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            if (pooledSession)
-                _sessionPool.Discard(hints.ThreadId);
-            throw;
-        }
-        catch (Exception ex)
-        {
-            if (pooledSession)
-                _sessionPool.Discard(hints.ThreadId);
-            Console.Error.WriteLine($"  [codergen] Error: {ex.Message}");
-            return new CodergenResult(
-                Response: $"Agent error: {ex.Message}",
-                Status: OutcomeStatus.Retry
-            );
-        }
-        finally
-        {
-            if (!pooledSession && session is not null)
-                session.Close();
-        }
-    }
-
-    private Session GetSession(
-        bool shouldPool,
-        RuntimeHints hints,
-        string? resolvedProvider,
-        string? requestedModel,
-        string? reasoningEffort,
-        out bool pooledSession)
-    {
-        pooledSession = false;
-
-        if (!shouldPool)
-            return CreateSession(resolvedProvider, requestedModel, reasoningEffort);
-
-        if (_sessionPool.TryGet(hints.ThreadId, out var existing) &&
-            existing is not null &&
-            IsCompatible(existing, resolvedProvider, requestedModel, reasoningEffort))
-        {
-            pooledSession = true;
-            return existing;
-        }
-
-        if (existing is not null)
-            _sessionPool.Discard(hints.ThreadId);
-
-        pooledSession = true;
-        return _sessionPool.GetOrCreate(
-            hints.ThreadId,
-            () => CreateSession(resolvedProvider, requestedModel, reasoningEffort));
-    }
-
-    private Session CreateSession(string? resolvedProvider, string? model, string? reasoningEffort)
-    {
-        if (_sessionFactory is not null)
-            return _sessionFactory(resolvedProvider, model, reasoningEffort);
-
-        var (adapter, profile) = BuildProvider(resolvedProvider);
-
-        if (!string.IsNullOrEmpty(model))
-            SetProfileModel(profile, model);
-
-        var env = new LocalExecutionEnvironment(_projectRoot);
-        var sessionConfig = new SessionConfig(
-            MaxTurns: 200,
-            MaxToolRoundsPerInput: 300,
-            DefaultCommandTimeoutMs: 30_000,
-            MaxCommandTimeoutMs: 600_000,
-            ReasoningEffort: reasoningEffort
-        );
-
-        var session = new Session(adapter, profile, env, sessionConfig);
-        SubscribeSessionEvents(session);
-        return session;
-    }
-
-    private static (IProviderAdapter Adapter, IProviderProfile Profile) BuildProvider(string? resolvedProvider)
-    {
-        switch (resolvedProvider?.ToLowerInvariant())
-        {
-            case "openai":
-                var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
-                    ?? throw new InvalidOperationException("OPENAI_API_KEY not set.");
-                return (new OpenAiAdapter(openAiKey), new OpenAiProfile());
-
-            case "gemini":
-                var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY")
-                    ?? throw new InvalidOperationException("GEMINI_API_KEY not set.");
-                return (new GeminiAdapter(geminiKey), new GeminiProfile());
-
-            default: // "anthropic" or unspecified
-                var anthropicKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
-                    ?? throw new InvalidOperationException("ANTHROPIC_API_KEY not set.");
-                return (new AnthropicAdapter(anthropicKey), new AnthropicProfile());
-        }
-    }
-
-    private static void SubscribeSessionEvents(Session session)
-    {
-        session.EventEmitter.Subscribe(evt =>
-        {
-            switch (evt.Kind)
-            {
-                case EventKind.ToolCallStart:
-                    var toolName = evt.Data.GetValueOrDefault("toolName");
-                    Console.WriteLine($"  [tool] {toolName}");
-                    break;
-                case EventKind.AssistantTextDelta:
-                    var text = evt.Data.GetValueOrDefault("text") as string;
-                    if (!string.IsNullOrEmpty(text))
-                    {
-                        var preview = text.Length > 200 ? text[..200] + "..." : text;
-                        Console.Write(preview);
-                    }
-                    break;
-            }
-            return Task.CompletedTask;
-        });
-    }
-
-    private bool IsCompatible(Session session, string? resolvedProvider, string? requestedModel, string? reasoningEffort)
-    {
-        var requestedProvider = (resolvedProvider ?? "anthropic").ToLowerInvariant();
-        if (!session.ProviderProfile.Id.Equals(requestedProvider, StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        if (!string.IsNullOrWhiteSpace(requestedModel))
-        {
-            var resolvedModel = Client.ResolveModelAlias(requestedModel);
-            if (!session.ProviderProfile.Model.Equals(resolvedModel, StringComparison.OrdinalIgnoreCase))
-                return false;
-        }
-
-        if (!string.Equals(session.Config.ReasoningEffort, reasoningEffort, StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        return session.State != SessionState.Closed;
-    }
-
-    private bool ShouldPoolSession(RuntimeHints hints)
-    {
-        return hints.Fidelity.Equals("full", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private string BuildCarryoverPreamble(string threadId, string fidelity)
-    {
-        if (fidelity.Equals("full", StringComparison.OrdinalIgnoreCase))
-            return string.Empty;
-
-        if (!_sessionPool.TryGet(threadId, out var prior) || prior is null || prior.History.Count == 0)
-            return string.Empty;
-
-        var maxTurns = fidelity.StartsWith("summary:high", StringComparison.OrdinalIgnoreCase) ? 8 : 4;
-        if (fidelity.Equals("truncate", StringComparison.OrdinalIgnoreCase))
-            maxTurns = 2;
-
-        var summaryLines = new List<string>();
-        foreach (var turn in prior.History.TakeLast(maxTurns))
-        {
-            switch (turn)
-            {
-                case UserTurn userTurn:
-                    summaryLines.Add($"- User: {TrimLine(userTurn.Content)}");
-                    break;
-                case AssistantTurn assistantTurn:
-                    summaryLines.Add($"- Assistant: {TrimLine(assistantTurn.Content)}");
-                    break;
-                case SteeringTurn steeringTurn:
-                    summaryLines.Add($"- Steering: {TrimLine(steeringTurn.Content)}");
-                    break;
-            }
-        }
-
-        if (summaryLines.Count == 0)
-            return string.Empty;
-
-        return string.Join("\n", new[]
-        {
-            "[CONTEXT CARRYOVER]",
-            $"Thread: {threadId}",
-            $"Mode: {fidelity}",
-            "Prior thread summary:",
-            string.Join("\n", summaryLines),
-            "[/CONTEXT CARRYOVER]"
-        });
-    }
-
-    private static string TrimLine(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return string.Empty;
-
-        var trimmed = value.Replace('\n', ' ').Trim();
-        return trimmed.Length > 240 ? trimmed[..240] + "..." : trimmed;
-    }
-
-    private static string BuildStageStatusReminder(string parseError)
-    {
-        if (string.IsNullOrWhiteSpace(parseError))
-            parseError = "Missing structured stage status JSON.";
-
-        return
-            "Your previous response did not provide valid stage status JSON.\n" +
-            $"Reason: {parseError}\n" +
-            "Reply ONLY with a JSON object containing keys: status, preferred_next_label, suggested_next_ids, context_updates, notes, failure_reason.";
-    }
-
-    private Dictionary<string, object?> BuildStageTelemetry(Session session, int historyStartIndex, DateTimeOffset stageStartedAt)
-    {
-        var stageTurns = session.History.Skip(historyStartIndex).ToList();
-        var assistantTurns = stageTurns.OfType<AssistantTurn>().ToList();
-        var toolCalls = assistantTurns.SelectMany(t => t.ToolCalls).ToList();
-        var toolResults = stageTurns.OfType<ToolResultsTurn>().SelectMany(t => t.Results).ToList();
-
-        var usage = assistantTurns
-            .Select(t => t.Usage)
-            .Aggregate(Usage.Empty, (acc, next) => acc + next);
-
-        var byTool = toolCalls
-            .GroupBy(tc => tc.Name, StringComparer.OrdinalIgnoreCase)
-            .OrderByDescending(g => g.Count())
-            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => (object?)g.Count(), StringComparer.OrdinalIgnoreCase);
-
-        var touchedFiles = ExtractTouchedFiles(toolCalls)
-            .Take(50)
-            .Cast<object?>()
-            .ToList();
-
-        var telemetry = new Dictionary<string, object?>
-        {
-            ["duration_ms"] = (long)Math.Max(0, (DateTimeOffset.UtcNow - stageStartedAt).TotalMilliseconds),
-            ["assistant_turns"] = assistantTurns.Count,
-            ["tool_calls"] = toolCalls.Count,
-            ["tool_errors"] = toolResults.Count(r => r.IsError),
-            ["tool_by_name"] = byTool,
-            ["touched_files"] = touchedFiles,
-            ["touched_files_count"] = touchedFiles.Count,
-            ["token_usage"] = new Dictionary<string, object?>
-            {
-                ["input_tokens"] = usage.InputTokens,
-                ["output_tokens"] = usage.OutputTokens,
-                ["total_tokens"] = usage.TotalTokens,
-                ["reasoning_tokens"] = usage.ReasoningTokens,
-                ["cache_read_tokens"] = usage.CacheReadTokens,
-                ["cache_write_tokens"] = usage.CacheWriteTokens
-            }
-        };
-
-        return telemetry;
-    }
-
-    private IEnumerable<string> ExtractTouchedFiles(IEnumerable<ToolCallData> toolCalls)
-    {
-        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var toolCall in toolCalls)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(toolCall.Arguments);
-                var root = doc.RootElement;
-                switch (toolCall.Name.ToLowerInvariant())
-                {
-                    case "write_file":
-                        if (TryGetString(root, out var writePath, "file_path", "path"))
-                            files.Add(NormalizeTouchedPath(writePath));
-                        break;
-                    case "apply_patch":
-                        if (TryGetString(root, out var patchText, "patch"))
-                            AddPatchFiles(patchText, files);
-                        break;
-                }
-            }
-            catch
-            {
-                // Telemetry should not fail stage execution.
-            }
-        }
-
-        return files.OrderBy(f => f, StringComparer.OrdinalIgnoreCase);
-    }
-
-    private string NormalizeTouchedPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return path;
-
-        try
-        {
-            var absolute = Path.IsPathRooted(path)
-                ? Path.GetFullPath(path)
-                : Path.GetFullPath(path, _projectRoot);
-
-            if (absolute.StartsWith(_projectRoot, StringComparison.OrdinalIgnoreCase))
-                return Path.GetRelativePath(_projectRoot, absolute);
-
-            return absolute;
-        }
-        catch
-        {
-            return path;
-        }
-    }
-
-    private void AddPatchFiles(string patch, HashSet<string> files)
-    {
-        using var reader = new StringReader(patch ?? string.Empty);
-        string? line;
-        while ((line = reader.ReadLine()) is not null)
-        {
-            if (TryExtractPatchPath(line, out var patchPath))
-                files.Add(NormalizeTouchedPath(patchPath));
-        }
-    }
-
-    private static bool TryExtractPatchPath(string line, out string path)
-    {
-        path = string.Empty;
-        var prefixes = new[]
-        {
-            "*** Update File: ",
-            "*** Add File: ",
-            "*** Delete File: ",
-            "--- ",
-            "+++ "
-        };
-
-        foreach (var prefix in prefixes)
-        {
-            if (!line.StartsWith(prefix, StringComparison.Ordinal))
-                continue;
-
-            var candidate = line[prefix.Length..].Trim();
-            if (candidate.StartsWith("a/", StringComparison.Ordinal) || candidate.StartsWith("b/", StringComparison.Ordinal))
-                candidate = candidate[2..];
-
-            if (candidate == "/dev/null" || string.IsNullOrWhiteSpace(candidate))
-                return false;
-
-            path = candidate;
-            return true;
-        }
-
-        return false;
-    }
-
-    private static bool TryGetString(JsonElement root, out string value, params string[] keys)
-    {
-        value = string.Empty;
-        foreach (var key in keys)
-        {
-            if (!root.TryGetProperty(key, out var el) || el.ValueKind != JsonValueKind.String)
-                continue;
-
-            var text = el.GetString();
-            if (string.IsNullOrWhiteSpace(text))
-                continue;
-
-            value = text;
-            return true;
-        }
-
-        return false;
-    }
-
-    private static OutcomeStatus InferStatusFromResponse(string response)
-    {
-        if (response.StartsWith("[Error:", StringComparison.Ordinal) ||
-            response.StartsWith("[Turn limit reached]", StringComparison.Ordinal) ||
-            response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal))
-        {
-            return OutcomeStatus.Retry;
-        }
-
-        return OutcomeStatus.Success;
-    }
-
-    private static RuntimeHints ParseRuntimeHints(string prompt)
-    {
-        var fidelity = ExtractHint(prompt, "Runtime fidelity") ?? "full";
-        var thread = ExtractHint(prompt, "Runtime thread") ?? "default";
-        var resumeMode = ExtractHint(prompt, "Resume mode") ?? "fresh";
-
-        return new RuntimeHints(
-            Fidelity: fidelity.Trim(),
-            ThreadId: thread.Trim(),
-            ResumeMode: resumeMode.Trim());
-    }
-
-    private static string? ExtractHint(string prompt, string key)
-    {
-        var pattern = @"^\s*" + Regex.Escape(key) + @"\s*:\s*(.+?)\s*$";
-        var match = Regex.Match(prompt, pattern, RegexOptions.Multiline | RegexOptions.IgnoreCase);
-        return match.Success ? match.Groups[1].Value : null;
-    }
-
-    private static string? InferProvider(string? model)
-    {
-        if (string.IsNullOrEmpty(model)) return null;
-        var lower = model.ToLowerInvariant();
-        if (lower.StartsWith("claude")) return "anthropic";
-        if (lower.StartsWith("gpt") || lower.StartsWith("o1") || lower.StartsWith("o3") || lower.StartsWith("o4") || lower.StartsWith("codex")) return "openai";
-        if (lower.StartsWith("gemini")) return "gemini";
-        return null;
-    }
-
-    private static void SetProfileModel(IProviderProfile profile, string model)
-    {
-        // Resolve alias (e.g. "codex-5.2" → "gpt-5.2-codex") before setting
-        var resolved = Client.ResolveModelAlias(model);
-
-        switch (profile)
-        {
-            case AnthropicProfile ap:
-                ap.Model = resolved;
-                break;
-            case OpenAiProfile op:
-                op.Model = resolved;
-                break;
-            case GeminiProfile gp:
-                gp.Model = resolved;
-                break;
-        }
-    }
-
-    private sealed record RuntimeHints(string Fidelity, string ThreadId, string ResumeMode);
+    return InteractiveEditorCommand.RunAsync(args, RunPipeline);
 }
 
 class RunEntry
@@ -3902,22 +3414,4 @@ class RunEntry
     public string output_dir { get; set; } = "";
     public string name { get; set; } = "";
     public string started { get; set; } = "";
-}
-
-class RunLock
-{
-    public int pid { get; set; }
-    public string started_at { get; set; } = "";
-}
-
-class RunManifest
-{
-    public string run_id { get; set; } = "";
-    public int pid { get; set; }
-    public string graph_path { get; set; } = "";
-    public string started_at { get; set; } = "";
-    public string updated_at { get; set; } = "";
-    public string active_stage { get; set; } = "";
-    public string status { get; set; } = "";
-    public string? crash { get; set; }
 }

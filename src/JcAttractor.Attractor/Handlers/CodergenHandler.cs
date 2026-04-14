@@ -17,7 +17,8 @@ public record CodergenResult(
     List<string>? SuggestedNextIds = null,
     StageStatusContract? StageStatus = null,
     string? RawAssistantResponse = null,
-    Dictionary<string, object?>? Telemetry = null);
+    Dictionary<string, object?>? Telemetry = null,
+    Dictionary<string, string>? Artifacts = null);
 
 public class CodergenHandler : INodeHandler
 {
@@ -222,6 +223,8 @@ public class CodergenHandler : INodeHandler
                 result.RawAssistantResponse,
                 ct);
         }
+
+        await PersistSupplementalArtifactsAsync(stageDir, result.Artifacts, ct);
     }
 
     private static async Task<StageStatusContract?> TryReadStageStatusArtifactAsync(string statusPath, CancellationToken ct)
@@ -294,6 +297,7 @@ public class CodergenHandler : INodeHandler
         sb.AppendLine("  context_updates: object<string,string> (optional)");
         sb.AppendLine("  notes: string (optional)");
         sb.AppendLine("  failure_reason: string (optional)");
+        sb.AppendLine("  blocking_question: string | object (optional when you need Soulcaster to auto-answer a blocking question)");
         if (outgoingLabels.Count > 0)
             sb.AppendLine($"If preferred_next_label is set, it MUST be one of: {string.Join(", ", outgoingLabels)}");
         sb.AppendLine("[/STAGE STATUS CONTRACT]");
@@ -334,6 +338,9 @@ public class CodergenHandler : INodeHandler
         var thread = string.IsNullOrWhiteSpace(node.ThreadId) ? node.Id : node.ThreadId;
         var stageId = RuntimeStageResolver.ResolveStageId(context, node.Id);
         var resumeMode = context.Get("pipeline.resume_mode");
+        var helperProvider = ResolveHelperAttribute(node, graph, "provider");
+        var helperModel = ResolveHelperAttribute(node, graph, "model");
+        var helperReasoning = ResolveHelperAttribute(node, graph, "reasoning_effort");
         if (string.IsNullOrWhiteSpace(resumeMode))
             resumeMode = "fresh";
 
@@ -353,6 +360,12 @@ public class CodergenHandler : INodeHandler
         if (!string.Equals(stageId, node.Id, StringComparison.Ordinal))
             sb.AppendLine($"  Runtime stage: {stageId}");
         sb.AppendLine($"  Resume mode: {resumeMode}");
+        if (!string.IsNullOrWhiteSpace(helperProvider))
+            sb.AppendLine($"  Helper provider: {helperProvider}");
+        if (!string.IsNullOrWhiteSpace(helperModel))
+            sb.AppendLine($"  Helper model: {helperModel}");
+        if (!string.IsNullOrWhiteSpace(helperReasoning))
+            sb.AppendLine($"  Helper reasoning effort: {helperReasoning}");
         if (outgoingLabels.Count > 0)
             sb.AppendLine($"  Outgoing labels: {string.Join(", ", outgoingLabels)}");
         sb.AppendLine();
@@ -396,5 +409,42 @@ public class CodergenHandler : INodeHandler
         }
 
         return expanded;
+    }
+
+    private static string ResolveHelperAttribute(GraphNode node, Graph graph, string suffix)
+    {
+        var nodeKey = $"helper_{suffix}";
+        if (node.RawAttributes.TryGetValue(nodeKey, out var nodeValue) && !string.IsNullOrWhiteSpace(nodeValue))
+            return nodeValue;
+
+        return graph.Attributes.TryGetValue(nodeKey, out var graphValue) ? graphValue : string.Empty;
+    }
+
+    private static async Task PersistSupplementalArtifactsAsync(
+        string stageDir,
+        IReadOnlyDictionary<string, string>? artifacts,
+        CancellationToken ct)
+    {
+        if (artifacts is null || artifacts.Count == 0)
+            return;
+
+        foreach (var (relativePath, content) in artifacts)
+        {
+            if (string.IsNullOrWhiteSpace(relativePath))
+                continue;
+
+            var safePath = relativePath
+                .Replace('\\', Path.DirectorySeparatorChar)
+                .TrimStart(Path.DirectorySeparatorChar);
+            var fullPath = Path.GetFullPath(Path.Combine(stageDir, safePath));
+            if (!fullPath.StartsWith(stageDir, StringComparison.Ordinal))
+                continue;
+
+            var directory = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+
+            await File.WriteAllTextAsync(fullPath, content ?? string.Empty, ct);
+        }
     }
 }
