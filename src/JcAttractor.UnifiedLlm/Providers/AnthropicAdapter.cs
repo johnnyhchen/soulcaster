@@ -291,6 +291,13 @@ public sealed class AnthropicAdapter : IProviderAdapter, IProviderDiscoveryAdapt
 
     private JsonObject BuildRequestBody(Request request, bool stream)
     {
+        if (request.OutputModalities?.Contains(ResponseModality.Image) == true)
+        {
+            throw new ConfigurationError(
+                "Anthropic Messages API does not support assistant image output. " +
+                "Use OpenAI or Gemini when requesting image output modalities.");
+        }
+
         var body = new JsonObject
         {
             ["model"] = request.Model,

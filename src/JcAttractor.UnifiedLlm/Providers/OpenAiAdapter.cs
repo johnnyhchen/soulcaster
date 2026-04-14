@@ -428,46 +428,52 @@ public sealed class OpenAiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         if (request.TopP is not null)
             body["top_p"] = request.TopP.Value;
 
+        var wantsImageOutput = WantsOutputModality(request, ResponseModality.Image);
+
         // Tools
-        if (request.Tools is not null && request.Tools.Count > 0)
+        if ((request.Tools is not null && request.Tools.Count > 0) || wantsImageOutput)
         {
             var tools = new JsonArray();
-            foreach (var tool in request.Tools)
+            if (request.Tools is not null)
             {
-                var properties = new JsonObject();
-                var required = new JsonArray();
-                foreach (var param in tool.Parameters)
+                foreach (var tool in request.Tools)
                 {
-                    var propType = param.Required
-                        ? param.Type
-                        : param.Type;
-                    var prop = new JsonObject { ["type"] = new JsonArray(param.Type, "null") };
-                    if (param.Description is not null)
-                        prop["description"] = param.Description;
-                    if (param.Required)
-                        prop["type"] = param.Type;
-                    properties[param.Name] = prop;
-                    // OpenAI strict mode requires all properties in required
-                    required.Add(param.Name);
+                    var properties = new JsonObject();
+                    var required = new JsonArray();
+                    foreach (var param in tool.Parameters)
+                    {
+                        var prop = new JsonObject { ["type"] = new JsonArray(param.Type, "null") };
+                        if (param.Description is not null)
+                            prop["description"] = param.Description;
+                        if (param.Required)
+                            prop["type"] = param.Type;
+                        properties[param.Name] = prop;
+                        // OpenAI strict mode requires all properties in required
+                        required.Add(param.Name);
+                    }
+
+                    var parameters = new JsonObject
+                    {
+                        ["type"] = "object",
+                        ["properties"] = properties,
+                        ["required"] = required,
+                        ["additionalProperties"] = false
+                    };
+
+                    tools.Add(new JsonObject
+                    {
+                        ["type"] = "function",
+                        ["name"] = tool.Name,
+                        ["description"] = tool.Description,
+                        ["parameters"] = parameters,
+                        ["strict"] = true
+                    });
                 }
-
-                var parameters = new JsonObject
-                {
-                    ["type"] = "object",
-                    ["properties"] = properties,
-                    ["required"] = required,
-                    ["additionalProperties"] = false
-                };
-
-                tools.Add(new JsonObject
-                {
-                    ["type"] = "function",
-                    ["name"] = tool.Name,
-                    ["description"] = tool.Description,
-                    ["parameters"] = parameters,
-                    ["strict"] = true
-                });
             }
+
+            if (wantsImageOutput)
+                tools.Add(new JsonObject { ["type"] = "image_generation" });
+
             body["tools"] = tools;
         }
 
@@ -659,6 +665,16 @@ public sealed class OpenAiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                             }
                         }
                         break;
+
+                    case "image_generation_call":
+                        var imageBase64 = item["result"]?.GetValue<string>();
+                        if (!string.IsNullOrWhiteSpace(imageBase64))
+                        {
+                            var mimeType = item["mime_type"]?.GetValue<string>() ?? "image/png";
+                            var imageBytes = Convert.FromBase64String(imageBase64);
+                            content.Add(ContentPart.ImagePart(ImageData.FromBytes(imageBytes, mimeType)));
+                        }
+                        break;
                 }
             }
         }
@@ -713,4 +729,7 @@ public sealed class OpenAiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             ReasoningTokens: reasoningTokens is > 0 ? reasoningTokens : null,
             CacheReadTokens: cacheRead is > 0 ? cacheRead : null);
     }
+
+    private static bool WantsOutputModality(Request request, ResponseModality modality) =>
+        request.OutputModalities?.Contains(modality) == true;
 }

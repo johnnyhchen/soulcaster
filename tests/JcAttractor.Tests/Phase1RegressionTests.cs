@@ -431,3 +431,67 @@ Return stage status JSON.
         }
     }
 }
+
+public class CodergenLoopTerminationRegressionTests
+{
+    [Fact]
+    public async Task AgentCodergenBackend_ExplorationStall_ReturnsRetryWithoutExtraStatusReminders()
+    {
+        var provider = new ExplorationLoopProvider();
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _) => new Session(
+                provider,
+                new OpenAiProfile(),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(
+                    MaxToolRoundsPerInput: 50,
+                    MaxConsecutiveExplorationRounds: 3)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: loop-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Retry, result.Status);
+        Assert.Contains("Exploration stall detected", result.RawAssistantResponse);
+        Assert.Equal(4, provider.RequestCount);
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_ModelTimeout_ReturnsRetry()
+    {
+        var provider = new SlowProvider();
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _) => new Session(
+                provider,
+                new FakeProfile(provider),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 50)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: timeout-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Retry, result.Status);
+        Assert.Contains("Model response timeout reached", result.RawAssistantResponse);
+    }
+}

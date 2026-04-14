@@ -8,6 +8,7 @@ public record Request
     public List<ToolDefinition>? Tools { get; init; }
     public ToolChoice? ToolChoice { get; init; }
     public ResponseFormat? ResponseFormat { get; init; }
+    public List<ResponseModality>? OutputModalities { get; init; }
     public double? Temperature { get; init; }
     public double? TopP { get; init; }
     public int? MaxTokens { get; init; }

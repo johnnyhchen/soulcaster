@@ -45,3 +45,9 @@ public enum ToolChoiceMode
     Required,
     Named
 }
+
+public enum ResponseModality
+{
+    Text,
+    Image
+}

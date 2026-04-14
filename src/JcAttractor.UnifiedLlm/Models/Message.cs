@@ -20,6 +20,9 @@ public record Message(
     public static Message UserMsg(string text) =>
         new(Role.User, [ContentPart.TextPart(text)]);
 
+    public static Message UserMsg(params ContentPart[] content) =>
+        new(Role.User, content.ToList());
+
     public static Message AssistantMsg(string text) =>
         new(Role.Assistant, [ContentPart.TextPart(text)]);
 

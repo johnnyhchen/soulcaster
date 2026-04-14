@@ -38,6 +38,25 @@ public static class ProviderCommandSupport
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    public static IReadOnlyDictionary<string, IProviderAdapter> CreateCompletionAdaptersFromEnv()
+    {
+        var adapters = new Dictionary<string, IProviderAdapter>(StringComparer.OrdinalIgnoreCase);
+
+        var anthropicKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+        if (!string.IsNullOrWhiteSpace(anthropicKey))
+            adapters["anthropic"] = new AnthropicAdapter(anthropicKey);
+
+        var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        if (!string.IsNullOrWhiteSpace(openAiKey))
+            adapters["openai"] = new OpenAiAdapter(openAiKey);
+
+        var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY");
+        if (!string.IsNullOrWhiteSpace(geminiKey))
+            adapters["gemini"] = new GeminiAdapter(geminiKey);
+
+        return adapters;
+    }
+
     public static IReadOnlyDictionary<string, IProviderDiscoveryAdapter> CreateDiscoveryAdaptersFromEnv()
     {
         var adapters = new Dictionary<string, IProviderDiscoveryAdapter>(StringComparer.OrdinalIgnoreCase);
@@ -70,6 +89,36 @@ public static class ProviderCommandSupport
             _ => throw new ArgumentException($"Unsupported provider '{provider}'. Expected one of: anthropic, openai, gemini.", nameof(provider))
         };
     }
+
+    public static IReadOnlyList<ResponseModality> ParseOutputModalities(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return [];
+
+        var modalities = new List<ResponseModality>();
+        foreach (var token in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            modalities.Add(token.ToLowerInvariant() switch
+            {
+                "text" => ResponseModality.Text,
+                "image" => ResponseModality.Image,
+                _ => throw new ArgumentException($"Unsupported output modality '{token}'. Expected one of: text, image.", nameof(raw))
+            });
+        }
+
+        return modalities
+            .Distinct()
+            .ToList();
+    }
+
+    public static string GetImageExtension(string? mediaType) => mediaType?.ToLowerInvariant() switch
+    {
+        "image/jpeg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        "image/bmp" => ".bmp",
+        _ => ".png"
+    };
 
     public static string ResolveRepositoryRoot(string startDirectory)
     {

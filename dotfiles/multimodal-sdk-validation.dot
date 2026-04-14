@@ -1,0 +1,16 @@
+digraph attractor_run {
+    goal = "Validate SDK-backed image input and image output against live model providers."
+    label = "Multimodal SDK Validation"
+    node [shape=parallelogram]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    validate_sdk [
+        label="Validate OpenAI + Gemini image round-trips",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/validate_multimodal_sdk.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/dotfiles/output/multimodal-sdk-validation/logs/validate_sdk"
+    ]
+
+    start -> validate_sdk
+    validate_sdk -> exit
+}

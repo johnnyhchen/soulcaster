@@ -2,6 +2,15 @@ namespace JcAttractor.CodingAgent;
 
 public static class LoopDetection
 {
+    private static readonly HashSet<string> ExplorationToolNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "read_file",
+        "grep",
+        "glob",
+        "list_dir",
+        "read_many_files"
+    };
+
     /// <summary>
     /// Extracts a list of tool call signatures from the session history.
     /// Each signature is a string combining the tool name and a hash of its arguments.
@@ -23,6 +32,76 @@ public static class LoopDetection
         }
 
         return signatures;
+    }
+
+    public static bool IsExplorationTool(string toolName) =>
+        ExplorationToolNames.Contains(toolName);
+
+    /// <summary>
+    /// Counts consecutive assistant tool rounds at the end of the history that are purely
+    /// exploratory (read/search/list style tools only). This catches non-terminating loops
+    /// where the model keeps gathering slightly different context without making progress.
+    /// </summary>
+    public static int CountConsecutiveExplorationOnlyRounds(IReadOnlyList<ITurn> history)
+    {
+        var rounds = 0;
+
+        for (var i = history.Count - 1; i >= 0; i--)
+        {
+            switch (history[i])
+            {
+                case ToolResultsTurn:
+                case SteeringTurn:
+                    continue;
+                case UserTurn:
+                case SystemTurn:
+                    return rounds;
+                case AssistantTurn assistantTurn:
+                    if (assistantTurn.ToolCalls.Count == 0)
+                        return rounds;
+
+                    if (assistantTurn.ToolCalls.All(tc => IsExplorationTool(tc.Name)))
+                    {
+                        rounds++;
+                        continue;
+                    }
+
+                    return rounds;
+            }
+        }
+
+        return rounds;
+    }
+
+    public static int CountConsecutiveExplorationOnlyToolCalls(IReadOnlyList<ITurn> history)
+    {
+        var toolCalls = 0;
+
+        for (var i = history.Count - 1; i >= 0; i--)
+        {
+            switch (history[i])
+            {
+                case ToolResultsTurn:
+                case SteeringTurn:
+                    continue;
+                case UserTurn:
+                case SystemTurn:
+                    return toolCalls;
+                case AssistantTurn assistantTurn:
+                    if (assistantTurn.ToolCalls.Count == 0)
+                        return toolCalls;
+
+                    if (assistantTurn.ToolCalls.All(tc => IsExplorationTool(tc.Name)))
+                    {
+                        toolCalls += assistantTurn.ToolCalls.Count;
+                        continue;
+                    }
+
+                    return toolCalls;
+            }
+        }
+
+        return toolCalls;
     }
 
     /// <summary>

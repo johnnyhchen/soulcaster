@@ -179,6 +179,27 @@ public class MessageAndContentTests
     }
 
     [Fact]
+    public void ImageData_FromFile_LoadsBytesAndInfersMediaType()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_image_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var path = Path.Combine(tempDir, "sample.png");
+        File.WriteAllBytes(path, Convert.FromBase64String(UnifiedLlmTestAssets.TestImageBase64));
+
+        try
+        {
+            var image = ImageData.FromFile(path);
+            Assert.NotNull(image.Data);
+            Assert.Equal("image/png", image.MediaType);
+            Assert.Null(image.Url);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
     public void ContentPart_ToolCallPart_SetsCorrectKind()
     {
         var tc = new ToolCallData("id1", "tool_name", "{}", "function");
@@ -216,6 +237,18 @@ public class MessageAndContentTests
         var msg = Message.UserMsg("Hello!");
         Assert.Equal(Role.User, msg.Role);
         Assert.Equal("Hello!", msg.Text);
+    }
+
+    [Fact]
+    public void Message_UserMsg_ContentPartsOverload_CorrectRole()
+    {
+        var msg = Message.UserMsg(
+            ContentPart.TextPart("Hello!"),
+            ContentPart.ImagePart(ImageData.FromBytes(Convert.FromBase64String(UnifiedLlmTestAssets.TestImageBase64))));
+
+        Assert.Equal(Role.User, msg.Role);
+        Assert.Equal("Hello!", msg.Text);
+        Assert.Single(msg.Content.Where(part => part.Kind == ContentKind.Image));
     }
 
     [Fact]
@@ -298,6 +331,23 @@ public class ResponseTests
     {
         var response = CreateResponse("no thinking");
         Assert.Null(response.Reasoning);
+    }
+
+    [Fact]
+    public void Response_Images_ExtractsImageParts()
+    {
+        var image = ImageData.FromBytes(Convert.FromBase64String(UnifiedLlmTestAssets.TestImageBase64), "image/png");
+        var msg = new Message(Role.Assistant, new List<ContentPart>
+        {
+            ContentPart.TextPart("caption"),
+            ContentPart.ImagePart(image)
+        });
+
+        var response = new Response("id", "model", "provider", msg, FinishReason.Stop, Usage.Empty);
+
+        Assert.Single(response.Images);
+        Assert.Equal("image/png", response.Images[0].MediaType);
+        Assert.NotNull(response.Images[0].Data);
     }
 
     [Fact]
@@ -604,6 +654,7 @@ public class RequestTests
         Assert.Null(req.Provider);
         Assert.Null(req.Tools);
         Assert.Null(req.ToolChoice);
+        Assert.Null(req.OutputModalities);
         Assert.Null(req.Temperature);
         Assert.Null(req.MaxTokens);
         Assert.Null(req.ReasoningEffort);
@@ -815,6 +866,157 @@ public class T13_ProviderOptionsPassThroughTests
     }
 }
 
+public class T14_MultimodalAdapterTests
+{
+    [Fact]
+    public void OpenAiAdapter_AddsImageGenerationTool_WhenImageOutputRequested()
+    {
+        var adapter = new OpenAiAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gpt-5.4",
+            Messages = new List<Message> { Message.UserMsg("Generate an image") },
+            OutputModalities = new List<ResponseModality> { ResponseModality.Text, ResponseModality.Image }
+        };
+
+        var method = typeof(OpenAiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var tools = body!["tools"]!.AsArray();
+        Assert.Contains(tools, tool => tool?["type"]?.GetValue<string>() == "image_generation");
+    }
+
+    [Fact]
+    public void OpenAiAdapter_ParsesImageGenerationCall_Output()
+    {
+        var adapter = new OpenAiAdapter("test-key");
+        var responseBody = $$"""
+            {
+              "id": "resp_123",
+              "model": "gpt-5.4",
+              "status": "completed",
+              "output": [
+                {
+                  "type": "message",
+                  "content": [
+                    { "type": "output_text", "text": "caption" }
+                  ]
+                },
+                {
+                  "id": "ig_123",
+                  "type": "image_generation_call",
+                  "status": "completed",
+                  "result": "{{UnifiedLlmTestAssets.TestImageBase64}}"
+                }
+              ],
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20
+              }
+            }
+            """;
+
+        var method = typeof(OpenAiAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var response = method!.Invoke(adapter, new object[] { responseBody, "gpt-5.4" }) as Response;
+        Assert.NotNull(response);
+        Assert.Equal("caption", response!.Text);
+        Assert.Single(response.Images);
+        Assert.NotNull(response.Images[0].Data);
+    }
+
+    [Fact]
+    public void GeminiAdapter_AddsResponseModalities_WhenImageOutputRequested()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gemini-3.1-flash-image-preview",
+            Messages = new List<Message> { Message.UserMsg("Generate an image") },
+            OutputModalities = new List<ResponseModality> { ResponseModality.Text, ResponseModality.Image }
+        };
+
+        var method = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var modalities = body!["generationConfig"]!["responseModalities"]!.AsArray()
+            .Select(node => node!.GetValue<string>())
+            .ToList();
+        Assert.Contains("TEXT", modalities);
+        Assert.Contains("IMAGE", modalities);
+    }
+
+    [Fact]
+    public void GeminiAdapter_ParsesInlineImage_Output()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var responseBody = $$"""
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      { "text": "caption" },
+                      {
+                        "inlineData": {
+                          "mimeType": "image/png",
+                          "data": "{{UnifiedLlmTestAssets.TestImageBase64}}"
+                        }
+                      }
+                    ]
+                  },
+                  "finishReason": "STOP"
+                }
+              ],
+              "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20
+              }
+            }
+            """;
+
+        var method = typeof(GeminiAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var response = method!.Invoke(adapter, new object[] { responseBody, "gemini-3.1-flash-image-preview" }) as Response;
+        Assert.NotNull(response);
+        Assert.Equal("caption", response!.Text);
+        Assert.Single(response.Images);
+        Assert.NotNull(response.Images[0].Data);
+    }
+
+    [Fact]
+    public void AnthropicAdapter_Throws_WhenImageOutputRequested()
+    {
+        var adapter = new AnthropicAdapter("test-key");
+        var request = new Request
+        {
+            Model = "claude-opus-4-6",
+            Messages = new List<Message> { Message.UserMsg("Generate an image") },
+            OutputModalities = new List<ResponseModality> { ResponseModality.Image }
+        };
+
+        var method = typeof(AnthropicAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var ex = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+            method!.Invoke(adapter, new object[] { request, false }));
+        Assert.IsType<ConfigurationError>(ex.InnerException);
+    }
+}
+
 // ── T11 test helper ─────────────────────────────────────────────────────────
 
 internal class ModelCapturingProvider : IProviderAdapter
@@ -837,4 +1039,10 @@ internal class ModelCapturingProvider : IProviderAdapter
         yield return new StreamEvent { Type = StreamEventType.Finish, FinishReason = FinishReason.Stop };
         await Task.CompletedTask;
     }
+}
+
+internal static partial class UnifiedLlmTestAssets
+{
+    public const string TestImageBase64 =
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR42mP4b2xMEmIY1TCqYfhqAACXHWUQdfT2ygAAAABJRU5ErkJggg==";
 }

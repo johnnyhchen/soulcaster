@@ -111,8 +111,18 @@ public class Session
     /// The core agentic loop. Processes user input through the LLM, executes tool calls,
     /// and iterates until the assistant produces a final text response or limits are reached.
     /// </summary>
-    public async Task<AssistantTurn> ProcessInputAsync(string userInput, CancellationToken ct = default)
+    public Task<AssistantTurn> ProcessInputAsync(string userInput, CancellationToken ct = default) =>
+        ProcessInputAsync(Message.UserMsg(userInput), ct);
+
+    /// <summary>
+    /// The core agentic loop for multimodal user input. Processes user content through the LLM,
+    /// executes tool calls, and iterates until the assistant produces a final response or limits are reached.
+    /// </summary>
+    public async Task<AssistantTurn> ProcessInputAsync(Message userMessage, CancellationToken ct = default)
     {
+        if (userMessage.Role != Role.User)
+            throw new ArgumentException("ProcessInputAsync requires a user-role message.", nameof(userMessage));
+
         try
         {
             await _processLock.WaitAsync(ct);
@@ -131,14 +141,18 @@ public class Session
 
             await EventEmitter.EmitAsync(EventKind.UserInput, new Dictionary<string, object?>
             {
-                ["content"] = userInput
+                ["content"] = userMessage.Text
             });
 
             // Add user turn to history
-            History.Add(new UserTurn(userInput, DateTimeOffset.UtcNow));
+            History.Add(new UserTurn(
+                userMessage.Text,
+                DateTimeOffset.UtcNow,
+                ShouldPersistParts(userMessage.Content) ? new List<ContentPart>(userMessage.Content) : null));
 
             var totalTurns = 0;
             var toolRounds = 0;
+            var explorationStallWarningIssued = false;
 
             try
             {
@@ -171,15 +185,54 @@ public class Session
                     // Drain steering messages into history
                     await DrainSteeringAsync();
 
-                    // Loop detection
-                    if (Config.EnableLoopDetection && LoopDetection.DetectLoop(History, Config.LoopDetectionWindow))
+                    if (Config.EnableLoopDetection)
                     {
-                        await EventEmitter.EmitAsync(EventKind.LoopDetection);
+                        var explorationRounds = LoopDetection.CountConsecutiveExplorationOnlyRounds(History);
+                        var explorationToolCalls = LoopDetection.CountConsecutiveExplorationOnlyToolCalls(History);
+                        var roundLimitHit = Config.MaxConsecutiveExplorationRounds > 0 &&
+                                            explorationRounds >= Config.MaxConsecutiveExplorationRounds;
+                        var toolCallLimitHit = Config.MaxConsecutiveExplorationToolCalls > 0 &&
+                                               explorationToolCalls >= Config.MaxConsecutiveExplorationToolCalls;
 
-                        // Inject a steering message to break the loop
-                        History.Add(new SteeringTurn(
-                            "You appear to be in a loop repeating the same tool calls. Please try a different approach or ask the user for clarification.",
-                            DateTimeOffset.UtcNow));
+                        if (roundLimitHit || toolCallLimitHit)
+                        {
+                            var stallMetric = toolCallLimitHit
+                                ? $"{explorationToolCalls} consecutive exploration-only tool calls"
+                                : $"{explorationRounds} consecutive exploration-only tool rounds";
+
+                            await EventEmitter.EmitAsync(EventKind.LoopDetection, new Dictionary<string, object?>
+                            {
+                                ["reason"] = "exploration_stall",
+                                ["rounds"] = explorationRounds,
+                                ["tool_calls"] = explorationToolCalls
+                            });
+
+                            if (explorationStallWarningIssued)
+                            {
+                                return CreateFinalTurn(
+                                    $"[Exploration stall detected after {stallMetric}]");
+                            }
+
+                            History.Add(new SteeringTurn(
+                                $"You have spent {stallMetric} only reading or searching files. Stop gathering more context and either make a concrete change, run a validating command, ask a blocking question, or provide a final answer.",
+                                DateTimeOffset.UtcNow));
+                            explorationStallWarningIssued = true;
+                        }
+                        else
+                        {
+                            explorationStallWarningIssued = false;
+                        }
+
+                        // Loop detection
+                        if (LoopDetection.DetectLoop(History, Config.LoopDetectionWindow))
+                        {
+                            await EventEmitter.EmitAsync(EventKind.LoopDetection);
+
+                            // Inject a steering message to break the loop
+                            History.Add(new SteeringTurn(
+                                "You appear to be in a loop repeating the same tool calls. Please try a different approach or ask the user for clarification.",
+                                DateTimeOffset.UtcNow));
+                        }
                     }
 
                     // Build messages and call LLM
@@ -205,7 +258,22 @@ public class Session
                     Response response;
                     try
                     {
-                        response = await LlmClient.CompleteAsync(request, ct);
+                        using var providerCts = Config.MaxProviderResponseMs > 0
+                            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+                            : null;
+                        if (providerCts is not null)
+                            providerCts.CancelAfter(Config.MaxProviderResponseMs);
+
+                        response = await LlmClient.CompleteAsync(request, providerCts?.Token ?? ct);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && Config.MaxProviderResponseMs > 0)
+                    {
+                        await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
+                        {
+                            ["error"] = "Model response timeout reached.",
+                            ["timeout_ms"] = Config.MaxProviderResponseMs
+                        });
+                        return CreateFinalTurn("[Model response timeout reached]");
                     }
                     catch (OperationCanceledException)
                     {
@@ -251,7 +319,8 @@ public class Session
                         usage,
                         response.Id,
                         DateTimeOffset.UtcNow,
-                        thinkingParts.Count > 0 ? thinkingParts : null);
+                        thinkingParts.Count > 0 ? thinkingParts : null,
+                        ShouldPersistParts(response.Message.Content) ? new List<ContentPart>(response.Message.Content) : null);
 
                     History.Add(assistantTurn);
 
@@ -437,11 +506,20 @@ public class Session
             switch (turn)
             {
                 case UserTurn userTurn:
-                    messages.Add(Message.UserMsg(userTurn.Content));
+                    if (userTurn.Parts is { Count: > 0 })
+                        messages.Add(new Message(Role.User, new List<ContentPart>(userTurn.Parts)));
+                    else
+                        messages.Add(Message.UserMsg(userTurn.Content));
                     break;
 
                 case AssistantTurn assistantTurn:
                 {
+                    if (assistantTurn.Parts is { Count: > 0 })
+                    {
+                        messages.Add(new Message(Role.Assistant, new List<ContentPart>(assistantTurn.Parts)));
+                        break;
+                    }
+
                     var parts = new List<ContentPart>();
 
                     // Add thinking/reasoning parts if present (preserve signatures for round-trip)
@@ -517,5 +595,13 @@ public class Session
         History.Add(turn);
         State = SessionState.Idle;
         return turn;
+    }
+
+    private static bool ShouldPersistParts(List<ContentPart> parts)
+    {
+        if (parts.Count == 0)
+            return false;
+
+        return parts.Any(p => p.Kind != ContentKind.Text);
     }
 }

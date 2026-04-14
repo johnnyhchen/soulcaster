@@ -41,6 +41,39 @@ public class SessionTests
     }
 
     [Fact]
+    public async Task Session_ProcessInputAsync_AcceptsMultimodalUserMessage()
+    {
+        var provider = new CapturingProvider();
+        var profile = new FakeProfile(provider);
+        var session = new Session(provider, profile, new FakeExecutionEnvironment());
+
+        var result = await session.ProcessInputAsync(Message.UserMsg(
+            ContentPart.TextPart("Use this image"),
+            ContentPart.ImagePart(ImageData.FromBytes(
+                Convert.FromBase64String(UnifiedLlmTestAssets.TestImageBase64),
+                "image/png"))));
+
+        Assert.Equal("captured", result.Content);
+        Assert.NotNull(provider.LastRequest);
+        Assert.Contains(provider.LastRequest!.Messages[1].Content, part => part.Kind == ContentKind.Image);
+    }
+
+    [Fact]
+    public async Task Session_ProcessInputAsync_PreservesAssistantImageParts()
+    {
+        var provider = new ImageReturningProvider();
+        var profile = new FakeProfile(provider);
+        var session = new Session(provider, profile, new FakeExecutionEnvironment());
+
+        var result = await session.ProcessInputAsync("hello");
+
+        Assert.Equal("image ready", result.Content);
+        Assert.Single(result.Images);
+        var assistantTurn = Assert.IsType<AssistantTurn>(session.History.Last());
+        Assert.Single(assistantTurn.Images);
+    }
+
+    [Fact]
     public async Task Session_ReturnsToIdle_AfterProcessing()
     {
         var session = CreateSession();
@@ -89,6 +122,47 @@ public class SessionTests
     }
 
     [Fact]
+    public async Task Session_ExplorationOnlyStall_TerminatesBeforeToolBudgetExhaustion()
+    {
+        var provider = new ExplorationLoopProvider();
+        var session = new Session(
+            provider,
+            new OpenAiProfile(),
+            new FakeExecutionEnvironment(),
+            new SessionConfig(
+                MaxToolRoundsPerInput: 50,
+                MaxConsecutiveExplorationRounds: 3));
+
+        var result = await session.ProcessInputAsync("Inspect the file and fix it.");
+
+        Assert.Contains("Exploration stall detected", result.Content);
+        Assert.Equal(4, provider.RequestCount);
+        Assert.Contains(
+            session.History.OfType<SteeringTurn>(),
+            turn => turn.Content.Contains("only reading or searching files", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Session_ExplorationToolBurst_TerminatesWhenToolCallBudgetIsExceeded()
+    {
+        var provider = new ExplorationLoopProvider(callsPerResponse: 3);
+        var session = new Session(
+            provider,
+            new OpenAiProfile(),
+            new FakeExecutionEnvironment(),
+            new SessionConfig(
+                MaxToolRoundsPerInput: 50,
+                MaxConsecutiveExplorationRounds: 50,
+                MaxConsecutiveExplorationToolCalls: 5));
+
+        var result = await session.ProcessInputAsync("Inspect the file and fix it.");
+
+        Assert.Contains("Exploration stall detected", result.Content);
+        Assert.Contains("tool calls", result.Content);
+        Assert.Equal(3, provider.RequestCount);
+    }
+
+    [Fact]
     public async Task Session_Cancellation_ThrowsOperationCanceled()
     {
         var slowProvider = new SlowProvider();
@@ -103,6 +177,23 @@ public class SessionTests
 
         await Assert.ThrowsAsync<OperationCanceledException>(() =>
             session.ProcessInputAsync("hello", cts.Token));
+    }
+
+    [Fact]
+    public async Task Session_ModelResponseTimeout_ReturnsSentinelTurn()
+    {
+        var slowProvider = new SlowProvider();
+        var profile = new FakeProfile(slowProvider);
+        var session = new Session(
+            slowProvider,
+            profile,
+            new FakeExecutionEnvironment(),
+            new SessionConfig(MaxProviderResponseMs: 50));
+
+        var result = await session.ProcessInputAsync("hello");
+
+        Assert.Contains("Model response timeout reached", result.Content);
+        Assert.Equal(SessionState.Idle, session.State);
     }
 
     [Fact]
@@ -350,6 +441,62 @@ public class LoopDetectionTests
         Assert.False(LoopDetection.DetectLoop(history));
     }
 
+    [Fact]
+    public void CountConsecutiveExplorationOnlyRounds_VaryingArgs_CountsStreak()
+    {
+        var history = new List<ITurn>
+        {
+            new UserTurn("inspect", DateTimeOffset.UtcNow),
+            CreateAssistantTurnWithToolCall("read_file", "{\"path\": \"/a.cs\"}"),
+            new ToolResultsTurn(new List<ToolResultData> { new("1", "content", false) }, DateTimeOffset.UtcNow),
+            CreateAssistantTurnWithToolCall("grep", "{\"pattern\": \"DashboardHtml\", \"path\": \"/repo\"}"),
+            new ToolResultsTurn(new List<ToolResultData> { new("2", "match", false) }, DateTimeOffset.UtcNow),
+            CreateAssistantTurnWithToolCall("read_file", "{\"path\": \"/b.cs\", \"offset\": 200}"),
+            new ToolResultsTurn(new List<ToolResultData> { new("3", "content", false) }, DateTimeOffset.UtcNow)
+        };
+
+        Assert.Equal(3, LoopDetection.CountConsecutiveExplorationOnlyRounds(history));
+    }
+
+    [Fact]
+    public void CountConsecutiveExplorationOnlyToolCalls_SumsBurstAcrossRounds()
+    {
+        var history = new List<ITurn>
+        {
+            new UserTurn("inspect", DateTimeOffset.UtcNow),
+            new AssistantTurn(
+                "",
+                new List<ToolCallData>
+                {
+                    new("1", "read_file", "{\"path\":\"/a\"}", "function"),
+                    new("2", "grep", "{\"pattern\":\"DashboardHtml\"}", "function")
+                },
+                null,
+                Usage.Empty,
+                null,
+                DateTimeOffset.UtcNow),
+            new ToolResultsTurn(new List<ToolResultData>
+            {
+                new("1", "content", false),
+                new("2", "match", false)
+            }, DateTimeOffset.UtcNow),
+            new AssistantTurn(
+                "",
+                new List<ToolCallData>
+                {
+                    new("3", "read_file", "{\"path\":\"/b\"}", "function"),
+                    new("4", "read_file", "{\"path\":\"/c\"}", "function"),
+                    new("5", "grep", "{\"pattern\":\"detail\"}", "function")
+                },
+                null,
+                Usage.Empty,
+                null,
+                DateTimeOffset.UtcNow)
+        };
+
+        Assert.Equal(5, LoopDetection.CountConsecutiveExplorationOnlyToolCalls(history));
+    }
+
     private static AssistantTurn CreateAssistantTurnWithToolCall(string toolName, string args)
     {
         return new AssistantTurn(
@@ -452,9 +599,12 @@ public class SessionConfigTests
         Assert.Equal(0, config.MaxToolRoundsPerInput);
         Assert.Equal(10000, config.DefaultCommandTimeoutMs);
         Assert.Equal(600000, config.MaxCommandTimeoutMs);
+        Assert.Equal(120000, config.MaxProviderResponseMs);
         Assert.True(config.EnableLoopDetection);
         Assert.Equal(10, config.LoopDetectionWindow);
         Assert.Equal(1, config.MaxSubagentDepth);
+        Assert.Equal(12, config.MaxConsecutiveExplorationRounds);
+        Assert.Equal(20, config.MaxConsecutiveExplorationToolCalls);
     }
 }
 
@@ -556,6 +706,50 @@ internal class LoopingProvider : IProviderAdapter
     {
         yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "test" };
         await Task.CompletedTask;
+    }
+}
+
+internal sealed class ExplorationLoopProvider : IProviderAdapter
+{
+    public string Name => "exploration-loop";
+    public int RequestCount { get; private set; }
+    private readonly int _callsPerResponse;
+
+    public ExplorationLoopProvider(int callsPerResponse = 1)
+    {
+        _callsPerResponse = Math.Max(1, callsPerResponse);
+    }
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+    {
+        RequestCount++;
+        var parts = new List<ContentPart> { ContentPart.TextPart("Need a bit more context.") };
+        for (var i = 0; i < _callsPerResponse; i++)
+        {
+            var ordinal = ((RequestCount - 1) * _callsPerResponse) + i + 1;
+            var filePath = $"/fake/workdir/file-{ordinal}.cs";
+            parts.Add(ContentPart.ToolCallPart(new ToolCallData(
+                $"read-{ordinal}",
+                "read_file",
+                $$"""{"file_path":"{{filePath}}","offset":{{ordinal * 20}},"limit":40}""",
+                "function")));
+        }
+
+        return Task.FromResult(new Response(
+            $"explore-{RequestCount}",
+            "model",
+            Name,
+            new Message(Role.Assistant, parts),
+            FinishReason.ToolCalls,
+            Usage.Empty));
+    }
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(
+        Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await Task.CompletedTask;
+        yield break;
     }
 }
 
@@ -1035,6 +1229,32 @@ internal class CapturingProvider : IProviderAdapter
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "test" };
+        await Task.CompletedTask;
+    }
+}
+
+internal class ImageReturningProvider : IProviderAdapter
+{
+    public string Name => "image-returning";
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+    {
+        var message = new Message(Role.Assistant, new List<ContentPart>
+        {
+            ContentPart.TextPart("image ready"),
+            ContentPart.ImagePart(ImageData.FromBytes(
+                Convert.FromBase64String(UnifiedLlmTestAssets.TestImageBase64),
+                "image/png"))
+        });
+
+        return Task.FromResult(new Response("id", "model", Name, message, FinishReason.Stop, Usage.Empty));
+    }
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "image ready" };
+        yield return new StreamEvent { Type = StreamEventType.Finish, FinishReason = FinishReason.Stop };
         await Task.CompletedTask;
     }
 }

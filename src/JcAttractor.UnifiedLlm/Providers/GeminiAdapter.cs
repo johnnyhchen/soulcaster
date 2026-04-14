@@ -147,6 +147,7 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 
         var textAccum = new System.Text.StringBuilder();
         var reasoningAccum = new System.Text.StringBuilder();
+        var images = new List<ImageData>();
         var toolCalls = new List<(string id, string name, string args)>();
         Usage? finalUsage = null;
         bool started = false;
@@ -228,6 +229,11 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                             ToolCall = new ToolCallData(callId, funcName, argsJson)
                         };
                     }
+
+                    var inlineData = part["inlineData"] ?? part["inline_data"];
+                    var imageData = ParseInlineImage(inlineData);
+                    if (imageData is not null)
+                        images.Add(imageData);
                 }
             }
 
@@ -240,6 +246,8 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     parts.Add(ContentPart.ThinkingPart(new ThinkingData(reasoningAccum.ToString(), null, false)));
                 if (textAccum.Length > 0)
                     parts.Add(ContentPart.TextPart(textAccum.ToString()));
+                foreach (var image in images)
+                    parts.Add(ContentPart.ImagePart(image));
                 foreach (var tc in toolCalls)
                     parts.Add(ContentPart.ToolCallPart(new ToolCallData(tc.id, tc.name, tc.args)));
 
@@ -467,6 +475,23 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             hasGenConfig = true;
         }
 
+        if (request.OutputModalities is { Count: > 0 })
+        {
+            var modalities = new JsonArray();
+            foreach (var modality in request.OutputModalities
+                .Distinct()
+                .Select(MapResponseModality))
+            {
+                modalities.Add(modality);
+            }
+
+            if (modalities.Count > 0)
+            {
+                genConfig["responseModalities"] = modalities;
+                hasGenConfig = true;
+            }
+        }
+
         if (hasGenConfig)
             body["generationConfig"] = genConfig;
 
@@ -654,6 +679,10 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     content.Add(ContentPart.ToolCallPart(new ToolCallData(callId, funcName, argsJson)));
                     hasToolCalls = true;
                 }
+
+                var imageData = ParseInlineImage(part["inlineData"] ?? part["inline_data"]);
+                if (imageData is not null)
+                    content.Add(ContentPart.ImagePart(imageData));
             }
         }
 
@@ -704,6 +733,26 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
     {
         var id = Interlocked.Increment(ref _syntheticCallIdCounter);
         return $"gemini_call_{id:D4}";
+    }
+
+    private static string MapResponseModality(ResponseModality modality) => modality switch
+    {
+        ResponseModality.Text => "TEXT",
+        ResponseModality.Image => "IMAGE",
+        _ => "TEXT"
+    };
+
+    private static ImageData? ParseInlineImage(JsonNode? inlineData)
+    {
+        var base64 = inlineData?["data"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(base64))
+            return null;
+
+        var mimeType = inlineData?["mimeType"]?.GetValue<string>()
+            ?? inlineData?["mime_type"]?.GetValue<string>()
+            ?? "image/png";
+
+        return ImageData.FromBytes(Convert.FromBase64String(base64), mimeType);
     }
 
     private HttpRequestMessage CreateModelsRequest(string? nextPageToken)

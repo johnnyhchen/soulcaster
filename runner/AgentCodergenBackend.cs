@@ -148,6 +148,9 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 if (string.IsNullOrWhiteSpace(firstResponse))
                     firstResponse = finalResponse;
 
+                if (IsTerminalSessionSentinel(finalResponse))
+                    break;
+
                 if (StageStatusContract.TryParseAssistantResponse(finalResponse, out parsedStatus, out parseError))
                 {
                     if (parsedStatus?.BlockingQuestion is not null &&
@@ -284,9 +287,10 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         var env = new LocalExecutionEnvironment(_projectRoot);
         var sessionConfig = new SessionConfig(
             MaxTurns: 200,
-            MaxToolRoundsPerInput: 300,
+            MaxToolRoundsPerInput: 120,
             DefaultCommandTimeoutMs: 30_000,
             MaxCommandTimeoutMs: 600_000,
+            MaxProviderResponseMs: 90_000,
             ReasoningEffort: reasoningEffort);
 
         var session = new Session(adapter, profile, env, sessionConfig);
@@ -692,12 +696,23 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
     {
         if (response.StartsWith("[Error:", StringComparison.Ordinal) ||
             response.StartsWith("[Turn limit reached]", StringComparison.Ordinal) ||
-            response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal))
+            response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal) ||
+            response.StartsWith("[Model response timeout reached]", StringComparison.Ordinal) ||
+            response.StartsWith("[Exploration stall detected", StringComparison.Ordinal))
         {
             return OutcomeStatus.Retry;
         }
 
         return OutcomeStatus.Success;
+    }
+
+    private static bool IsTerminalSessionSentinel(string response)
+    {
+        return response.StartsWith("[Error:", StringComparison.Ordinal) ||
+               response.StartsWith("[Turn limit reached]", StringComparison.Ordinal) ||
+               response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal) ||
+               response.StartsWith("[Model response timeout reached]", StringComparison.Ordinal) ||
+               response.StartsWith("[Exploration stall detected", StringComparison.Ordinal);
     }
 
     private static RuntimeHints ParseRuntimeHints(string prompt)

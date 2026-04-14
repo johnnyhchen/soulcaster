@@ -77,4 +77,13 @@ public record Response(
             return parts.Count > 0 ? string.Concat(parts) : null;
         }
     }
+
+    /// <summary>
+    /// Image parts returned by the response message.
+    /// </summary>
+    public List<ImageData> Images =>
+        Message.Content
+            .Where(p => p.Kind == ContentKind.Image && p.Image is not null)
+            .Select(p => p.Image!)
+            .ToList();
 }
