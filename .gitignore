@@ -9,4 +9,4 @@ qa-results/
 logs/
 .claude/ralph-loop.local.md
 .claude/plans/
-
+.playwright-mcp/

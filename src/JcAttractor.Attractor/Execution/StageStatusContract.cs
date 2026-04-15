@@ -71,10 +71,28 @@ public sealed record StageStatusContract(
                 },
             ["model"] = model,
             ["provider"] = provider,
-            ["contract_validated"] = true,
+            ["contract_validated"] = !usedFallback,
             ["used_fallback"] = usedFallback,
             ["validation_error"] = validationError
         };
+    }
+
+    public static string ResolveContractState(bool usedFallback, string? reason = null)
+    {
+        if (!usedFallback)
+            return "validated";
+
+        if (string.IsNullOrWhiteSpace(reason))
+            return "fallback";
+
+        var normalized = reason.Trim().ToLowerInvariant();
+        if (normalized.Contains("missing", StringComparison.Ordinal) ||
+            normalized.Contains("empty", StringComparison.Ordinal))
+        {
+            return "missing";
+        }
+
+        return "invalid";
     }
 
     public static bool TryParseAssistantResponse(string text, out StageStatusContract? status, out string error)

@@ -148,7 +148,7 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         var textAccum = new System.Text.StringBuilder();
         var reasoningAccum = new System.Text.StringBuilder();
         var images = new List<ImageData>();
-        var toolCalls = new List<(string id, string name, string args)>();
+        var toolCalls = new List<(string id, string name, string args, string? signature)>();
         Usage? finalUsage = null;
         bool started = false;
 
@@ -215,18 +215,19 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     {
                         var funcName = funcCall["name"]?.GetValue<string>() ?? "";
                         var argsJson = funcCall["args"]?.ToJsonString() ?? "{}";
-                        var callId = GenerateSyntheticCallId();
-                        toolCalls.Add((callId, funcName, argsJson));
+                        var callId = funcCall["id"]?.GetValue<string>() ?? GenerateSyntheticCallId();
+                        var signature = ParseThoughtSignature(part);
+                        toolCalls.Add((callId, funcName, argsJson, signature));
 
                         yield return new StreamEvent
                         {
                             Type = StreamEventType.ToolCallStart,
-                            ToolCall = new ToolCallData(callId, funcName, argsJson)
+                            ToolCall = new ToolCallData(callId, funcName, argsJson, Signature: signature)
                         };
                         yield return new StreamEvent
                         {
                             Type = StreamEventType.ToolCallEnd,
-                            ToolCall = new ToolCallData(callId, funcName, argsJson)
+                            ToolCall = new ToolCallData(callId, funcName, argsJson, Signature: signature)
                         };
                     }
 
@@ -249,7 +250,7 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                 foreach (var image in images)
                     parts.Add(ContentPart.ImagePart(image));
                 foreach (var tc in toolCalls)
-                    parts.Add(ContentPart.ToolCallPart(new ToolCallData(tc.id, tc.name, tc.args)));
+                    parts.Add(ContentPart.ToolCallPart(new ToolCallData(tc.id, tc.name, tc.args, Signature: tc.signature)));
 
                 var fr = MapFinishReason(finishReasonStr, toolCalls.Count > 0);
                 var msg = new Message(Role.Assistant, parts.Count > 0 ? parts : [ContentPart.TextPart("")]);
@@ -308,6 +309,7 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 
         // Contents (conversation messages)
         var contents = new JsonArray();
+        var toolNamesById = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var msg in conversationMessages)
         {
             var geminiRole = msg.Role switch
@@ -331,11 +333,14 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                         try { responseContent = JsonNode.Parse(part.ToolResult.Content); }
                         catch { responseContent = new JsonObject { ["result"] = part.ToolResult.Content }; }
 
+                        var toolName = ResolveToolName(part.ToolResult.ToolCallId, toolNamesById);
+
                         parts.Add(new JsonObject
                         {
                             ["functionResponse"] = new JsonObject
                             {
-                                ["name"] = part.ToolResult.ToolCallId, // Gemini uses the function name, but we map from call ID
+                                ["name"] = toolName,
+                                ["id"] = part.ToolResult.ToolCallId,
                                 ["response"] = responseContent
                             }
                         });
@@ -382,22 +387,32 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                             try { argsNode = JsonNode.Parse(part.ToolCall.Arguments); }
                             catch { argsNode = new JsonObject(); }
 
-                            parts.Add(new JsonObject
+                            var toolCallPart = new JsonObject
                             {
                                 ["functionCall"] = new JsonObject
                                 {
+                                    ["id"] = part.ToolCall.Id,
                                     ["name"] = part.ToolCall.Name,
                                     ["args"] = argsNode
                                 }
-                            });
+                            };
+                            var signature = part.ToolCall.Signature;
+                            if (!string.IsNullOrWhiteSpace(signature))
+                                toolCallPart["thoughtSignature"] = signature;
+
+                            parts.Add(toolCallPart);
+                            toolNamesById[part.ToolCall.Id] = part.ToolCall.Name;
                             break;
 
                         case ContentKind.Thinking when part.Thinking is not null:
-                            parts.Add(new JsonObject
+                            var thinkingPart = new JsonObject
                             {
                                 ["text"] = part.Thinking.Text,
                                 ["thought"] = true
-                            });
+                            };
+                            if (!string.IsNullOrWhiteSpace(part.Thinking.Signature))
+                                thinkingPart["thoughtSignature"] = part.Thinking.Signature;
+                            parts.Add(thinkingPart);
                             break;
                     }
                 }
@@ -663,8 +678,9 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                 if (text is not null)
                 {
                     var isThought = part["thought"]?.GetValue<bool>() ?? false;
+                    var signature = ParseThoughtSignature(part);
                     if (isThought)
-                        content.Add(ContentPart.ThinkingPart(new ThinkingData(text, null, false)));
+                        content.Add(ContentPart.ThinkingPart(new ThinkingData(text, signature, false)));
                     else
                         content.Add(ContentPart.TextPart(text));
                 }
@@ -675,8 +691,9 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                 {
                     var funcName = funcCall["name"]?.GetValue<string>() ?? "";
                     var argsJson = funcCall["args"]?.ToJsonString() ?? "{}";
-                    var callId = GenerateSyntheticCallId();
-                    content.Add(ContentPart.ToolCallPart(new ToolCallData(callId, funcName, argsJson)));
+                    var callId = funcCall["id"]?.GetValue<string>() ?? GenerateSyntheticCallId();
+                    var signature = ParseThoughtSignature(part);
+                    content.Add(ContentPart.ToolCallPart(new ToolCallData(callId, funcName, argsJson, Signature: signature)));
                     hasToolCalls = true;
                 }
 
@@ -728,6 +745,15 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             ReasoningTokens: thoughts is > 0 ? thoughts : null,
             CacheReadTokens: cached is > 0 ? cached : null);
     }
+
+    private static string? ParseThoughtSignature(JsonNode? part) =>
+        part?["thoughtSignature"]?.GetValue<string>()
+        ?? part?["thought_signature"]?.GetValue<string>();
+
+    private static string ResolveToolName(string toolCallId, IReadOnlyDictionary<string, string> toolNamesById) =>
+        toolNamesById.TryGetValue(toolCallId, out var toolName) && !string.IsNullOrWhiteSpace(toolName)
+            ? toolName
+            : toolCallId;
 
     private string GenerateSyntheticCallId()
     {

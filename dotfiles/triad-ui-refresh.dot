@@ -1,0 +1,22 @@
+digraph attractor_run {
+    goal = "Generate and evaluate a focused UI/UX refresh direction for Triad before implementation."
+    label = "Triad UI Refresh"
+    node [shape=parallelogram]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    ideate [
+        label="Gemini ideation",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/triad_ui_ideate.sh /Users/Johnny.Chen/triad /Users/Johnny.Chen/triad/triad-baseline-before-soulcaster.png /tmp/triad-ui-refresh"
+    ]
+
+    evaluate [
+        label="Opus evaluation",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/triad_ui_evaluate.sh /Users/Johnny.Chen/triad /Users/Johnny.Chen/triad/triad-baseline-before-soulcaster.png /tmp/triad-ui-refresh"
+    ]
+
+    start -> ideate
+    ideate -> evaluate
+    evaluate -> exit
+}

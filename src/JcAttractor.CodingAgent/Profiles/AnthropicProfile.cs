@@ -98,6 +98,8 @@ public class AnthropicProfile : IProviderProfile
                 return await env.RunCommandAsync(command, timeout);
             }));
 
+        ValidationTools.Register(ToolRegistry);
+
         ToolRegistry.Register(new RegisteredTool(
             "glob",
             new ToolDefinition(
@@ -161,6 +163,7 @@ public class AnthropicProfile : IProviderProfile
         sb.AppendLine("- Use edit_file for precise modifications with old_string/new_string replacement.");
         sb.AppendLine("- Use write_file only when creating new files or replacing entire file content.");
         sb.AppendLine("- Use bash for running build tools, tests, git commands, and other CLI operations.");
+        sb.AppendLine("- Use queue_validation_check to register authoritative final validation checks.");
         sb.AppendLine("- Use glob to find files by name pattern.");
         sb.AppendLine("- Use grep to search file contents for code patterns.");
         sb.AppendLine("- Always use absolute file paths.");

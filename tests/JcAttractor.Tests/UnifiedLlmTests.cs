@@ -864,6 +864,93 @@ public class T13_ProviderOptionsPassThroughTests
         Assert.NotNull(body);
         Assert.True(body!.ContainsKey("customSetting"));
     }
+
+    [Fact]
+    public void GeminiAdapter_PreservesFunctionCallIdsAndSignatures_InRequestBody()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gemini-3-flash-preview",
+            Messages = new List<Message>
+            {
+                Message.UserMsg("Create the file."),
+                new Message(Role.Assistant, new List<ContentPart>
+                {
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "call-123",
+                        "write_file",
+                        "{\"path\":\"demo.txt\",\"content\":\"hello\"}",
+                        Signature: "sig-abc"))
+                }),
+                Message.ToolResultMsg("call-123", "{\"ok\":true}", false)
+            }
+        };
+
+        var method = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var contents = body!["contents"]!.AsArray();
+        Assert.Equal(3, contents.Count);
+
+        var assistantPart = contents[1]!["parts"]![0]!;
+        Assert.Equal("call-123", assistantPart["functionCall"]!["id"]!.GetValue<string>());
+        Assert.Equal("write_file", assistantPart["functionCall"]!["name"]!.GetValue<string>());
+        Assert.Equal("sig-abc", assistantPart["thoughtSignature"]!.GetValue<string>());
+
+        var toolResponse = contents[2]!["parts"]![0]!["functionResponse"]!;
+        Assert.Equal("call-123", toolResponse["id"]!.GetValue<string>());
+        Assert.Equal("write_file", toolResponse["name"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void GeminiAdapter_ParsesFunctionCallIdsAndSignatures_FromResponse()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var responseBody = """
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      {
+                        "functionCall": {
+                          "id": "call-123",
+                          "name": "write_file",
+                          "args": {
+                            "path": "demo.txt",
+                            "content": "hello"
+                          }
+                        },
+                        "thoughtSignature": "sig-abc"
+                      }
+                    ]
+                  },
+                  "finishReason": "STOP"
+                }
+              ],
+              "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+              }
+            }
+            """;
+
+        var method = typeof(GeminiAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var response = method!.Invoke(adapter, new object[] { responseBody, "gemini-3-flash-preview" }) as Response;
+        Assert.NotNull(response);
+        Assert.Single(response!.ToolCalls);
+        Assert.Equal("call-123", response.ToolCalls[0].Id);
+        Assert.Equal("write_file", response.ToolCalls[0].Name);
+        Assert.Equal("sig-abc", response.ToolCalls[0].Signature);
+    }
 }
 
 public class T14_MultimodalAdapterTests

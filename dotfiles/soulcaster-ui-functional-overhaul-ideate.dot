@@ -1,0 +1,29 @@
+digraph attractor_run {
+    goal = "Research Soulcaster functionality and generate a consensus-approved dashboard overhaul direction."
+    label = "Soulcaster UI Functional Overhaul Ideation"
+    node [shape=parallelogram]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    research [
+        label="Opus functionality research",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_functionality_research.sh /Users/Johnny.Chen/soulcaster /tmp/soulcaster-ui-functional-overhaul"
+    ]
+
+    ideate [
+        label="Gemini triptych ideation",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_functional_ideate.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/soulcaster-webui-functionality-baseline.png /Users/Johnny.Chen/soulcaster/soulcaster-webui-functionality-detail.png /tmp/soulcaster-ui-functional-overhaul"
+    ]
+
+    consensus_gate [
+        label="Opus + GPT-5.4 consensus gate",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_functional_consensus.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/soulcaster-webui-functionality-baseline.png /Users/Johnny.Chen/soulcaster/soulcaster-webui-functionality-detail.png /tmp/soulcaster-ui-functional-overhaul"
+    ]
+
+    start -> research
+    research -> ideate
+    ideate -> consensus_gate
+    consensus_gate -> ideate [condition="outcome=fail", label="Revise"]
+    consensus_gate -> exit [condition="outcome=success", label="Accept"]
+}

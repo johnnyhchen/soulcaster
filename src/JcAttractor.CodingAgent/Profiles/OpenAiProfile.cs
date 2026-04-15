@@ -94,6 +94,8 @@ public class OpenAiProfile : IProviderProfile
                 return await env.RunCommandAsync(command, timeout);
             }));
 
+        ValidationTools.Register(ToolRegistry);
+
         ToolRegistry.Register(new RegisteredTool(
             "glob",
             new ToolDefinition(
@@ -260,6 +262,7 @@ public class OpenAiProfile : IProviderProfile
         sb.AppendLine("- Use apply_patch with v4a unified diff format for targeted code changes.");
         sb.AppendLine("- Use write_file for creating new files or full file rewrites.");
         sb.AppendLine("- Use shell for running build tools, tests, git, and CLI operations.");
+        sb.AppendLine("- Use queue_validation_check to register authoritative final validation checks.");
         sb.AppendLine("- Use glob to find files by name patterns.");
         sb.AppendLine("- Use grep to search file contents.");
         sb.AppendLine("- Always use absolute file paths.");

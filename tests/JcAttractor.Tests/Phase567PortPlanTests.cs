@@ -378,7 +378,8 @@ public class QueueParallelismTests
             string? model = null,
             string? provider = null,
             string? reasoningEffort = null,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
         {
             var status = prompt.Contains("bad-item", StringComparison.OrdinalIgnoreCase)
                 ? OutcomeStatus.Fail
@@ -400,7 +401,8 @@ public class QueueParallelismTests
             string? model = null,
             string? provider = null,
             string? reasoningEffort = null,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
         {
             var nodeId = ExtractNodeId(prompt);
             _callCounts[nodeId] = _callCounts.GetValueOrDefault(nodeId) + 1;
@@ -672,7 +674,8 @@ public class TelemetryDrivenSupervisorTests
             string? model = null,
             string? provider = null,
             string? reasoningEffort = null,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
         {
             CallCount++;
             return Task.FromResult(new CodergenResult(

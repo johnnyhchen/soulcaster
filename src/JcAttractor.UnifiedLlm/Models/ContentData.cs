@@ -58,7 +58,8 @@ public record ToolCallData(
     string Id,
     string Name,
     string Arguments,
-    string Type = "function");
+    string Type = "function",
+    string? Signature = null);
 
 public record ToolResultData(
     string ToolCallId,

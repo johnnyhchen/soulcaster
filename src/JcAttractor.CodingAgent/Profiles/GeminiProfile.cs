@@ -98,6 +98,8 @@ public class GeminiProfile : IProviderProfile
                 return await env.RunCommandAsync(command, timeout);
             }));
 
+        ValidationTools.Register(ToolRegistry);
+
         ToolRegistry.Register(new RegisteredTool(
             "glob",
             new ToolDefinition(
@@ -196,6 +198,7 @@ public class GeminiProfile : IProviderProfile
         sb.AppendLine("- Use edit_file for exact string replacement edits.");
         sb.AppendLine("- Use write_file for creating new files or complete file rewrites.");
         sb.AppendLine("- Use shell for running commands, build tools, tests, and git.");
+        sb.AppendLine("- Use queue_validation_check to register authoritative final validation checks.");
         sb.AppendLine("- Use glob to find files matching name patterns.");
         sb.AppendLine("- Use grep to search file contents with regex.");
         sb.AppendLine("- Always use absolute file paths.");

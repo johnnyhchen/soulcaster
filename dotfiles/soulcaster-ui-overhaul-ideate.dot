@@ -1,0 +1,23 @@
+digraph attractor_run {
+    goal = "Generate and consensus-evaluate a stronger Soulcaster dashboard overhaul proposal before implementation."
+    label = "Soulcaster UI Overhaul Ideation"
+    node [shape=parallelogram]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    ideate [
+        label="Gemini UI ideation",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_ideate_sdk.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/soulcaster-webui-overhaul-baseline.png /tmp/soulcaster-ui-overhaul"
+    ]
+
+    consensus_gate [
+        label="Opus + GPT-5.4 consensus gate",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_consensus_gate.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/soulcaster-webui-overhaul-baseline.png /tmp/soulcaster-ui-overhaul"
+    ]
+
+    start -> ideate
+    ideate -> consensus_gate
+    consensus_gate -> ideate [condition="outcome=fail", label="Revise"]
+    consensus_gate -> exit [condition="outcome=success", label="Accept"]
+}

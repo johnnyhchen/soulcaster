@@ -1,0 +1,48 @@
+digraph attractor_run {
+    goal = "Implement the accepted Soulcaster dashboard overhaul proposal in runner/Program.cs."
+    label = "Soulcaster UI Overhaul Implement"
+    default_max_retry = 1
+
+    model_stylesheet = "
+        * { provider = \"openai\"; model = \"gpt-5.4\"; reasoning_effort = \"xhigh\" }
+    "
+
+    node [shape=box, timeout="3600s"]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    implement [
+        label="Implement accepted overhaul",
+        prompt="Read the accepted UI overhaul brief at /tmp/soulcaster-ui-overhaul/accepted-proposal.md.
+Also read the consensus evaluation at /tmp/soulcaster-ui-overhaul/evaluation.md and incorporate any required changes that accompany the ACCEPT verdict.
+
+Read /Users/Johnny.Chen/soulcaster/runner/Program.cs and focus on DashboardHtml().
+
+Implement the accepted overhaul with these constraints:
+1. Preserve the current workflow, queue, pipeline list, detail view, graph, telemetry, gates, and artifacts.
+2. Keep the work centered in runner/Program.cs unless a tiny presentation hook is clearly necessary.
+3. Make the interface materially more intentional and distinctive than the current version. Improve hierarchy, spacing rhythm, state treatment, and detail-panel presence.
+4. Keep the dashboard fully usable on desktop and narrower widths. Use a decisive mobile fallback, not an ambiguous one.
+5. Do not regress clickability or hide existing information. Preserve queue/detail gate answering, phase-summary links, markdown modal viewing, and a fallback area for artifacts that do not map cleanly to a node.
+6. Ensure the header attention stack has a clear max-height/internal scroll treatment so large queues do not consume the viewport.
+7. Lock the detail order to Graph, Execution with nested node context, Stage Metrics if present, then Gates.
+
+After making changes:
+- Run dotnet build /Users/Johnny.Chen/soulcaster/runner/Runner.csproj
+- Write logs/ui_overhaul_implement/IMPLEMENTATION-1.md summarizing the design changes, files modified, and build result
+
+Return success only if the build passes and the accepted overhaul has been implemented."
+    ]
+
+    validate_build [
+        shape=parallelogram,
+        label="Validate build",
+        tool_command="cd /Users/Johnny.Chen/soulcaster && dotnet build runner/Runner.csproj"
+    ]
+
+    start -> implement
+    implement -> validate_build
+    validate_build -> implement [condition="outcome=fail", label="Fix build"]
+    validate_build -> exit [condition="outcome=success", label="Built"]
+}

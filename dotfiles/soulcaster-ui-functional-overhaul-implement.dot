@@ -1,0 +1,50 @@
+digraph attractor_run {
+    goal = "Implement the accepted Soulcaster dashboard overhaul proposal in runner/Program.cs."
+    label = "Soulcaster UI Functional Overhaul Implement"
+    default_max_retry = 1
+
+    model_stylesheet = "
+        * { provider = \"openai\"; model = \"gpt-5.4\"; reasoning_effort = \"xhigh\" }
+    "
+
+    node [shape=box, timeout="3600s"]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    implement [
+        label="Implement accepted overhaul",
+        prompt="Read the research brief at /tmp/soulcaster-ui-functional-overhaul/research.md.
+Read the accepted proposal at /tmp/soulcaster-ui-functional-overhaul/accepted-proposal.md.
+Read the consensus evaluation at /tmp/soulcaster-ui-functional-overhaul/evaluation.md.
+
+Read /Users/Johnny.Chen/soulcaster/runner/Program.cs and focus on DashboardHtml().
+
+Implement the accepted overhaul with these constraints:
+1. Preserve Soulcaster's actual workflow: attention queue, pipeline list, expandable detail panel, graph, telemetry, gates, artifacts, phase summaries, markdown viewing, and gate actions.
+2. Keep the implementation centered in runner/Program.cs unless a tiny presentation hook is clearly necessary.
+3. Land the accepted visual direction, hierarchy, and user-journey improvements rather than a minimal restyle.
+4. Make overview and expanded detail feel like one coherent product surface.
+5. Use a decisive mobile fallback.
+6. Preserve clickability and do not hide existing information.
+7. Keep detail ordering aligned with the accepted brief.
+8. Avoid exploratory churn. Read only what you need, then edit DashboardHtml decisively.
+
+After making changes:
+- Run dotnet build /Users/Johnny.Chen/soulcaster/runner/Runner.csproj
+- Write logs/ui_functional_overhaul_implement/IMPLEMENTATION-1.md summarizing the changes and build result
+
+Return success only if the build passes and the accepted overhaul has been implemented."
+    ]
+
+    validate_build [
+        shape=parallelogram,
+        label="Validate build",
+        tool_command="cd /Users/Johnny.Chen/soulcaster && dotnet build runner/Runner.csproj"
+    ]
+
+    start -> implement
+    implement -> validate_build
+    validate_build -> implement [condition="outcome=fail", label="Fix build"]
+    validate_build -> exit [condition="outcome=success", label="Built"]
+}

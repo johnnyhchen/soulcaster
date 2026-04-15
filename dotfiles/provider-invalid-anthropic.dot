@@ -1,0 +1,17 @@
+digraph provider_invalid_anthropic {
+    graph [goal="Validate codergen failure classification with an invalid Anthropic model"]
+
+    start [shape=Mdiamond]
+    validate [
+        shape=box,
+        provider="anthropic",
+        model="claude-does-not-exist",
+        reasoning_effort="medium",
+        timeout="60s",
+        prompt="Return valid stage status JSON."
+    ]
+    done [shape=Msquare]
+
+    start -> validate
+    validate -> done
+}

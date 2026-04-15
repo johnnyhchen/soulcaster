@@ -13,6 +13,7 @@ public class Session
     public SessionConfig Config { get; }
     public SessionState State { get; private set; } = SessionState.Idle;
     public IProviderAdapter LlmClient { get; }
+    public Exception? LastError { get; private set; }
 
     private readonly Queue<string> _steeringQueue = new();
     private readonly Queue<string> _followUpQueue = new();
@@ -138,6 +139,7 @@ public class Session
                 throw new InvalidOperationException("Session is closed.");
 
             State = SessionState.Processing;
+            LastError = null;
 
             await EventEmitter.EmitAsync(EventKind.UserInput, new Dictionary<string, object?>
             {
@@ -268,6 +270,7 @@ public class Session
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested && Config.MaxProviderResponseMs > 0)
                     {
+                        LastError = new TimeoutException("Model response timeout reached.");
                         await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
                         {
                             ["error"] = "Model response timeout reached.",
@@ -281,6 +284,7 @@ public class Session
                     }
                     catch (Exception ex)
                     {
+                        LastError = ex;
                         await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
                         {
                             ["error"] = ex.Message,
@@ -354,6 +358,7 @@ public class Session
             }
             catch (Exception ex)
             {
+                LastError = ex;
                 await EventEmitter.EmitAsync(EventKind.Error, new Dictionary<string, object?>
                 {
                     ["error"] = ex.Message,

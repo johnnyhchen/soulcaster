@@ -1,0 +1,45 @@
+digraph attractor_run {
+    goal = "Implement the accepted Soulcaster WebUI refresh proposal in the dashboard served from runner/Program.cs."
+    label = "Soulcaster WebUI Implement"
+    default_max_retry = 1
+
+    model_stylesheet = "
+        * { provider = \"openai\"; model = \"gpt-5.3-codex\"; reasoning_effort = \"high\" }
+    "
+
+    node [shape=box, timeout="2400s"]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    implement [
+        label="Implement dashboard refresh",
+        prompt="Read the accepted UI refresh brief at /tmp/soulcaster-ui-refresh/accepted-proposal.md.
+
+Read /Users/Johnny.Chen/soulcaster/runner/Program.cs and focus on the DashboardHtml() markup, styles, and client-side behavior.
+
+Implement the accepted UI refresh with these constraints:
+1. Preserve the existing dashboard workflow, queue, pipeline list, detail view, graph panel, telemetry, gates, artifacts, and current API usage.
+2. Keep the implementation centered in runner/Program.cs. Avoid backend/API changes unless a tiny presentation hook is clearly necessary.
+3. Make the visual direction more intentional and easier to scan: stronger hierarchy, better spacing rhythm, stronger selected states, clearer badges, clearer cards, better error/empty styling, and improved responsiveness.
+4. Keep the UI functional on both desktop and narrower widths.
+5. Do not remove capabilities already present in the dashboard.
+
+After making the changes:
+- Run dotnet build /Users/Johnny.Chen/soulcaster/runner/Runner.csproj
+- Write logs/ui_refresh_implement/IMPLEMENTATION-1.md summarizing the UX changes, files modified, and build result
+
+Return success only if the build passes and the accepted proposal has been implemented."
+    ]
+
+    validate_build [
+        shape=parallelogram,
+        label="Validate build",
+        tool_command="cd /Users/Johnny.Chen/soulcaster && dotnet build runner/Runner.csproj"
+    ]
+
+    start -> implement
+    implement -> validate_build
+    validate_build -> implement [condition="outcome=fail", label="Fix build"]
+    validate_build -> exit      [condition="outcome=success", label="Built"]
+}

@@ -219,23 +219,26 @@ public class PipelineEngine
             nodeOutcomes[currentNodeId] = outcome;
             MergeParallelBranchResults(completedNodes, nodeOutcomes, outcome);
             var stageDurationMs = (long)Math.Max(0, (DateTimeOffset.UtcNow - stageStartUtc).TotalMilliseconds);
-            var stageEndData = new Dictionary<string, object?>
+
+            async Task PersistStageOutcomeAsync(Outcome persistedOutcome)
             {
-                ["status"] = StageStatusContract.ToStatusString(outcome.Status),
-                ["preferred_next_label"] = outcome.PreferredLabel,
-                ["notes"] = outcome.Notes,
-                ["duration_ms"] = stageDurationMs
-            };
-            MergeTelemetry(stageEndData, outcome.Telemetry);
+                var stageEndData = new Dictionary<string, object?>
+                {
+                    ["status"] = StageStatusContract.ToStatusString(persistedOutcome.Status),
+                    ["preferred_next_label"] = persistedOutcome.PreferredLabel,
+                    ["notes"] = persistedOutcome.Notes,
+                    ["duration_ms"] = stageDurationMs
+                };
+                MergeTelemetry(stageEndData, persistedOutcome.Telemetry);
 
-            await WriteTelemetryEventAsync(
-                eventType: "stage_end",
-                nodeId: currentNodeId,
-                data: stageEndData,
-                ct: ct);
+                await WriteTelemetryEventAsync(
+                    eventType: "stage_end",
+                    nodeId: currentNodeId,
+                    data: stageEndData,
+                    ct: ct);
 
-            // Write status.json for this node
-            await WriteNodeStatusAsync(currentNodeId, outcome, ct);
+                await WriteNodeStatusAsync(currentNodeId, persistedOutcome, ct);
+            }
 
             // Handle retry logic
             if (outcome.Status == OutcomeStatus.Retry || outcome.Status == OutcomeStatus.Fail)
@@ -253,6 +256,8 @@ public class PipelineEngine
                     string retryTarget = !string.IsNullOrEmpty(currentNode.RetryTarget) ? currentNode.RetryTarget
                         : !string.IsNullOrEmpty(graph.RetryTarget) ? graph.RetryTarget
                         : currentNodeId;
+
+                    await PersistStageOutcomeAsync(outcome);
 
                     // Apply backoff delay
                     await ApplyBackoffAsync(currentRetryCount, ct);
@@ -275,16 +280,24 @@ public class PipelineEngine
                 }
 
                 // Max retries exceeded or no retries configured
-                // Convert exhausted RETRY to FAIL
-                if (outcome.Status == OutcomeStatus.Retry && currentRetryCount >= maxRetries && maxRetries > 0)
+                // Convert exhausted or unconfigured RETRY to a terminal status before routing.
+                if (outcome.Status == OutcomeStatus.Retry)
                 {
                     if (currentNode.AllowPartial)
                     {
-                        outcome = outcome with { Status = OutcomeStatus.PartialSuccess, Notes = "Retries exhausted, partial accepted" };
+                        outcome = outcome with
+                        {
+                            Status = OutcomeStatus.PartialSuccess,
+                            Notes = currentRetryCount > 0 ? "Retries exhausted, partial accepted" : "Retry unavailable, partial accepted"
+                        };
                     }
                     else
                     {
-                        outcome = outcome with { Status = OutcomeStatus.Fail, Notes = "Max retries exceeded" };
+                        outcome = outcome with
+                        {
+                            Status = OutcomeStatus.Fail,
+                            Notes = currentRetryCount > 0 ? "Max retries exceeded" : "Retry requested but no retry budget is configured"
+                        };
                     }
                     nodeOutcomes[currentNodeId] = outcome;
                 }
@@ -297,6 +310,7 @@ public class PipelineEngine
                 if (fallbackTarget != null && graph.Nodes.ContainsKey(fallbackTarget))
                 {
                     retryCounts[currentNodeId] = 0; // Reset retry count
+                    await PersistStageOutcomeAsync(outcome);
                     await SaveCheckpointAsync(currentNodeId, fallbackTarget, selectedEdge: null, completedNodes, context, retryCounts, ct);
                     currentNodeId = fallbackTarget;
                     incomingEdge = null;
@@ -328,6 +342,7 @@ public class PipelineEngine
                     // Step 2: Check retry_target
                     else if (!string.IsNullOrEmpty(currentNode.RetryTarget) && graph.Nodes.ContainsKey(currentNode.RetryTarget))
                     {
+                        await PersistStageOutcomeAsync(outcome);
                         currentNodeId = currentNode.RetryTarget;
                         incomingEdge = null;
                         continue;
@@ -335,18 +350,21 @@ public class PipelineEngine
                     // Step 3: Check fallback_retry_target (node then graph)
                     else if (!string.IsNullOrEmpty(currentNode.FallbackRetryTarget) && graph.Nodes.ContainsKey(currentNode.FallbackRetryTarget))
                     {
+                        await PersistStageOutcomeAsync(outcome);
                         currentNodeId = currentNode.FallbackRetryTarget;
                         incomingEdge = null;
                         continue;
                     }
                     else if (!string.IsNullOrEmpty(graph.RetryTarget) && graph.Nodes.ContainsKey(graph.RetryTarget))
                     {
+                        await PersistStageOutcomeAsync(outcome);
                         currentNodeId = graph.RetryTarget;
                         incomingEdge = null;
                         continue;
                     }
                     else if (!string.IsNullOrEmpty(graph.FallbackRetryTarget) && graph.Nodes.ContainsKey(graph.FallbackRetryTarget))
                     {
+                        await PersistStageOutcomeAsync(outcome);
                         currentNodeId = graph.FallbackRetryTarget;
                         incomingEdge = null;
                         continue;
@@ -354,6 +372,7 @@ public class PipelineEngine
                     else
                     {
                         // Step 4: Pipeline termination
+                        await PersistStageOutcomeAsync(outcome);
                         completedNodes.Add(currentNodeId);
                         await SaveCheckpointAsync(currentNodeId, currentNodeId, selectedEdge: null, completedNodes, context, retryCounts, ct);
 
@@ -367,6 +386,7 @@ public class PipelineEngine
                 }
             }
 
+            await PersistStageOutcomeAsync(outcome);
             completedNodes.Add(currentNodeId);
 
             var directNextNode = TryResolveDirectNextNode(outcome, graph);
@@ -490,7 +510,7 @@ public class PipelineEngine
     private async Task<Outcome> ExecuteWithTimeoutAsync(
         INodeHandler handler, GraphNode node, PipelineContext context, Graph graph, CancellationToken ct)
     {
-        if (!string.IsNullOrEmpty(node.Timeout) && TimeSpan.TryParse(node.Timeout, out var timeout))
+        if (RuntimeDurationParser.TryParseTimeout(node.Timeout, out var timeout))
         {
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(timeout);
@@ -501,7 +521,14 @@ public class PipelineEngine
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                return new Outcome(OutcomeStatus.Retry, Notes: $"Node '{node.Id}' timed out after {timeout}.");
+                return new Outcome(
+                    OutcomeStatus.Fail,
+                    Notes: $"Node '{node.Id}' timed out after {timeout}.",
+                    Telemetry: new Dictionary<string, object?>
+                    {
+                        ["provider_state"] = "timeout",
+                        ["failure_kind"] = "timeout"
+                    });
             }
         }
 
@@ -515,8 +542,22 @@ public class PipelineEngine
             string stageDir = Path.Combine(_config.LogsRoot, nodeId);
             Directory.CreateDirectory(stageDir);
             var statusPath = Path.Combine(stageDir, "status.json");
+            var statusData = new Dictionary<string, object?>
+            {
+                ["node_id"] = nodeId,
+                ["status"] = StageStatusContract.ToStatusString(outcome.Status),
+                ["preferred_next_label"] = outcome.PreferredLabel,
+                ["notes"] = outcome.Notes,
+                ["provider_state"] = ResolveProviderState(outcome),
+                ["contract_state"] = "missing",
+                ["edit_state"] = ResolveEditState(outcome.Telemetry),
+                ["verification_state"] = "not_required",
+                ["advance_allowed"] = outcome.Status == OutcomeStatus.Success || outcome.Status == OutcomeStatus.PartialSuccess
+            };
 
-            // If a handler already wrote a validated contract status, keep it canonical.
+            if (TryGetString(outcome.Telemetry, "failure_kind", out var failureKind))
+                statusData["failure_kind"] = failureKind;
+
             if (File.Exists(statusPath))
             {
                 try
@@ -528,6 +569,23 @@ public class PipelineEngine
                     {
                         return;
                     }
+
+                    var existingData = JsonSerializer.Deserialize<Dictionary<string, object?>>(existing);
+                    if (existingData is null)
+                        goto WriteStatus;
+
+                    foreach (var (key, value) in existingData)
+                        statusData[key] = value;
+
+                    statusData["node_id"] = nodeId;
+                    statusData["status"] = StageStatusContract.ToStatusString(outcome.Status);
+                    statusData["preferred_next_label"] = outcome.PreferredLabel;
+                    statusData["notes"] = outcome.Notes;
+                    statusData["provider_state"] = ResolveProviderState(outcome);
+                    statusData["edit_state"] = ResolveEditState(outcome.Telemetry);
+                    statusData["advance_allowed"] = outcome.Status == OutcomeStatus.Success || outcome.Status == OutcomeStatus.PartialSuccess;
+                    if (TryGetString(outcome.Telemetry, "failure_kind", out var mergedFailureKind))
+                        statusData["failure_kind"] = mergedFailureKind;
                 }
                 catch
                 {
@@ -535,14 +593,7 @@ public class PipelineEngine
                 }
             }
 
-            var statusData = new Dictionary<string, object?>
-            {
-                ["node_id"] = nodeId,
-                ["status"] = StageStatusContract.ToStatusString(outcome.Status),
-                ["preferred_next_label"] = outcome.PreferredLabel,
-                ["notes"] = outcome.Notes
-            };
-
+        WriteStatus:
             await File.WriteAllTextAsync(
                 statusPath,
                 JsonSerializer.Serialize(statusData, new JsonSerializerOptions { WriteIndented = true }),
@@ -553,6 +604,24 @@ public class PipelineEngine
         {
             // Non-critical: don't fail the pipeline if status write fails
         }
+    }
+
+    private static string ResolveProviderState(Outcome outcome)
+    {
+        if (TryGetString(outcome.Telemetry, "provider_state", out var providerState))
+            return providerState;
+
+        if (outcome.Notes.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+            return "timeout";
+
+        return outcome.Status == OutcomeStatus.Fail ? "error" : "completed";
+    }
+
+    private static string ResolveEditState(Dictionary<string, object?>? telemetry)
+    {
+        return TryGetInt(telemetry, "touched_files_count", out var touchedFiles) && touchedFiles > 0
+            ? "modified"
+            : "none";
     }
 
     private void ApplyContextReset(GraphEdge selectedEdge, Graph graph, PipelineContext context)
@@ -649,10 +718,10 @@ public class PipelineEngine
         }
     }
 
-    private static bool TryGetInt(Dictionary<string, object?> source, string key, out long value)
+    private static bool TryGetInt(Dictionary<string, object?>? source, string key, out long value)
     {
         value = 0;
-        if (!source.TryGetValue(key, out var raw) || raw is null)
+        if (source is null || !source.TryGetValue(key, out var raw) || raw is null)
             return false;
 
         switch (raw)
@@ -678,6 +747,19 @@ public class PipelineEngine
             default:
                 return false;
         }
+    }
+
+    private static bool TryGetString(Dictionary<string, object?>? source, string key, out string value)
+    {
+        value = string.Empty;
+        if (source is null || !source.TryGetValue(key, out var raw) || raw is null)
+            return false;
+
+        if (raw is not string text || string.IsNullOrWhiteSpace(text))
+            return false;
+
+        value = text;
+        return true;
     }
 
     private static string? TryResolveDirectNextNode(Outcome outcome, Graph graph)

@@ -10,14 +10,14 @@ public static class RunnerBackendFactory
 {
     public static AgentCodergenBackend Create(string workingDir, string projectRoot, RunOptions options)
     {
-        Func<string?, string?, string?, Session>? sessionFactory = null;
+        Func<string?, string?, string?, CodergenExecutionOptions?, Session>? sessionFactory = null;
         if (string.Equals(options.BackendMode, "scripted", StringComparison.OrdinalIgnoreCase))
         {
             if (string.IsNullOrWhiteSpace(options.BackendScriptPath))
                 throw new InvalidOperationException("The scripted backend requires --backend-script <path>.");
 
             var plan = ScriptedBackendPlan.Load(options.BackendScriptPath!);
-            sessionFactory = (provider, model, reasoningEffort) =>
+            sessionFactory = (provider, model, reasoningEffort, executionOptions) =>
             {
                 var resolvedProvider = string.IsNullOrWhiteSpace(provider) ? "scripted" : provider;
                 var resolvedModel = string.IsNullOrWhiteSpace(model) ? "scripted-model" : Client.ResolveModelAlias(model);
@@ -28,6 +28,7 @@ public static class RunnerBackendFactory
                     MaxToolRoundsPerInput: 50,
                     DefaultCommandTimeoutMs: 30_000,
                     MaxCommandTimeoutMs: 120_000,
+                    MaxProviderResponseMs: executionOptions?.MaxProviderResponseMs ?? 90_000,
                     ReasoningEffort: reasoningEffort);
                 return new Session(new ScriptedProviderAdapter(plan), profile, env, config);
             };
@@ -50,7 +51,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
     private readonly string _workingDir;
     private readonly string _projectRoot;
     private readonly string? _initialSteerText;
-    private readonly Func<string?, string?, string?, Session>? _sessionFactory;
+    private readonly Func<string?, string?, string?, CodergenExecutionOptions?, Session>? _sessionFactory;
     private readonly SessionPool _sessionPool = new();
     private readonly string? _steerFilePath;
     private int _initialSteerUsed;
@@ -59,7 +60,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         string workingDir,
         string projectRoot,
         string? initialSteerText = null,
-        Func<string?, string?, string?, Session>? sessionFactory = null,
+        Func<string?, string?, string?, CodergenExecutionOptions?, Session>? sessionFactory = null,
         string? steerFilePath = null)
     {
         _workingDir = workingDir;
@@ -84,7 +85,8 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         string? model = null,
         string? provider = null,
         string? reasoningEffort = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         var hints = ParseRuntimeHints(prompt);
         var resolvedProvider = provider ?? InferProvider(model);
@@ -109,6 +111,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 resolvedProvider: resolvedProvider,
                 requestedModel: model,
                 reasoningEffort: reasoningEffort,
+                options: options,
                 pooledSession: out pooledSession);
 
             ApplyInitialSteer(session);
@@ -203,8 +206,23 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             if (finalTurn is not null)
                 Console.WriteLine($"  [codergen] Session complete ({finalTurn.ToolCalls.Count} tool calls made)");
 
-            var status = parsedStatus?.Status ?? InferStatusFromResponse(finalResponse);
+            var classification = ClassifyTerminalResponse(finalResponse, session.LastError);
+            var status = parsedStatus?.Status ?? classification.Status;
             var telemetry = BuildStageTelemetry(session, historyStartIndex, stageStartedAt);
+            telemetry["provider"] = session.ProviderProfile.Id;
+            telemetry["model"] = session.ProviderProfile.Model;
+            telemetry["provider_state"] = classification.ProviderState;
+            if (!telemetry.ContainsKey("verification_state"))
+                telemetry["verification_state"] = classification.DefaultVerificationState;
+            telemetry["provider_timeout_ms"] = session.Config.MaxProviderResponseMs;
+            if (!string.IsNullOrWhiteSpace(classification.FailureKind))
+                telemetry["failure_kind"] = classification.FailureKind;
+            if (classification.ProviderStatusCode is not null)
+                telemetry["provider_status_code"] = classification.ProviderStatusCode.Value;
+            if (classification.ProviderRetryable is not null)
+                telemetry["provider_retryable"] = classification.ProviderRetryable.Value;
+            if (!string.IsNullOrWhiteSpace(classification.ErrorMessage))
+                telemetry["provider_error_message"] = classification.ErrorMessage;
             if (helperTelemetry.Count > 0)
             {
                 telemetry["helper_session_count"] = helperTelemetry.Count;
@@ -233,9 +251,19 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             if (pooledSession)
                 _sessionPool.Discard(hints.ThreadId);
             Console.Error.WriteLine($"  [codergen] Error: {ex.Message}");
+            var classification = ClassifyException(ex);
             return new CodergenResult(
                 Response: $"Agent error: {ex.Message}",
-                Status: OutcomeStatus.Retry);
+                Status: classification.Status,
+                Telemetry: new Dictionary<string, object?>
+                {
+                    ["provider_state"] = classification.ProviderState,
+                    ["verification_state"] = classification.DefaultVerificationState,
+                    ["failure_kind"] = classification.FailureKind,
+                    ["provider_status_code"] = classification.ProviderStatusCode,
+                    ["provider_retryable"] = classification.ProviderRetryable,
+                    ["provider_error_message"] = classification.ErrorMessage
+                });
         }
         finally
         {
@@ -250,16 +278,17 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         string? resolvedProvider,
         string? requestedModel,
         string? reasoningEffort,
+        CodergenExecutionOptions? options,
         out bool pooledSession)
     {
         pooledSession = false;
 
         if (!shouldPool)
-            return CreateSession(resolvedProvider, requestedModel, reasoningEffort);
+            return CreateSession(resolvedProvider, requestedModel, reasoningEffort, options);
 
         if (_sessionPool.TryGet(hints.ThreadId, out var existing) &&
             existing is not null &&
-            IsCompatible(existing, resolvedProvider, requestedModel, reasoningEffort))
+            IsCompatible(existing, resolvedProvider, requestedModel, reasoningEffort, options))
         {
             pooledSession = true;
             return existing;
@@ -271,13 +300,17 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         pooledSession = true;
         return _sessionPool.GetOrCreate(
             hints.ThreadId,
-            () => CreateSession(resolvedProvider, requestedModel, reasoningEffort));
+            () => CreateSession(resolvedProvider, requestedModel, reasoningEffort, options));
     }
 
-    private Session CreateSession(string? resolvedProvider, string? model, string? reasoningEffort)
+    private Session CreateSession(
+        string? resolvedProvider,
+        string? model,
+        string? reasoningEffort,
+        CodergenExecutionOptions? options)
     {
         if (_sessionFactory is not null)
-            return _sessionFactory(resolvedProvider, model, reasoningEffort);
+            return _sessionFactory(resolvedProvider, model, reasoningEffort, options);
 
         var (adapter, profile) = BuildProvider(resolvedProvider);
 
@@ -290,7 +323,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             MaxToolRoundsPerInput: 120,
             DefaultCommandTimeoutMs: 30_000,
             MaxCommandTimeoutMs: 600_000,
-            MaxProviderResponseMs: 90_000,
+            MaxProviderResponseMs: options?.MaxProviderResponseMs ?? 90_000,
             ReasoningEffort: reasoningEffort);
 
         var session = new Session(adapter, profile, env, sessionConfig);
@@ -343,7 +376,12 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         });
     }
 
-    private bool IsCompatible(Session session, string? resolvedProvider, string? requestedModel, string? reasoningEffort)
+    private bool IsCompatible(
+        Session session,
+        string? resolvedProvider,
+        string? requestedModel,
+        string? reasoningEffort,
+        CodergenExecutionOptions? options)
     {
         var requestedProvider = (resolvedProvider ?? "anthropic").ToLowerInvariant();
         if (!session.ProviderProfile.Id.Equals(requestedProvider, StringComparison.OrdinalIgnoreCase))
@@ -357,6 +395,9 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         }
 
         if (!string.Equals(session.Config.ReasoningEffort, reasoningEffort, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (session.Config.MaxProviderResponseMs != (options?.MaxProviderResponseMs ?? 90_000))
             return false;
 
         return session.State != SessionState.Closed;
@@ -473,7 +514,8 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         var helperSession = CreateSession(
             !string.IsNullOrWhiteSpace(hints.HelperProvider) ? hints.HelperProvider : resolvedProvider,
             !string.IsNullOrWhiteSpace(hints.HelperModel) ? hints.HelperModel : requestedModel,
-            !string.IsNullOrWhiteSpace(hints.HelperReasoningEffort) ? hints.HelperReasoningEffort : reasoningEffort);
+            !string.IsNullOrWhiteSpace(hints.HelperReasoningEffort) ? hints.HelperReasoningEffort : reasoningEffort,
+            options: null);
 
         try
         {
@@ -541,6 +583,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         var assistantTurns = stageTurns.OfType<AssistantTurn>().ToList();
         var toolCalls = assistantTurns.SelectMany(t => t.ToolCalls).ToList();
         var toolResults = stageTurns.OfType<ToolResultsTurn>().SelectMany(t => t.Results).ToList();
+        var toolCallById = toolCalls.ToDictionary(tc => tc.Id, StringComparer.Ordinal);
 
         var usage = assistantTurns
             .Select(t => t.Usage)
@@ -552,10 +595,28 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => (object?)g.Count(), StringComparer.OrdinalIgnoreCase);
 
-        var touchedFiles = ExtractTouchedFiles(toolCalls)
+        var allTouchedFiles = ExtractTouchedFiles(toolCalls).ToList();
+        var touchedFiles = allTouchedFiles
             .Take(50)
             .Cast<object?>()
             .ToList();
+        var verificationCommands = ExtractVerificationCommands(toolCalls).ToList();
+        var verificationCallIds = new HashSet<string>(
+            verificationCommands.Select(command => command.ToolCallId),
+            StringComparer.Ordinal);
+        var successfulToolCallIds = new HashSet<string>(
+            toolResults
+                .Where(result => !result.IsError)
+                .Select(result => result.ToolCallId),
+            StringComparer.Ordinal);
+        var queuedValidationChecks = ExtractQueuedValidationChecks(toolCalls, successfulToolCallIds).ToList();
+        var verificationErrors = toolResults.Count(result =>
+            result.IsError &&
+            verificationCallIds.Contains(result.ToolCallId) &&
+            toolCallById.ContainsKey(result.ToolCallId));
+        var verificationState = verificationCommands.Count == 0
+            ? "not_run"
+            : verificationErrors > 0 ? "failed" : "passed";
 
         return new Dictionary<string, object?>
         {
@@ -565,7 +626,12 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             ["tool_errors"] = toolResults.Count(r => r.IsError),
             ["tool_by_name"] = byTool,
             ["touched_files"] = touchedFiles,
-            ["touched_files_count"] = touchedFiles.Count,
+            ["touched_files_count"] = allTouchedFiles.Count,
+            ["verification_commands"] = verificationCommands.Select(command => (object?)command.Command).ToList(),
+            ["verification_errors"] = verificationErrors,
+            ["verification_state"] = verificationState,
+            ["queued_validation_checks"] = queuedValidationChecks,
+            ["queued_validation_check_count"] = queuedValidationChecks.Count,
             ["token_usage"] = new Dictionary<string, object?>
             {
                 ["input_tokens"] = usage.InputTokens,
@@ -594,6 +660,10 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                         if (TryGetString(root, out var writePath, "file_path", "path"))
                             files.Add(NormalizeTouchedPath(writePath));
                         break;
+                    case "edit_file":
+                        if (TryGetString(root, out var editPath, "file_path", "path"))
+                            files.Add(NormalizeTouchedPath(editPath));
+                        break;
                     case "apply_patch":
                         if (TryGetString(root, out var patchText, "patch"))
                             AddPatchFiles(patchText, files);
@@ -607,6 +677,129 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         }
 
         return files.OrderBy(f => f, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private IEnumerable<VerificationCommand> ExtractVerificationCommands(IEnumerable<ToolCallData> toolCalls)
+    {
+        foreach (var toolCall in toolCalls)
+        {
+            if (!toolCall.Name.Equals("shell", StringComparison.OrdinalIgnoreCase) &&
+                !toolCall.Name.Equals("bash", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string? command = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(toolCall.Arguments);
+                if (TryGetString(doc.RootElement, out var parsedCommand, "command", "cmd"))
+                    command = parsedCommand;
+            }
+            catch
+            {
+                // Verification telemetry should be best-effort only.
+            }
+
+            if (string.IsNullOrWhiteSpace(command) || !LooksLikeVerificationCommand(command))
+                continue;
+
+            yield return new VerificationCommand(toolCall.Id, command);
+        }
+    }
+
+    private IEnumerable<RuntimeValidationCheckRegistration> ExtractQueuedValidationChecks(
+        IEnumerable<ToolCallData> toolCalls,
+        ISet<string> successfulToolCallIds)
+    {
+        var ordinal = 0;
+        foreach (var toolCall in toolCalls)
+        {
+            if (!toolCall.Name.Equals("queue_validation_check", StringComparison.OrdinalIgnoreCase) ||
+                !successfulToolCallIds.Contains(toolCall.Id))
+            {
+                continue;
+            }
+
+            if (!TryParseQueuedValidationCheck(toolCall, ordinal + 1, out var check))
+                continue;
+
+            ordinal++;
+            yield return check!;
+        }
+    }
+
+    private static bool TryParseQueuedValidationCheck(
+        ToolCallData toolCall,
+        int ordinal,
+        out RuntimeValidationCheckRegistration? check)
+    {
+        check = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(toolCall.Arguments);
+            var root = doc.RootElement;
+            var kind = TryGetString(root, out var parsedKind, "kind")
+                ? RuntimeValidationCheckKinds.Normalize(parsedKind)
+                : RuntimeValidationCheckKinds.Command;
+            var name = TryGetString(root, out var parsedName, "name") && !string.IsNullOrWhiteSpace(parsedName)
+                ? parsedName
+                : $"model-{kind}-{ordinal}";
+            var command = TryGetString(root, out var parsedCommand, "command") ? parsedCommand : null;
+            var path = TryGetString(root, out var parsedPath, "path") ? parsedPath : null;
+            var paths = TryReadStringList(root, "paths");
+            var workdir = TryGetString(root, out var parsedWorkdir, "workdir") ? parsedWorkdir : null;
+            var containsText = TryGetString(root, out var parsedContainsText, "contains_text", "containsText") ? parsedContainsText : null;
+            var matchesRegex = TryGetString(root, out var parsedRegex, "matches_regex", "matchesRegex") ? parsedRegex : null;
+            var jsonPath = TryGetString(root, out var parsedJsonPath, "json_path", "jsonPath") ? parsedJsonPath : null;
+            var expectedValueJson = TryGetString(root, out var parsedExpectedValueJson, "expected_value_json", "expectedValueJson") ? parsedExpectedValueJson : null;
+            var expectedSchemaJson = TryGetString(root, out var parsedExpectedSchemaJson, "expected_schema_json", "expectedSchemaJson") ? parsedExpectedSchemaJson : null;
+            var requireAnyChange = TryReadBoolean(root, "require_any_change", "requireAnyChange") ?? false;
+            var timeoutMs = TryReadInt(root, "timeout_ms");
+            var required = root.TryGetProperty("required", out var requiredElement) &&
+                           requiredElement.ValueKind is JsonValueKind.True or JsonValueKind.False &&
+                           requiredElement.GetBoolean();
+
+            var pathCount = (string.IsNullOrWhiteSpace(path) ? 0 : 1) + (paths?.Count ?? 0);
+            var isValid = kind switch
+            {
+                RuntimeValidationCheckKinds.Command => !string.IsNullOrWhiteSpace(command),
+                RuntimeValidationCheckKinds.FileExists => pathCount > 0,
+                RuntimeValidationCheckKinds.FileContent => pathCount == 1 &&
+                                                           (!string.IsNullOrWhiteSpace(containsText) ||
+                                                            !string.IsNullOrWhiteSpace(matchesRegex) ||
+                                                            !string.IsNullOrWhiteSpace(jsonPath)),
+                RuntimeValidationCheckKinds.Diff => true,
+                RuntimeValidationCheckKinds.Artifact => pathCount > 0,
+                RuntimeValidationCheckKinds.Schema => pathCount == 1 && !string.IsNullOrWhiteSpace(expectedSchemaJson),
+                _ => false
+            };
+            if (!isValid)
+                return false;
+
+            check = new RuntimeValidationCheckRegistration(
+                Kind: kind,
+                Name: name,
+                Command: command,
+                Path: path,
+                Paths: paths,
+                Workdir: workdir,
+                ContainsText: containsText,
+                MatchesRegex: matchesRegex,
+                JsonPath: jsonPath,
+                ExpectedValueJson: expectedValueJson,
+                ExpectedSchemaJson: expectedSchemaJson,
+                RequireAnyChange: requireAnyChange,
+                TimeoutMs: timeoutMs,
+                Required: required,
+                Source: RuntimeValidationCheckSources.ModelRequested,
+                SourceReference: toolCall.Id);
+            return true;
+        }
+        catch
+        {
+            // Structured validation telemetry is best-effort.
+            return false;
+        }
     }
 
     private string NormalizeTouchedPath(string path)
@@ -692,18 +885,263 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         return false;
     }
 
-    private static OutcomeStatus InferStatusFromResponse(string response)
+    private static int? TryReadInt(JsonElement root, params string[] keys)
     {
-        if (response.StartsWith("[Error:", StringComparison.Ordinal) ||
-            response.StartsWith("[Turn limit reached]", StringComparison.Ordinal) ||
-            response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal) ||
-            response.StartsWith("[Model response timeout reached]", StringComparison.Ordinal) ||
-            response.StartsWith("[Exploration stall detected", StringComparison.Ordinal))
+        foreach (var key in keys)
         {
-            return OutcomeStatus.Retry;
+            if (!root.TryGetProperty(key, out var el))
+                continue;
+
+            if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out var number))
+                return number;
+
+            if (el.ValueKind == JsonValueKind.String &&
+                int.TryParse(el.GetString(), out var parsed))
+            {
+                return parsed;
+            }
         }
 
-        return OutcomeStatus.Success;
+        return null;
+    }
+
+    private static bool? TryReadBoolean(JsonElement root, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (!root.TryGetProperty(key, out var el))
+                continue;
+
+            if (el.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                return el.GetBoolean();
+
+            if (el.ValueKind == JsonValueKind.String &&
+                bool.TryParse(el.GetString(), out var parsed))
+            {
+                return parsed;
+            }
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<string>? TryReadStringList(JsonElement root, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (!root.TryGetProperty(key, out var el))
+                continue;
+
+            if (el.ValueKind == JsonValueKind.String)
+            {
+                var single = el.GetString();
+                return string.IsNullOrWhiteSpace(single) ? Array.Empty<string>() : new[] { single };
+            }
+
+            if (el.ValueKind != JsonValueKind.Array)
+                continue;
+
+            return el.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString())
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Cast<string>()
+                .ToList();
+        }
+
+        return null;
+    }
+
+    private static TerminalResponseClassification ClassifyTerminalResponse(string response, Exception? error = null)
+    {
+        if (response.StartsWith("[Model response timeout reached]", StringComparison.Ordinal))
+            return new TerminalResponseClassification(OutcomeStatus.Fail, "timeout", "provider_timeout");
+
+        if (error is not null)
+            return ClassifyException(error);
+
+        if (response.StartsWith("[Error:", StringComparison.Ordinal))
+            return ClassifyErrorMessage(ExtractErrorText(response));
+
+        if (response.StartsWith("[Turn limit reached]", StringComparison.Ordinal))
+            return new TerminalResponseClassification(OutcomeStatus.Retry, "completed", "turn_limit");
+
+        if (response.StartsWith("[Tool round limit reached]", StringComparison.Ordinal))
+            return new TerminalResponseClassification(OutcomeStatus.Retry, "completed", "tool_round_limit");
+
+        if (response.StartsWith("[Exploration stall detected", StringComparison.Ordinal))
+            return new TerminalResponseClassification(OutcomeStatus.Retry, "completed", "exploration_stall");
+
+        return new TerminalResponseClassification(OutcomeStatus.Success, "completed", null);
+    }
+
+    private static TerminalResponseClassification ClassifyException(Exception error)
+    {
+        if (error is TimeoutException)
+            return new TerminalResponseClassification(OutcomeStatus.Fail, "timeout", "provider_timeout", ErrorMessage: error.Message);
+
+        return error switch
+        {
+            AuthenticationError auth =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "auth_failed",
+                    "provider_auth",
+                    ProviderStatusCode: (int)auth.StatusCode,
+                    ProviderRetryable: auth.Retryable,
+                    ErrorMessage: auth.Message),
+            RateLimitError rateLimit =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Retry,
+                    "rate_limited",
+                    "provider_rate_limit",
+                    ProviderStatusCode: (int)rateLimit.StatusCode,
+                    ProviderRetryable: rateLimit.Retryable,
+                    ErrorMessage: rateLimit.Message),
+            NotFoundError notFound =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "not_found",
+                    "provider_not_found",
+                    ProviderStatusCode: (int)notFound.StatusCode,
+                    ProviderRetryable: notFound.Retryable,
+                    ErrorMessage: notFound.Message),
+            ContentFilterError contentFilter =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "content_filtered",
+                    "provider_content_filter",
+                    ProviderStatusCode: (int)contentFilter.StatusCode,
+                    ProviderRetryable: contentFilter.Retryable,
+                    ErrorMessage: contentFilter.Message),
+            ConfigurationError configuration =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "config_error",
+                    "configuration_error",
+                    ErrorMessage: configuration.Message),
+            ProviderError providerError when providerError.Retryable =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Retry,
+                    "transient_error",
+                    "provider_transient_error",
+                    ProviderStatusCode: (int)providerError.StatusCode,
+                    ProviderRetryable: providerError.Retryable,
+                    ErrorMessage: providerError.Message),
+            ProviderError providerError when LooksLikeNotFoundMessage(providerError.Message) =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "not_found",
+                    "provider_not_found",
+                    ProviderStatusCode: (int)providerError.StatusCode,
+                    ProviderRetryable: providerError.Retryable,
+                    ErrorMessage: providerError.Message),
+            ProviderError providerError =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "error",
+                    "provider_error",
+                    ProviderStatusCode: (int)providerError.StatusCode,
+                    ProviderRetryable: providerError.Retryable,
+                    ErrorMessage: providerError.Message),
+            _ =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "runtime_error",
+                    "runtime_error",
+                    ErrorMessage: error.Message)
+        };
+    }
+
+    private static TerminalResponseClassification ClassifyErrorMessage(string errorText)
+    {
+        var normalized = errorText.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return new TerminalResponseClassification(OutcomeStatus.Fail, "error", "provider_error");
+
+        if (normalized.Contains("rate limit", StringComparison.Ordinal) ||
+            normalized.Contains("too many requests", StringComparison.Ordinal) ||
+            normalized.Contains("high demand", StringComparison.Ordinal))
+        {
+            return new TerminalResponseClassification(
+                OutcomeStatus.Retry,
+                "rate_limited",
+                "provider_rate_limit",
+                ErrorMessage: errorText);
+        }
+
+        if (normalized.Contains("unauthorized", StringComparison.Ordinal) ||
+            normalized.Contains("forbidden", StringComparison.Ordinal) ||
+            normalized.Contains("api key", StringComparison.Ordinal) ||
+            normalized.Contains("authentication", StringComparison.Ordinal))
+        {
+            return new TerminalResponseClassification(
+                OutcomeStatus.Fail,
+                "auth_failed",
+                "provider_auth",
+                ErrorMessage: errorText);
+        }
+
+        if (normalized.Contains("not found", StringComparison.Ordinal) ||
+            normalized.Contains("is not found", StringComparison.Ordinal) ||
+            normalized.Contains("does not exist", StringComparison.Ordinal))
+        {
+            return new TerminalResponseClassification(
+                OutcomeStatus.Fail,
+                "not_found",
+                "provider_not_found",
+                ErrorMessage: errorText);
+        }
+
+        if (normalized.Contains("blocked", StringComparison.Ordinal) ||
+            normalized.Contains("content filter", StringComparison.Ordinal) ||
+            normalized.Contains("safety", StringComparison.Ordinal))
+        {
+            return new TerminalResponseClassification(
+                OutcomeStatus.Fail,
+                "content_filtered",
+                "provider_content_filter",
+                ErrorMessage: errorText);
+        }
+
+        if (normalized.Contains("missing thought_signature", StringComparison.Ordinal) ||
+            normalized.Contains("thought signature", StringComparison.Ordinal))
+        {
+            return new TerminalResponseClassification(
+                OutcomeStatus.Fail,
+                "error",
+                "provider_protocol_error",
+                ErrorMessage: errorText);
+        }
+
+        return new TerminalResponseClassification(
+            OutcomeStatus.Fail,
+            "error",
+            "provider_error",
+            ErrorMessage: errorText);
+    }
+
+    private static string ExtractErrorText(string response)
+    {
+        if (!response.StartsWith("[Error:", StringComparison.Ordinal))
+            return response;
+
+        var trimmed = response.Trim();
+        if (trimmed.EndsWith("]", StringComparison.Ordinal))
+            trimmed = trimmed[..^1];
+
+        return trimmed["[Error:".Length..].Trim();
+    }
+
+    private static bool LooksLikeNotFoundMessage(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        var normalized = message.Trim().ToLowerInvariant();
+        return normalized.Contains("not found", StringComparison.Ordinal) ||
+               normalized.Contains("is not found", StringComparison.Ordinal) ||
+               normalized.Contains("does not exist", StringComparison.Ordinal);
     }
 
     private static bool IsTerminalSessionSentinel(string response)
@@ -755,6 +1193,127 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         return null;
     }
 
+    private static bool LooksLikeVerificationCommand(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+            return false;
+
+        var separators = new[] { "&&", "||", ";", "\r\n", "\n" };
+        var segments = command.Split(separators, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        return segments.Any(LooksLikeVerificationSegment);
+    }
+
+    private static bool LooksLikeVerificationSegment(string segment)
+    {
+        if (string.IsNullOrWhiteSpace(segment))
+            return false;
+
+        var normalized = Regex.Replace(segment.ToLowerInvariant(), @"\s+", " ").Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        if (normalized.StartsWith("cd ", StringComparison.Ordinal) ||
+            normalized.StartsWith("pwd", StringComparison.Ordinal) ||
+            normalized.StartsWith("echo ", StringComparison.Ordinal) ||
+            normalized.StartsWith("export ", StringComparison.Ordinal) ||
+            normalized.StartsWith("set ", StringComparison.Ordinal) ||
+            normalized.StartsWith("source ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return normalized.Contains("dotnet test", StringComparison.Ordinal) ||
+               normalized.Contains("dotnet build", StringComparison.Ordinal) ||
+               normalized.Contains("dotnet msbuild", StringComparison.Ordinal) ||
+               normalized.Contains("dotnet format --verify-no-changes", StringComparison.Ordinal) ||
+               normalized.Contains("cargo test", StringComparison.Ordinal) ||
+               normalized.Contains("cargo check", StringComparison.Ordinal) ||
+               normalized.Contains("cargo clippy", StringComparison.Ordinal) ||
+               normalized.Contains("cargo nextest", StringComparison.Ordinal) ||
+               normalized.Contains("cargo fmt --check", StringComparison.Ordinal) ||
+               normalized.Contains("go test", StringComparison.Ordinal) ||
+               normalized.Contains("go vet", StringComparison.Ordinal) ||
+               normalized.Contains("go build", StringComparison.Ordinal) ||
+               normalized.Contains("pytest", StringComparison.Ordinal) ||
+               normalized.Contains("python -m pytest", StringComparison.Ordinal) ||
+               normalized.Contains("python -m unittest", StringComparison.Ordinal) ||
+               normalized.Contains("uv run pytest", StringComparison.Ordinal) ||
+               normalized.Contains("uv run ruff", StringComparison.Ordinal) ||
+               normalized.Contains("uv run mypy", StringComparison.Ordinal) ||
+               normalized.Contains("ruff check", StringComparison.Ordinal) ||
+               normalized.Contains("mypy", StringComparison.Ordinal) ||
+               normalized.Contains("eslint", StringComparison.Ordinal) ||
+               normalized.Contains("tsc --noemit", StringComparison.Ordinal) ||
+               normalized.Contains("jest", StringComparison.Ordinal) ||
+               normalized.Contains("vitest", StringComparison.Ordinal) ||
+               normalized.Contains("playwright", StringComparison.Ordinal) ||
+               normalized.Contains("cypress", StringComparison.Ordinal) ||
+               normalized.Contains("gradle test", StringComparison.Ordinal) ||
+               normalized.Contains("gradle build", StringComparison.Ordinal) ||
+               normalized.Contains("gradle check", StringComparison.Ordinal) ||
+               normalized.Contains("mvn test", StringComparison.Ordinal) ||
+               normalized.Contains("mvn verify", StringComparison.Ordinal) ||
+               normalized.Contains("bazel test", StringComparison.Ordinal) ||
+               normalized.Contains("bazel build", StringComparison.Ordinal) ||
+               normalized.Contains("npm test", StringComparison.Ordinal) ||
+               normalized.Contains("pnpm test", StringComparison.Ordinal) ||
+               normalized.Contains("yarn test", StringComparison.Ordinal) ||
+               normalized.Contains("bun test", StringComparison.Ordinal) ||
+               normalized.Contains("npm run build", StringComparison.Ordinal) ||
+               normalized.Contains("pnpm build", StringComparison.Ordinal) ||
+               normalized.Contains("yarn build", StringComparison.Ordinal) ||
+               normalized.Contains("npm run lint", StringComparison.Ordinal) ||
+               normalized.Contains("pnpm lint", StringComparison.Ordinal) ||
+               normalized.Contains("yarn lint", StringComparison.Ordinal) ||
+               normalized.Contains("pnpm exec", StringComparison.Ordinal) ||
+               LooksLikeVerificationTargetCommand(normalized) ||
+               LooksLikeVerificationScriptInvocation(normalized);
+    }
+
+    private static bool LooksLikeVerificationTargetCommand(string normalized)
+    {
+        foreach (var prefix in new[] { "make ", "just ", "task ", "npm run ", "pnpm run ", "yarn ", "bun run " })
+        {
+            if (!normalized.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+
+            var target = normalized[prefix.Length..].Trim();
+            return target.StartsWith("test", StringComparison.Ordinal) ||
+                   target.StartsWith("build", StringComparison.Ordinal) ||
+                   target.StartsWith("check", StringComparison.Ordinal) ||
+                   target.StartsWith("verify", StringComparison.Ordinal) ||
+                   target.StartsWith("validate", StringComparison.Ordinal) ||
+                   target.StartsWith("lint", StringComparison.Ordinal) ||
+                   target.StartsWith("ci", StringComparison.Ordinal);
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeVerificationScriptInvocation(string normalized)
+    {
+        var tokens = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length == 0)
+            return false;
+
+        var scriptToken = tokens[0];
+        if ((scriptToken is "bash" or "sh" or "zsh" or "pwsh" or "python" or "python3") && tokens.Length > 1)
+            scriptToken = tokens[1];
+
+        var fileName = Path.GetFileNameWithoutExtension(scriptToken.Trim('"', '\''));
+        if (string.IsNullOrWhiteSpace(fileName))
+            return false;
+
+        var lowered = fileName.ToLowerInvariant();
+        return lowered.Contains("test", StringComparison.Ordinal) ||
+               lowered.Contains("build", StringComparison.Ordinal) ||
+               lowered.Contains("check", StringComparison.Ordinal) ||
+               lowered.Contains("verify", StringComparison.Ordinal) ||
+               lowered.Contains("validate", StringComparison.Ordinal) ||
+               lowered.Contains("lint", StringComparison.Ordinal) ||
+               lowered.Equals("ci", StringComparison.Ordinal);
+    }
+
     private static void SetProfileModel(IProviderProfile profile, string model)
     {
         var resolved = Client.ResolveModelAlias(model);
@@ -783,6 +1342,19 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         string? HelperProvider,
         string? HelperModel,
         string? HelperReasoningEffort);
+
+    private sealed record VerificationCommand(string ToolCallId, string Command);
+
+    private sealed record TerminalResponseClassification(
+        OutcomeStatus Status,
+        string ProviderState,
+        string? FailureKind,
+        int? ProviderStatusCode = null,
+        bool? ProviderRetryable = null,
+        string? ErrorMessage = null)
+    {
+        public string DefaultVerificationState => "not_run";
+    }
 }
 
 internal static class BlockingQuestionDetector

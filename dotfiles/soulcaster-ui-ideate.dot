@@ -1,0 +1,23 @@
+digraph attractor_run {
+    goal = "Generate and evaluate a focused UI/UX refresh direction for Soulcaster's WebUI before implementation."
+    label = "Soulcaster WebUI Ideation"
+    node [shape=parallelogram]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    ideate [
+        label="Gemini ideation",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_ideate.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/soulcaster-webui-baseline-before.png /tmp/soulcaster-ui-refresh"
+    ]
+
+    evaluate [
+        label="Opus evaluation",
+        tool_command="/Users/Johnny.Chen/soulcaster/scripts/soulcaster_ui_evaluate.sh /Users/Johnny.Chen/soulcaster /Users/Johnny.Chen/soulcaster/soulcaster-webui-baseline-before.png /tmp/soulcaster-ui-refresh"
+    ]
+
+    start -> ideate
+    ideate -> evaluate
+    evaluate -> ideate [condition="outcome=fail", label="Revise"]
+    evaluate -> exit   [condition="outcome=success", label="Accept"]
+}

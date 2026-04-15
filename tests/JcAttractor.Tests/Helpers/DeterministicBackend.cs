@@ -40,7 +40,8 @@ internal sealed class DeterministicBackend : ICodergenBackend
         string? model = null,
         string? provider = null,
         string? reasoningEffort = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         var nodeId = ExtractNodeId(prompt);
         var invocation = new DeterministicInvocation(
@@ -49,7 +50,8 @@ internal sealed class DeterministicBackend : ICodergenBackend
             Prompt: prompt,
             Model: model,
             Provider: provider,
-            ReasoningEffort: reasoningEffort);
+            ReasoningEffort: reasoningEffort,
+            Options: options);
         Invocations.Add(invocation);
 
         if (_plans.TryGetValue(nodeId, out var queue) && queue.Count > 0)
@@ -67,7 +69,9 @@ internal sealed class DeterministicBackend : ICodergenBackend
         IEnumerable<string>? suggestedNextIds = null,
         IDictionary<string, string>? contextUpdates = null,
         string? notes = null,
-        string? failureReason = null)
+        string? failureReason = null,
+        IDictionary<string, object?>? telemetry = null,
+        IDictionary<string, string>? artifacts = null)
     {
         var contract = new StageStatusContract(
             Status: status,
@@ -96,7 +100,13 @@ internal sealed class DeterministicBackend : ICodergenBackend
             PreferredLabel: contract.PreferredNextLabel,
             SuggestedNextIds: contract.SuggestedNextIds,
             StageStatus: contract,
-            RawAssistantResponse: response);
+            RawAssistantResponse: response,
+            Telemetry: telemetry is null
+                ? null
+                : new Dictionary<string, object?>(telemetry, StringComparer.Ordinal),
+            Artifacts: artifacts is null
+                ? null
+                : new Dictionary<string, string>(artifacts, StringComparer.Ordinal));
     }
 
     private static string ExtractNodeId(string prompt)
@@ -112,4 +122,5 @@ internal sealed record DeterministicInvocation(
     string Prompt,
     string? Model,
     string? Provider,
-    string? ReasoningEffort);
+    string? ReasoningEffort,
+    CodergenExecutionOptions? Options);

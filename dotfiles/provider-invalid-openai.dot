@@ -1,0 +1,17 @@
+digraph provider_invalid_openai {
+    graph [goal="Validate codergen failure classification with an invalid OpenAI model"]
+
+    start [shape=Mdiamond]
+    validate [
+        shape=box,
+        provider="openai",
+        model="codex-does-not-exist",
+        reasoning_effort="medium",
+        timeout="60s",
+        prompt="Return valid stage status JSON."
+    ]
+    done [shape=Msquare]
+
+    start -> validate
+    validate -> done
+}

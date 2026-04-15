@@ -1,0 +1,19 @@
+digraph provider_validation_openai {
+    graph [goal="Validate codergen runtime live with the OpenAI provider"]
+
+    start [shape=Mdiamond]
+    validate [
+        shape=box,
+        provider="openai",
+        model="codex-5.2",
+        reasoning_effort="medium",
+        timeout="180s",
+        node_kind="implementation",
+        require_verification="true",
+        prompt="Validate the codergen runtime. Required steps: 1. Use the write_file tool or apply_patch tool, not shell redirection, to create logs/provider-validation/openai-validation.txt containing two short lines: provider=openai and result=PASS. 2. Run dotnet build src/JcAttractor.Attractor/JcAttractor.Attractor.csproj --nologo --no-restore. 3. Return valid stage status JSON with status=success only if both steps succeeded. Include notes that mention the file path and build result. Set context_updates.validation.provider=openai and context_updates.validation.marker=PASS."
+    ]
+    done [shape=Msquare]
+
+    start -> validate
+    validate -> done
+}

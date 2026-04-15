@@ -2634,13 +2634,26 @@ internal class FakeCodergenBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult(
             Response: $"Completed: {prompt}",
             Status: OutcomeStatus.Success,
-            ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" }
+            ContextUpdates: new Dictionary<string, string> { ["last_action"] = "codergen" },
+            Telemetry: new Dictionary<string, object?>
+            {
+                ["provider_state"] = "completed",
+                ["verification_state"] = "not_run",
+                ["touched_files"] = new List<object?> { "src/fake-change.txt" },
+                ["touched_files_count"] = 1
+            }
         ));
     }
 }
@@ -2657,7 +2670,13 @@ internal class AlwaysFailBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult(
@@ -2677,7 +2696,13 @@ internal class FailThenSucceedBackend : ICodergenBackend
         _failCount = failCount;
     }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         CallCount++;
         if (CallCount <= _failCount)
@@ -2711,7 +2736,13 @@ internal class RetryThenSucceedBackend : ICodergenBackend
         _retryCount = retryCount;
     }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         CallCount++;
         if (CallCount <= _retryCount)
@@ -2739,7 +2770,13 @@ internal class AlwaysRetryBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult(
@@ -2754,7 +2791,13 @@ internal class ContextTrackingBackend : ICodergenBackend
     public bool Step2SawStep1Context { get; private set; }
     private int _callCount;
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         _callCount++;
         if (_callCount == 1)
@@ -3069,7 +3112,13 @@ public class CodergenPreferredLabelTests
 
     private class LabellingBackend : ICodergenBackend
     {
-        public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+        public Task<CodergenResult> RunAsync(
+            string prompt,
+            string? model = null,
+            string? provider = null,
+            string? reasoningEffort = null,
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
             => Task.FromResult(new CodergenResult("done", OutcomeStatus.Success, PreferredLabel: "approved"));
     }
 }
@@ -3824,7 +3873,13 @@ public class T20_CodergenSuggestedNextIdsTests
 
     private class SuggestingBackend : ICodergenBackend
     {
-        public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+        public Task<CodergenResult> RunAsync(
+            string prompt,
+            string? model = null,
+            string? provider = null,
+            string? reasoningEffort = null,
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
             => Task.FromResult(new CodergenResult("done", OutcomeStatus.Success,
                 SuggestedNextIds: new List<string> { "node_a", "node_b" }));
     }
@@ -3836,7 +3891,13 @@ internal class CycleCountingBackend : ICodergenBackend
 {
     public int CallCount { get; private set; }
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         CallCount++;
         return Task.FromResult(new CodergenResult("cycle done", OutcomeStatus.Success));
@@ -3847,7 +3908,13 @@ internal class StopConditionBackend : ICodergenBackend
 {
     private int _callCount;
 
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         _callCount++;
         var updates = _callCount >= 2
@@ -3859,7 +3926,13 @@ internal class StopConditionBackend : ICodergenBackend
 
 internal class FailingBackend : ICodergenBackend
 {
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         return Task.FromResult(new CodergenResult(
             Response: "failed",
@@ -3870,7 +3943,13 @@ internal class FailingBackend : ICodergenBackend
 
 internal class ContextSettingBackend : ICodergenBackend
 {
-    public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+    public Task<CodergenResult> RunAsync(
+        string prompt,
+        string? model = null,
+        string? provider = null,
+        string? reasoningEffort = null,
+        CancellationToken ct = default,
+        CodergenExecutionOptions? options = null)
     {
         return Task.FromResult(new CodergenResult(
             Response: "done",

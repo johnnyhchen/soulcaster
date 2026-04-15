@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Net;
 using JcAttractor.Attractor;
 using JcAttractor.CodingAgent;
 using JcAttractor.Runner;
@@ -255,7 +256,8 @@ public class CodergenPromptPathRegressionTests
             string? model = null,
             string? provider = null,
             string? reasoningEffort = null,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
         {
             LastPrompt = prompt;
             return Task.FromResult(new CodergenResult(
@@ -365,7 +367,7 @@ public class SteerTextRegressionTests
             workingDir: "/tmp/run",
             projectRoot: "/tmp/project",
             initialSteerText: "Keep the changes minimal.",
-            sessionFactory: (_, _, _) => new Session(
+            sessionFactory: (_, _, _, _) => new Session(
                 provider,
                 new FakeProfile(provider),
                 new FakeExecutionEnvironment(),
@@ -441,7 +443,7 @@ public class CodergenLoopTerminationRegressionTests
         var backend = new AgentCodergenBackend(
             workingDir: "/tmp/run",
             projectRoot: "/tmp/project",
-            sessionFactory: (_, _, _) => new Session(
+            sessionFactory: (_, _, _, _) => new Session(
                 provider,
                 new OpenAiProfile(),
                 new FakeExecutionEnvironment(),
@@ -467,13 +469,13 @@ Implement the requested change and return stage status JSON.
     }
 
     [Fact]
-    public async Task AgentCodergenBackend_ModelTimeout_ReturnsRetry()
+    public async Task AgentCodergenBackend_ModelTimeout_ReturnsFail()
     {
         var provider = new SlowProvider();
         var backend = new AgentCodergenBackend(
             workingDir: "/tmp/run",
             projectRoot: "/tmp/project",
-            sessionFactory: (_, _, _) => new Session(
+            sessionFactory: (_, _, _, _) => new Session(
                 provider,
                 new FakeProfile(provider),
                 new FakeExecutionEnvironment(),
@@ -491,7 +493,409 @@ Implement the requested change and return stage status JSON.
 
         var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
 
-        Assert.Equal(OutcomeStatus.Retry, result.Status);
+        Assert.Equal(OutcomeStatus.Fail, result.Status);
         Assert.Contains("Model response timeout reached", result.RawAssistantResponse);
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_RateLimitError_ReturnsRetryWithTypedTelemetry()
+    {
+        var provider = new ThrowingProvider(new RateLimitError("rate limited"));
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _, _) => new Session(
+                provider,
+                new FakeProfile(provider),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 1_000)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: rate-limit-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Retry, result.Status);
+        Assert.Equal("rate_limited", result.Telemetry!["provider_state"]);
+        Assert.Equal("provider_rate_limit", result.Telemetry["failure_kind"]);
+        Assert.Equal(429L, Convert.ToInt64(result.Telemetry["provider_status_code"]));
+        Assert.Equal(true, result.Telemetry["provider_retryable"]);
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_ConfigurationError_ReturnsFailWithTypedTelemetry()
+    {
+        var provider = new ThrowingProvider(new ConfigurationError("misconfigured provider"));
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _, _) => new Session(
+                provider,
+                new FakeProfile(provider),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 1_000)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: config-error-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Fail, result.Status);
+        Assert.Equal("config_error", result.Telemetry!["provider_state"]);
+        Assert.Equal("configuration_error", result.Telemetry["failure_kind"]);
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_ModelDoesNotExistMessage_IsClassifiedAsNotFound()
+    {
+        var provider = new ThrowingProvider(new ProviderError(
+            "The requested model 'codex-does-not-exist' does not exist.",
+            HttpStatusCode.BadRequest,
+            retryable: false,
+            providerName: "openai"));
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _, _) => new Session(
+                provider,
+                new FakeProfile(provider),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 1_000)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: model-not-found-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Fail, result.Status);
+        Assert.Equal("not_found", result.Telemetry!["provider_state"]);
+        Assert.Equal("provider_not_found", result.Telemetry["failure_kind"]);
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_EditFileAndWrappedVerification_AreCountedInTelemetry()
+    {
+        var provider = new EditAndVerifyProvider();
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _, _) => new Session(
+                provider,
+                new GeminiProfile(),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 1_000)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: verification-telemetry-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gemini-3-flash-preview", provider: "gemini");
+
+        Assert.Equal(OutcomeStatus.Success, result.Status);
+        Assert.Equal(1L, Convert.ToInt64(result.Telemetry!["touched_files_count"]));
+        Assert.Equal("passed", result.Telemetry["verification_state"]);
+        var verificationCommands = Assert.IsAssignableFrom<IEnumerable<object?>>(result.Telemetry["verification_commands"]);
+        Assert.Contains(
+            verificationCommands.Select(item => item?.ToString()),
+            command => string.Equals(command, "uv run pytest tests/unit -q", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_QueueValidationCheck_IsCapturedInTelemetry()
+    {
+        var provider = new EditAndQueueValidationProvider();
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _, _) => new Session(
+                provider,
+                new OpenAiProfile(),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 1_000)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: queued-validation-telemetry-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Success, result.Status);
+        Assert.Equal(1L, Convert.ToInt64(result.Telemetry!["queued_validation_check_count"]));
+        var queuedChecks = Assert.IsAssignableFrom<IEnumerable<RuntimeValidationCheckRegistration>>(result.Telemetry["queued_validation_checks"]);
+        var queuedCheck = Assert.Single(queuedChecks);
+        Assert.Equal("command", queuedCheck.Kind);
+        Assert.Equal("unit-tests", queuedCheck.Name);
+        Assert.Equal("uv run pytest tests/unit -q", queuedCheck.Command);
+        Assert.True(queuedCheck.Required);
+    }
+
+    [Fact]
+    public async Task AgentCodergenBackend_QueueStructuredValidationCheck_IsCapturedInTelemetry()
+    {
+        var provider = new EditAndQueueStructuredValidationProvider();
+        var backend = new AgentCodergenBackend(
+            workingDir: "/tmp/run",
+            projectRoot: "/tmp/project",
+            sessionFactory: (_, _, _, _) => new Session(
+                provider,
+                new OpenAiProfile(),
+                new FakeExecutionEnvironment(),
+                new SessionConfig(MaxProviderResponseMs: 1_000)));
+
+        const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: queued-structured-validation-telemetry-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+Implement the requested change and return stage status JSON.
+""";
+
+        var result = await backend.RunAsync(prompt, model: "gpt-5.4", provider: "openai");
+
+        Assert.Equal(OutcomeStatus.Success, result.Status);
+        Assert.Equal(1L, Convert.ToInt64(result.Telemetry!["queued_validation_check_count"]));
+        var queuedChecks = Assert.IsAssignableFrom<IEnumerable<RuntimeValidationCheckRegistration>>(result.Telemetry["queued_validation_checks"]);
+        var queuedCheck = Assert.Single(queuedChecks);
+        Assert.Equal("file_content", queuedCheck.Kind);
+        Assert.Equal("output-status", queuedCheck.Name);
+        Assert.Equal("/tmp/project/out/report.json", queuedCheck.Path);
+        Assert.Equal("status", queuedCheck.JsonPath);
+        Assert.Equal("\"ok\"", queuedCheck.ExpectedValueJson);
+        Assert.True(queuedCheck.Required);
+    }
+
+    private sealed class ThrowingProvider : IProviderAdapter
+    {
+        private readonly Exception _exception;
+
+        public ThrowingProvider(Exception exception)
+        {
+            _exception = exception;
+        }
+
+        public string Name => "throwing";
+
+        public Task<Response> CompleteAsync(Request request, CancellationToken ct = default) =>
+            Task.FromException<Response>(_exception);
+
+        public async IAsyncEnumerable<StreamEvent> StreamAsync(
+            Request request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
+    }
+
+    private sealed class EditAndVerifyProvider : IProviderAdapter
+    {
+        public string Name => "edit-and-verify";
+        private int _callCount;
+
+        public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+        {
+            _callCount++;
+            if (_callCount == 1)
+            {
+                var parts = new List<ContentPart>
+                {
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "edit-1",
+                        "edit_file",
+                        """{"file_path":"/fake/workdir/src/app.cs","old_string":"before","new_string":"after"}""")),
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "verify-1",
+                        "shell",
+                        """{"command":"uv run pytest tests/unit -q"}"""))
+                };
+
+                return Task.FromResult(new Response(
+                    Id: "resp-1",
+                    Model: request.Model,
+                    Provider: Name,
+                    Message: new Message(Role.Assistant, parts),
+                    FinishReason: FinishReason.ToolCalls,
+                    Usage: Usage.Empty));
+            }
+
+            var statusJson = """
+            {
+              "status": "success",
+              "preferred_next_label": "",
+              "suggested_next_ids": [],
+              "context_updates": {},
+              "notes": "implemented and verified"
+            }
+            """;
+
+            return Task.FromResult(new Response(
+                Id: "resp-2",
+                Model: request.Model,
+                Provider: Name,
+                Message: Message.AssistantMsg(statusJson),
+                FinishReason: FinishReason.Stop,
+                Usage: Usage.Empty));
+        }
+
+        public async IAsyncEnumerable<StreamEvent> StreamAsync(
+            Request request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
+    }
+
+    private sealed class EditAndQueueValidationProvider : IProviderAdapter
+    {
+        public string Name => "edit-and-queue-validation";
+        private int _callCount;
+
+        public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+        {
+            _callCount++;
+            if (_callCount == 1)
+            {
+                var parts = new List<ContentPart>
+                {
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "edit-1",
+                        "edit_file",
+                        """{"file_path":"/fake/workdir/src/app.cs","old_string":"before","new_string":"after"}""")),
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "queue-1",
+                        "queue_validation_check",
+                        """{"kind":"command","name":"unit-tests","command":"uv run pytest tests/unit -q","required":true}"""))
+                };
+
+                return Task.FromResult(new Response(
+                    Id: "resp-1",
+                    Model: request.Model,
+                    Provider: Name,
+                    Message: new Message(Role.Assistant, parts),
+                    FinishReason: FinishReason.ToolCalls,
+                    Usage: Usage.Empty));
+            }
+
+            var statusJson = """
+            {
+              "status": "success",
+              "preferred_next_label": "",
+              "suggested_next_ids": [],
+              "context_updates": {},
+              "notes": "implemented and queued validation"
+            }
+            """;
+
+            return Task.FromResult(new Response(
+                Id: "resp-2",
+                Model: request.Model,
+                Provider: Name,
+                Message: Message.AssistantMsg(statusJson),
+                FinishReason: FinishReason.Stop,
+                Usage: Usage.Empty));
+        }
+
+        public async IAsyncEnumerable<StreamEvent> StreamAsync(
+            Request request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
+    }
+
+    private sealed class EditAndQueueStructuredValidationProvider : IProviderAdapter
+    {
+        public string Name => "edit-and-queue-structured-validation";
+        private int _callCount;
+
+        public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+        {
+            _callCount++;
+            if (_callCount == 1)
+            {
+                var parts = new List<ContentPart>
+                {
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "edit-1",
+                        "edit_file",
+                        """{"file_path":"/fake/workdir/src/app.cs","old_string":"before","new_string":"after"}""")),
+                    ContentPart.ToolCallPart(new ToolCallData(
+                        "queue-1",
+                        "queue_validation_check",
+                        """{"kind":"file_content","name":"output-status","path":"/tmp/project/out/report.json","json_path":"status","expected_value_json":"\"ok\"","required":true}"""))
+                };
+
+                return Task.FromResult(new Response(
+                    Id: "resp-1",
+                    Model: request.Model,
+                    Provider: Name,
+                    Message: new Message(Role.Assistant, parts),
+                    FinishReason: FinishReason.ToolCalls,
+                    Usage: Usage.Empty));
+            }
+
+            var statusJson = """
+            {
+              "status": "success",
+              "preferred_next_label": "",
+              "suggested_next_ids": [],
+              "context_updates": {},
+              "notes": "implemented and queued structured validation"
+            }
+            """;
+
+            return Task.FromResult(new Response(
+                Id: "resp-2",
+                Model: request.Model,
+                Provider: Name,
+                Message: Message.AssistantMsg(statusJson),
+                FinishReason: FinishReason.Stop,
+                Usage: Usage.Empty));
+        }
+
+        public async IAsyncEnumerable<StreamEvent> StreamAsync(
+            Request request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
     }
 }

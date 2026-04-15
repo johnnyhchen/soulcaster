@@ -6,6 +6,8 @@ public class HandlerRegistry
 
     public HandlerRegistry(ICodergenBackend? backend = null, IInterviewer? interviewer = null, ISupervisorController? supervisorController = null)
     {
+        backend = backend is null ? null : SynchronizedCodergenBackend.Wrap(backend);
+
         // Register default handlers
         _handlers["Mdiamond"] = new StartHandler();
         _handlers["Msquare"] = new ExitHandler();
@@ -40,12 +42,56 @@ public class HandlerRegistry
     /// </summary>
     private class NullCodergenBackend : ICodergenBackend
     {
-        public Task<CodergenResult> RunAsync(string prompt, string? model = null, string? provider = null, string? reasoningEffort = null, CancellationToken ct = default)
+        public Task<CodergenResult> RunAsync(
+            string prompt,
+            string? model = null,
+            string? provider = null,
+            string? reasoningEffort = null,
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
         {
             return Task.FromResult(new CodergenResult(
                 Response: "[Simulated] Response for codergen node. No backend configured.",
                 Status: OutcomeStatus.Success
             ));
+        }
+    }
+
+    private sealed class SynchronizedCodergenBackend : ICodergenBackend, ISessionControlBackend
+    {
+        private readonly ICodergenBackend _inner;
+        private readonly SemaphoreSlim _runLock = new(1, 1);
+
+        private SynchronizedCodergenBackend(ICodergenBackend inner)
+        {
+            _inner = inner;
+        }
+
+        public static ICodergenBackend Wrap(ICodergenBackend backend) =>
+            backend is SynchronizedCodergenBackend ? backend : new SynchronizedCodergenBackend(backend);
+
+        public async Task<CodergenResult> RunAsync(
+            string prompt,
+            string? model = null,
+            string? provider = null,
+            string? reasoningEffort = null,
+            CancellationToken ct = default,
+            CodergenExecutionOptions? options = null)
+        {
+            await _runLock.WaitAsync(ct);
+            try
+            {
+                return await _inner.RunAsync(prompt, model, provider, reasoningEffort, ct, options);
+            }
+            finally
+            {
+                _runLock.Release();
+            }
+        }
+
+        public bool ResetThread(string threadId)
+        {
+            return _inner is ISessionControlBackend sessionControl && sessionControl.ResetThread(threadId);
         }
     }
 }

@@ -1,0 +1,17 @@
+digraph provider_invalid_gemini {
+    graph [goal="Validate codergen failure classification with an invalid Gemini model"]
+
+    start [shape=Mdiamond]
+    validate [
+        shape=box,
+        provider="gemini",
+        model="gemini-does-not-exist",
+        reasoning_effort="medium",
+        timeout="60s",
+        prompt="Return valid stage status JSON."
+    ]
+    done [shape=Msquare]
+
+    start -> validate
+    validate -> done
+}
