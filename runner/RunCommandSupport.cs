@@ -1,6 +1,6 @@
-using JcAttractor.Attractor;
+using Soulcaster.Attractor;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public sealed record RunOptions(
     string DotFilePath,

@@ -1,9 +1,9 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using JcAttractor.UnifiedLlm;
+using Soulcaster.UnifiedLlm;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public sealed record ProviderSyncSelection(
     string Provider,
@@ -48,7 +48,7 @@ public static class ProviderCommandSupport
 
         var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         if (!string.IsNullOrWhiteSpace(openAiKey))
-            adapters["openai"] = new OpenAiAdapter(openAiKey);
+            adapters["openai"] = new OpenAIAdapter(openAiKey);
 
         var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY");
         if (!string.IsNullOrWhiteSpace(geminiKey))
@@ -67,7 +67,7 @@ public static class ProviderCommandSupport
 
         var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         if (!string.IsNullOrWhiteSpace(openAiKey))
-            adapters["openai"] = new OpenAiAdapter(openAiKey);
+            adapters["openai"] = new OpenAIAdapter(openAiKey);
 
         var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY");
         if (!string.IsNullOrWhiteSpace(geminiKey))
@@ -126,8 +126,8 @@ public static class ProviderCommandSupport
 
         while (current is not null)
         {
-            var runnerProject = Path.Combine(current.FullName, "runner", "Runner.csproj");
-            var modelCatalog = Path.Combine(current.FullName, "src", "JcAttractor.UnifiedLlm", "ModelCatalog.cs");
+            var runnerProject = Path.Combine(current.FullName, "runner", "Soulcaster.Runner.csproj");
+            var modelCatalog = Path.Combine(current.FullName, "src", "Soulcaster.UnifiedLlm", "ModelCatalog.cs");
             if (File.Exists(runnerProject) && File.Exists(modelCatalog))
                 return current.FullName;
 
@@ -213,8 +213,8 @@ public static class ProviderCommandSupport
         var manifestPath = Path.Combine(generatedDir, $"{sanitizedRunName}.manifest.json");
         var outputDirectory = Path.Combine(dotfilesDir, "output", sanitizedRunName);
         var validationReportPath = Path.Combine(outputDirectory, "logs", "validate_sync", "VALIDATION-RUN-1.md");
-        var catalogPath = Path.Combine(repoRoot, "src", "JcAttractor.UnifiedLlm", "ModelCatalog.cs");
-        var testsProjectPath = Path.Combine(repoRoot, "tests", "JcAttractor.Tests", "JcAttractor.Tests.csproj");
+        var catalogPath = Path.Combine(repoRoot, "src", "Soulcaster.UnifiedLlm", "ModelCatalog.cs");
+        var testsProjectPath = Path.Combine(repoRoot, "tests", "Soulcaster.Tests", "Soulcaster.Tests.csproj");
         var orchestrator = ResolveOrchestrator(normalizedProvider);
 
         var manifest = new ProviderSyncManifest(
@@ -351,8 +351,8 @@ public static class ProviderCommandSupport
         sb.AppendLine("Goal: add the unknown models from that manifest to the Attractor model catalog and regression tests.");
         sb.AppendLine();
         sb.AppendLine($"Required repo root: {repositoryRoot}");
-        sb.AppendLine($"Primary source file: {Path.Combine(repositoryRoot, "src", "JcAttractor.UnifiedLlm", "ModelCatalog.cs")}");
-        sb.AppendLine($"Primary test area: {Path.Combine(repositoryRoot, "tests", "JcAttractor.Tests")}");
+        sb.AppendLine($"Primary source file: {Path.Combine(repositoryRoot, "src", "Soulcaster.UnifiedLlm", "ModelCatalog.cs")}");
+        sb.AppendLine($"Primary test area: {Path.Combine(repositoryRoot, "tests", "Soulcaster.Tests")}");
         sb.AppendLine();
         sb.AppendLine("Read any runtime probe artifacts that already exist before you choose metadata values:");
         if (unknownModels.Count == 0)

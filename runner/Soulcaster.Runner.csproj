@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\Soulcaster.Attractor\Soulcaster.Attractor.csproj" />
+    <ProjectReference Include="..\src\Soulcaster.UnifiedLlm\Soulcaster.UnifiedLlm.csproj" />
+    <ProjectReference Include="..\src\Soulcaster.CodingAgent\Soulcaster.CodingAgent.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Exclude agent-generated output files from compilation -->
+  <ItemGroup>
+    <Compile Remove="output/**" />
+    <None Remove="output/**" />
+  </ItemGroup>
+
+</Project>

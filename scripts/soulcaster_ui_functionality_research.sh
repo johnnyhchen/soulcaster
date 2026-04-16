@@ -25,13 +25,13 @@ dashboard_api_file="$state_dir/dashboard-api-snippet.txt"
 engine_files_file="$state_dir/engine-files.txt"
 dotfiles_file="$state_dir/example-dotfiles.txt"
 
-dotnet run --project "$repo_root/runner/Runner.csproj" -- help >"$web_help_file"
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers help >"$providers_help_file"
-dotnet run --project "$repo_root/runner/Runner.csproj" -- builder help >"$builder_help_file"
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- help >"$web_help_file"
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers help >"$providers_help_file"
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- builder help >"$builder_help_file"
 
 sed -n '1111,1505p' "$repo_root/runner/Program.cs" >"$dashboard_api_file"
 
-find "$repo_root/src/JcAttractor.Attractor" -maxdepth 2 -type f | sed "s|$repo_root/||" | sort >"$engine_files_file"
+find "$repo_root/src/Soulcaster.Attractor" -maxdepth 2 -type f | sed "s|$repo_root/||" | sort >"$engine_files_file"
 find "$repo_root/dotfiles" -maxdepth 1 -name '*.dot' | sed "s|$repo_root/||" | sort >"$dotfiles_file"
 
 cat >"$prompt_file" <<'EOF'
@@ -90,7 +90,7 @@ cat "$web_help_file" >>"$prompt_file"
   cat "$dotfiles_file"
 } >>"$prompt_file"
 
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke \
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke \
   --provider anthropic \
   --model claude-opus-4-6 \
   --prompt-file "$prompt_file" \

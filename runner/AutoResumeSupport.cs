@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public sealed record ResumeDecision(
     bool ShouldResume,

@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 internal sealed class WorkerProcess
 {

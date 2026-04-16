@@ -5,7 +5,7 @@ SOULCASTER_DIR="${SOULCASTER_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 DOTFILES_DIR="$SOULCASTER_DIR/dotfiles"
 QA_AGENT_DIR="${QA_AGENT_DIR:-$HOME/qa-agent}"
 RESULTS_DIR="${RESULTS_DIR:-$SOULCASTER_DIR/qa-results/$(date +%Y%m%d-%H%M%S)}"
-SOLUTION_FILE="$SOULCASTER_DIR/JcAttractor.sln"
+SOLUTION_FILE="$SOULCASTER_DIR/Soulcaster.sln"
 
 MODE_UNIT=false
 MODE_SCENARIO=false

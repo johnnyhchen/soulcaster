@@ -51,12 +51,12 @@ This means we do **not** jump straight to a full codergen v2 redesign, and we do
 
 | Gap | Current code |
 |---|---|
-| Retry falls through when no retry budget is configured | `src/JcAttractor.Attractor/Execution/PipelineEngine.cs:241-307` |
+| Retry falls through when no retry budget is configured | `src/Soulcaster.Attractor/Execution/PipelineEngine.cs:241-307` |
 | Sentinel timeout/error responses are all mapped to `Retry` | `runner/AgentCodergenBackend.cs:695-705` |
-| Fallback status still writes `contract_validated = true` | `src/JcAttractor.Attractor/Execution/StageStatusContract.cs:48-76` |
-| Node timeout and provider timeout are separate, inconsistent policies | `src/JcAttractor.Attractor/Execution/PipelineEngine.cs:490-508`, `runner/AgentCodergenBackend.cs:288-295`, `src/JcAttractor.CodingAgent/Session/SessionConfig.cs:3-13` |
-| `CodergenHandler` has no success guard for zero-edit implementation work | `src/JcAttractor.Attractor/Handlers/CodergenHandler.cs:118-168` |
-| The backend interface has no runtime options channel | `src/JcAttractor.Attractor/Handlers/CodergenHandler.cs:7-10` |
+| Fallback status still writes `contract_validated = true` | `src/Soulcaster.Attractor/Execution/StageStatusContract.cs:48-76` |
+| Node timeout and provider timeout are separate, inconsistent policies | `src/Soulcaster.Attractor/Execution/PipelineEngine.cs:490-508`, `runner/AgentCodergenBackend.cs:288-295`, `src/Soulcaster.CodingAgent/Session/SessionConfig.cs:3-13` |
+| `CodergenHandler` has no success guard for zero-edit implementation work | `src/Soulcaster.Attractor/Handlers/CodergenHandler.cs:118-168` |
+| The backend interface has no runtime options channel | `src/Soulcaster.Attractor/Handlers/CodergenHandler.cs:7-10` |
 
 ## Adopted Plan
 

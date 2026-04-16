@@ -1,0 +1,15 @@
+global using Soulcaster.Attractor.Execution;
+global using Soulcaster.Attractor.Handlers;
+global using Soulcaster.Attractor.HumanInTheLoop;
+global using Soulcaster.Attractor.Parser;
+global using Soulcaster.Attractor.Serialization;
+global using Soulcaster.Attractor.Stylesheet;
+global using Soulcaster.Attractor.Transforms;
+global using Soulcaster.Attractor.Validation;
+global using Soulcaster.CodingAgent;
+global using Soulcaster.CodingAgent.Profiles;
+global using Soulcaster.CodingAgent.Tools;
+global using Soulcaster.UnifiedLlm;
+global using Soulcaster.UnifiedLlm.Errors;
+global using Soulcaster.UnifiedLlm.Models;
+global using Soulcaster.UnifiedLlm.Providers;

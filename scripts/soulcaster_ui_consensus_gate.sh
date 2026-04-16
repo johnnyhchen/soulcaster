@@ -73,14 +73,14 @@ cat "$proposal_file" >>"$prompt_file"
   printf '\n```\n'
 } >>"$prompt_file"
 
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke \
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke \
   --provider anthropic \
   --model claude-opus-4-6 \
   --prompt-file "$prompt_file" \
   --image "$baseline_screenshot" \
   --save-text "$opus_eval_file" >/dev/null
 
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke \
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke \
   --provider openai \
   --model gpt-5.4 \
   --prompt-file "$prompt_file" \

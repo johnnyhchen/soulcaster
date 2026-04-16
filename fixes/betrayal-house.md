@@ -37,7 +37,7 @@ Fixes made to soulcaster attractor and/or dotfiles while running the betrayal-ho
 var useP0 = targetFile.StartsWith('/');
 var stripLevel = useP0 ? "0" : "1";
 ```
-**File:** `src/JcAttractor.CodingAgent/Profiles/OpenAiProfile.cs` (lines 211-220)
+**File:** `src/Soulcaster.CodingAgent/Profiles/OpenAiProfile.cs` (lines 211-220)
 **Status:** PARTIALLY EFFECTIVE — `write_file` calls now work (GameStateDto.cs created), but `apply_patch` for existing files may still fail due to shell escaping of patch content via `echo '...'`. The `echo` quoting breaks on single quotes, backticks, and `$` in patch content. Needs further investigation — may need to write patch to a temp file instead of piping via echo.
 
 ---
@@ -48,7 +48,7 @@ var stripLevel = useP0 ? "0" : "1";
 **Symptom:** Even with `-p0` fix, `apply_patch` calls for existing files still don't persist changes. `GameStateDto.cs` was created (via `write_file`) but `GameLobby.razor`, `GameHub.cs`, and `GameBoard.razor` were not modified.
 **Root cause:** The patch content was passed via `echo '...'` which breaks on single quotes (C# code is full of them — `'{'`, string literals, char literals). The escaping `patch.Replace("'", "'\"'\"'")` is fragile and fails on multi-line patches with mixed quoting.
 **Fix:** Write the patch to a temp file (`/tmp/attractor-patch-{guid}.diff`) and redirect via `patch -pN < tmpfile` instead of piping through echo. Temp file is cleaned up in a `finally` block.
-**File:** `src/JcAttractor.CodingAgent/Profiles/OpenAiProfile.cs` (lines 211-228)
+**File:** `src/Soulcaster.CodingAgent/Profiles/OpenAiProfile.cs` (lines 211-228)
 **Status:** APPLIED (but insufficient — see Fix 5)
 
 ---

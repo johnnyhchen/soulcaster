@@ -52,11 +52,11 @@ Close the remaining runtime gaps that materially affect orchestration, streaming
 
 ### Primary Files
 
-- `src/JcAttractor.Attractor/Handlers/ParallelHandler.cs`
-- `src/JcAttractor.Attractor/Handlers/FanInHandler.cs`
-- `src/JcAttractor.UnifiedLlm/Client.cs`
-- `tests/JcAttractor.Tests/AttractorTests.cs`
-- `tests/JcAttractor.Tests/UnifiedLlmTests.cs`
+- `src/Soulcaster.Attractor/Handlers/ParallelHandler.cs`
+- `src/Soulcaster.Attractor/Handlers/FanInHandler.cs`
+- `src/Soulcaster.UnifiedLlm/Client.cs`
+- `tests/Soulcaster.Tests/AttractorTests.cs`
+- `tests/Soulcaster.Tests/UnifiedLlmTests.cs`
 - `SPEC-COMPLETION-PLAN.md`
 
 ### Deliverables
@@ -87,11 +87,11 @@ Turn subagents into true background workers that can be spawned, messaged, await
 
 ### Primary Files
 
-- `src/JcAttractor.CodingAgent/Session/Session.cs`
-- `src/JcAttractor.CodingAgent/Session/SubAgent.cs`
-- `src/JcAttractor.CodingAgent/Profiles/SubagentTools.cs`
-- `src/JcAttractor.CodingAgent/Session/SessionState.cs`
-- `tests/JcAttractor.Tests/CodingAgentTests.cs`
+- `src/Soulcaster.CodingAgent/Session/Session.cs`
+- `src/Soulcaster.CodingAgent/Session/SubAgent.cs`
+- `src/Soulcaster.CodingAgent/Profiles/SubagentTools.cs`
+- `src/Soulcaster.CodingAgent/Session/SessionState.cs`
+- `tests/Soulcaster.Tests/CodingAgentTests.cs`
 
 ### Deliverables
 
@@ -125,14 +125,14 @@ Make provider and model selection measurable, configurable, and cost-aware rathe
 
 ### Primary Files
 
-- `src/JcAttractor.UnifiedLlm/Client.cs`
-- `src/JcAttractor.UnifiedLlm/ModelCatalog.cs`
-- `src/JcAttractor.UnifiedLlm/Models/Response.cs`
-- `src/JcAttractor.Attractor/Execution/PipelineEngine.cs`
+- `src/Soulcaster.UnifiedLlm/Client.cs`
+- `src/Soulcaster.UnifiedLlm/ModelCatalog.cs`
+- `src/Soulcaster.UnifiedLlm/Models/Response.cs`
+- `src/Soulcaster.Attractor/Execution/PipelineEngine.cs`
 - `runner/Program.cs`
 - `runner/RunnerRuntimeObserver.cs`
 - new `runner/ModelEval*.cs` support files
-- `tests/JcAttractor.Tests/UnifiedLlmTests.cs`
+- `tests/Soulcaster.Tests/UnifiedLlmTests.cs`
 
 ### Deliverables
 
@@ -169,9 +169,9 @@ Move Soulcaster from file-backed local operation to a durable run service that s
 
 - `runner/Program.cs`
 - `runner/RunManifest.cs`
-- `src/JcAttractor.Attractor/Execution/Checkpoint.cs`
-- `src/JcAttractor.Attractor/Execution/PipelineEngine.cs`
-- `src/JcAttractor.Attractor/HumanInTheLoop/FileInterviewer.cs`
+- `src/Soulcaster.Attractor/Execution/Checkpoint.cs`
+- `src/Soulcaster.Attractor/Execution/PipelineEngine.cs`
+- `src/Soulcaster.Attractor/HumanInTheLoop/FileInterviewer.cs`
 - new `runner/Storage/*.cs` or equivalent
 - new API and persistence tests
 

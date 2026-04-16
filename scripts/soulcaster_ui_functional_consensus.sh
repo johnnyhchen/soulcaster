@@ -98,8 +98,8 @@ openai_args=(
   --save-text "$gpt_eval_file"
 )
 
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke "${anthropic_args[@]}" >/dev/null
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke "${openai_args[@]}" >/dev/null
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke "${anthropic_args[@]}" >/dev/null
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke "${openai_args[@]}" >/dev/null
 
 {
   echo "# Consensus Gate"

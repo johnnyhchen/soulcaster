@@ -118,7 +118,7 @@ implement [
   require_verification="true",
   validation_mode="required",
   validation_profile="build",
-  validation_commands="dotnet build src/JcAttractor.Attractor/JcAttractor.Attractor.csproj --nologo --no-restore",
+  validation_commands="dotnet build src/Soulcaster.Attractor/Soulcaster.Attractor.csproj --nologo --no-restore",
   validation_timeout="5m"
 ]
 ```
@@ -173,7 +173,7 @@ The runtime should persist an explicit manifest for each stage, for example:
       "id": "build-1",
       "kind": "command",
       "name": "project-build",
-      "command": "dotnet build src/JcAttractor.Attractor/JcAttractor.Attractor.csproj --nologo --no-restore",
+      "command": "dotnet build src/Soulcaster.Attractor/Soulcaster.Attractor.csproj --nologo --no-restore",
       "workdir": "/repo",
       "timeout_ms": 300000,
       "required": true,

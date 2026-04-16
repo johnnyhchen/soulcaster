@@ -196,7 +196,7 @@ if [ -s "$feedback_file" ]; then
   } >>"$prompt_file"
 fi
 
-dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke \
+dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke \
   --provider gemini \
   --model "${SOULCASTER_UI_IDEATION_MODEL:-gemini-3-pro-image-preview}" \
   --prompt-file "$prompt_file" \

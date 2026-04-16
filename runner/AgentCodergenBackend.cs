@@ -1,10 +1,10 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using JcAttractor.Attractor;
-using JcAttractor.CodingAgent;
-using JcAttractor.UnifiedLlm;
+using Soulcaster.Attractor;
+using Soulcaster.CodingAgent;
+using Soulcaster.UnifiedLlm;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public static class RunnerBackendFactory
 {
@@ -47,6 +47,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
 {
     private const int MaxStatusParseAttempts = 3;
     private const int MaxHelperRounds = 2;
+    private static readonly Regex ProviderStatusCodePattern = new(@"\b(?<status>[45]\d\d)\b", RegexOptions.Compiled);
 
     private readonly string _workingDir;
     private readonly string _projectRoot;
@@ -338,7 +339,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             case "openai":
                 var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
                     ?? throw new InvalidOperationException("OPENAI_API_KEY not set.");
-                return (new OpenAiAdapter(openAiKey), new OpenAiProfile());
+                return (new OpenAIAdapter(openAiKey), new OpenAIProfile());
 
             case "gemini":
                 var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY")
@@ -1059,6 +1060,12 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         if (string.IsNullOrWhiteSpace(normalized))
             return new TerminalResponseClassification(OutcomeStatus.Fail, "error", "provider_error");
 
+        var providerStatusCode = TryExtractProviderStatusCode(errorText, out var parsedStatusCode)
+            ? parsedStatusCode
+            : normalized.Contains("too many requests", StringComparison.Ordinal) ? 429
+            : normalized.Contains("high demand", StringComparison.Ordinal) ? 503
+            : (int?)null;
+
         if (normalized.Contains("rate limit", StringComparison.Ordinal) ||
             normalized.Contains("too many requests", StringComparison.Ordinal) ||
             normalized.Contains("high demand", StringComparison.Ordinal))
@@ -1067,10 +1074,13 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 OutcomeStatus.Retry,
                 "rate_limited",
                 "provider_rate_limit",
+                ProviderStatusCode: providerStatusCode,
+                ProviderRetryable: true,
                 ErrorMessage: errorText);
         }
 
-        if (normalized.Contains("unauthorized", StringComparison.Ordinal) ||
+        if (providerStatusCode is 401 or 403 ||
+            normalized.Contains("unauthorized", StringComparison.Ordinal) ||
             normalized.Contains("forbidden", StringComparison.Ordinal) ||
             normalized.Contains("api key", StringComparison.Ordinal) ||
             normalized.Contains("authentication", StringComparison.Ordinal))
@@ -1079,10 +1089,13 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 OutcomeStatus.Fail,
                 "auth_failed",
                 "provider_auth",
+                ProviderStatusCode: providerStatusCode,
+                ProviderRetryable: false,
                 ErrorMessage: errorText);
         }
 
-        if (normalized.Contains("not found", StringComparison.Ordinal) ||
+        if (providerStatusCode == 404 ||
+            normalized.Contains("not found", StringComparison.Ordinal) ||
             normalized.Contains("is not found", StringComparison.Ordinal) ||
             normalized.Contains("does not exist", StringComparison.Ordinal))
         {
@@ -1090,6 +1103,8 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 OutcomeStatus.Fail,
                 "not_found",
                 "provider_not_found",
+                ProviderStatusCode: providerStatusCode,
+                ProviderRetryable: false,
                 ErrorMessage: errorText);
         }
 
@@ -1101,6 +1116,8 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 OutcomeStatus.Fail,
                 "content_filtered",
                 "provider_content_filter",
+                ProviderStatusCode: providerStatusCode,
+                ProviderRetryable: false,
                 ErrorMessage: errorText);
         }
 
@@ -1111,6 +1128,19 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 OutcomeStatus.Fail,
                 "error",
                 "provider_protocol_error",
+                ProviderStatusCode: providerStatusCode,
+                ProviderRetryable: false,
+                ErrorMessage: errorText);
+        }
+
+        if (providerStatusCode >= 500)
+        {
+            return new TerminalResponseClassification(
+                OutcomeStatus.Retry,
+                "transient_error",
+                "provider_transient_error",
+                ProviderStatusCode: providerStatusCode,
+                ProviderRetryable: true,
                 ErrorMessage: errorText);
         }
 
@@ -1118,7 +1148,22 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             OutcomeStatus.Fail,
             "error",
             "provider_error",
+            ProviderStatusCode: providerStatusCode,
+            ProviderRetryable: providerStatusCode is not null ? false : null,
             ErrorMessage: errorText);
+    }
+
+    private static bool TryExtractProviderStatusCode(string errorText, out int statusCode)
+    {
+        var match = ProviderStatusCodePattern.Match(errorText);
+        if (match.Success &&
+            int.TryParse(match.Groups["status"].Value, out statusCode))
+        {
+            return true;
+        }
+
+        statusCode = default;
+        return false;
     }
 
     private static string ExtractErrorText(string response)
@@ -1323,7 +1368,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             case AnthropicProfile ap:
                 ap.Model = resolved;
                 break;
-            case OpenAiProfile op:
+            case OpenAIProfile op:
                 op.Model = resolved;
                 break;
             case GeminiProfile gp:

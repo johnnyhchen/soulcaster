@@ -31,7 +31,7 @@ Implement the accepted overhaul with these constraints:
 8. Avoid exploratory churn. Read only what you need, then edit DashboardHtml decisively.
 
 After making changes:
-- Run dotnet build /Users/Johnny.Chen/soulcaster/runner/Runner.csproj
+- Run dotnet build /Users/Johnny.Chen/soulcaster/runner/Soulcaster.Runner.csproj
 - Write logs/ui_functional_overhaul_implement/IMPLEMENTATION-1.md summarizing the changes and build result
 
 Return success only if the build passes and the accepted overhaul has been implemented."
@@ -40,7 +40,7 @@ Return success only if the build passes and the accepted overhaul has been imple
     validate_build [
         shape=parallelogram,
         label="Validate build",
-        tool_command="cd /Users/Johnny.Chen/soulcaster && dotnet build runner/Runner.csproj"
+        tool_command="cd /Users/Johnny.Chen/soulcaster && dotnet build runner/Soulcaster.Runner.csproj"
     ]
 
     start -> implement

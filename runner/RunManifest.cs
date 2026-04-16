@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public enum AutoResumePolicy
 {

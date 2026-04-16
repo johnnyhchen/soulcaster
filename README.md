@@ -8,9 +8,9 @@ You define your workflow as a Graphviz DOT file: nodes are AI tasks (LLM calls, 
 
 ```
 src/
-├── JcAttractor.Attractor/      # Pipeline engine, DOT parser, handlers, graph model
-├── JcAttractor.CodingAgent/    # Agentic coding loop (tool use, multi-turn sessions)
-└── JcAttractor.UnifiedLlm/     # Multi-provider LLM client (Anthropic, OpenAI, Gemini)
+├── Soulcaster.Attractor/      # Pipeline engine, DOT parser, handlers, graph model
+├── Soulcaster.CodingAgent/    # Agentic coding loop (tool use, multi-turn sessions)
+└── Soulcaster.UnifiedLlm/     # Multi-provider LLM client (Anthropic, OpenAI, Gemini)
 
 runner/                         # CLI runner that executes a .dot pipeline
 tests/                          # Test suite

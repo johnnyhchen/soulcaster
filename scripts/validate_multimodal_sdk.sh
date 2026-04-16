@@ -58,7 +58,7 @@ run_provider() {
 
   mkdir -p "$provider_dir"
 
-  dotnet run --project "$repo_root/runner/Runner.csproj" -- providers invoke \
+  dotnet run --project "$repo_root/runner/Soulcaster.Runner.csproj" -- providers invoke \
     --provider "$provider" \
     --model "$model" \
     --prompt-file "$prompt_file" \

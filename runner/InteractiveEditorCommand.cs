@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public static class InteractiveEditorCommand
 {

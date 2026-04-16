@@ -1,7 +1,7 @@
-using JcAttractor.Attractor;
+using Soulcaster.Attractor;
 using System.Text;
 
-namespace JcAttractor.Runner;
+namespace Soulcaster.Runner;
 
 public static class BuilderCommandSupport
 {
