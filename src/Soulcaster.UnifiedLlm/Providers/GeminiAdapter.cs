@@ -152,11 +152,12 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         Usage? finalUsage = null;
         bool started = false;
 
-        while (!reader.EndOfStream)
+        while (true)
         {
             ct.ThrowIfCancellationRequested();
             var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-            if (line is null) break;
+            if (line is null)
+                break;
 
             if (!line.StartsWith("data: ")) continue;
             var data = line["data: ".Length..];

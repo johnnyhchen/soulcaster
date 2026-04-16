@@ -134,11 +134,12 @@ public sealed class AnthropicAdapter : IProviderAdapter, IProviderDiscoveryAdapt
         string? responseId = null;
         string? responseModel = null;
 
-        while (!reader.EndOfStream)
+        while (true)
         {
             ct.ThrowIfCancellationRequested();
             var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-            if (line is null) break;
+            if (line is null)
+                break;
 
             if (line.StartsWith("event: "))
             {
