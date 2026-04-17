@@ -168,6 +168,27 @@ public class DotParserTests
     }
 
     [Fact]
+    public void EdgeSelector_ConditionalMatches_IgnoreSuggestedNextIds()
+    {
+        var edges = new List<GraphEdge>
+        {
+            new() { FromNode = "gate", ToNode = "DefineDoD_Gemini", Condition = "outcome=needs_dod" },
+            new() { FromNode = "gate", ToNode = "DefineDoD_GPT", Condition = "outcome=needs_dod" },
+            new() { FromNode = "gate", ToNode = "DefineDoD_Opus", Condition = "outcome=needs_dod" }
+        };
+        var outcome = new Outcome(
+            OutcomeStatus.Success,
+            SuggestedNextIds: ["DefineDoD_Opus", "DefineDoD_Gemini"]);
+        var context = new PipelineContext();
+        context.Set("outcome", "needs_dod");
+
+        var selected = EdgeSelector.SelectEdge(edges, outcome with { Notes = "x" }, context);
+
+        Assert.NotNull(selected);
+        Assert.Equal("DefineDoD_GPT", selected!.ToNode);
+    }
+
+    [Fact]
     public void Parse_GraphAttributes_SetCorrectly()
     {
         var dot = @"digraph G {
@@ -183,6 +204,52 @@ public class DotParserTests
         Assert.Equal("Build the feature", graph.Goal);
         Assert.Equal(5, graph.DefaultMaxRetry);
         Assert.Contains("claude-opus-4-6", graph.ModelStylesheet);
+    }
+
+    [Fact]
+    public void Parse_GraphAttributes_AcceptsDefaultMaxRetriesCanonicalName()
+    {
+        var dot = @"digraph G {
+            goal = ""Build the feature""
+            default_max_retries = 4
+            start [shape=Mdiamond]
+            done [shape=Msquare]
+            start -> done
+        }";
+
+        var graph = DotParser.Parse(dot);
+        Assert.Equal(4, graph.DefaultMaxRetry);
+    }
+
+    [Fact]
+    public void Parse_AiDotRunnerAliases_AreCanonicalized()
+    {
+        var dot = @"digraph G {
+            graph [context_fidelity_default=""truncate"", context_thread_default=""shared-thread""]
+            Start [node_type=""start"", shape=""circle"", timeout=""300""]
+            Check [node_type=""stack.steer"", shape=""diamond"", is_codergen=""true"", llm_prompt=""Check $task"", llm_model=""gpt-5.2-2025-12-11"", llm_provider=""openai"", max_retry=""2"", context_thread=""review"", context_fidelity_in=""summary:high"", timeout=""120""]
+            Exit [node_type=""exit"", shape=""doublecircle""]
+            Start -> Check -> Exit
+        }";
+
+        var graph = DotParser.Parse(dot);
+        var start = graph.Nodes["Start"];
+        var check = graph.Nodes["Check"];
+        var exit = graph.Nodes["Exit"];
+
+        Assert.Equal("truncate", graph.DefaultFidelity);
+        Assert.Equal("shared-thread", graph.Attributes["default_thread_id"]);
+        Assert.Equal("Mdiamond", start.Shape);
+        Assert.Equal("Msquare", exit.Shape);
+        Assert.Equal("box", check.Shape);
+        Assert.Equal("Check $task", check.Prompt);
+        Assert.Equal("gpt-5.2-2025-12-11", check.LlmModel);
+        Assert.Equal("openai", check.LlmProvider);
+        Assert.Equal(2, check.MaxRetries);
+        Assert.Equal("review", check.ThreadId);
+        Assert.Equal("summary:high", check.Fidelity);
+        Assert.Equal("120s", check.Timeout);
+        Assert.True(check.AllowPartial);
     }
 
     [Fact]
@@ -669,6 +736,17 @@ public class ConditionEvaluatorTests
     }
 
     [Fact]
+    public void Evaluate_OutcomeEquals_UsesCustomOutcomeFromContext()
+    {
+        var outcome = new Outcome(OutcomeStatus.Success);
+        var ctx = new PipelineContext();
+        ctx.Set("outcome", "needs_dod");
+
+        Assert.True(ConditionEvaluator.Evaluate("outcome=needs_dod", outcome, ctx));
+        Assert.False(ConditionEvaluator.Evaluate("outcome=success", outcome, ctx));
+    }
+
+    [Fact]
     public void Evaluate_OutcomeNotEquals_Works()
     {
         var outcome = new Outcome(OutcomeStatus.Fail);
@@ -773,6 +851,35 @@ public class EdgeSelectorTests
     }
 
     [Fact]
+    public void SelectEdge_NoEligibleConditionalEdge_ReturnsNull()
+    {
+        var edges = new List<GraphEdge>
+        {
+            new() { FromNode = "a", ToNode = "b", Condition = "outcome=success" },
+            new() { FromNode = "a", ToNode = "c", Condition = "outcome=retry" }
+        };
+
+        var result = EdgeSelector.SelectEdge(edges, new Outcome(OutcomeStatus.Fail), new PipelineContext());
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void SelectEdge_PreferredLabel_DoesNotSatisfyConditionalFallback()
+    {
+        var edges = new List<GraphEdge>
+        {
+            new() { FromNode = "a", ToNode = "done", Condition = "outcome=yes" },
+            new() { FromNode = "a", ToNode = "retry", Condition = "outcome=retry" }
+        };
+        var outcome = new Outcome(OutcomeStatus.Success, PreferredLabel: "yes");
+
+        var result = EdgeSelector.SelectEdge(edges, outcome, new PipelineContext());
+
+        Assert.Null(result);
+    }
+
+    [Fact]
     public void SelectEdge_PreferredLabel_MatchesEdgeLabel()
     {
         var edges = new List<GraphEdge>
@@ -836,6 +943,8 @@ public class EdgeSelectorTests
         Assert.Equal("approve", EdgeSelector.NormalizeLabel("[Y] Approve"));
         Assert.Equal("reject", EdgeSelector.NormalizeLabel("[N] Reject"));
         Assert.Equal("done", EdgeSelector.NormalizeLabel("[Yes] Done"));
+        Assert.Equal("approve", EdgeSelector.NormalizeLabel("Y) Approve"));
+        Assert.Equal("reject", EdgeSelector.NormalizeLabel("N - Reject"));
     }
 
     [Fact]
@@ -1010,6 +1119,27 @@ public class TransformTests
     }
 
     [Fact]
+    public void VariableExpansionTransform_ExpandsGraphVariables()
+    {
+        var graph = new Graph();
+        graph.Attributes["task"] = "Ship JSON reporter";
+        graph.Attributes["definition_of_done"] = "CLI plus tests";
+        graph.Goal = "$task";
+        graph.Nodes["a"] = new GraphNode
+        {
+            Id = "a",
+            Shape = "box",
+            Prompt = "Task: $task\nDoD: $definition_of_done\nGoal: $goal"
+        };
+
+        var transform = new VariableExpansionTransform();
+        var result = transform.Transform(graph);
+
+        Assert.Equal("Ship JSON reporter", result.Goal);
+        Assert.Equal("Task: Ship JSON reporter\nDoD: CLI plus tests\nGoal: Ship JSON reporter", result.Nodes["a"].Prompt);
+    }
+
+    [Fact]
     public void StylesheetTransform_AppliesModelFromStylesheet()
     {
         var graph = new Graph
@@ -1043,6 +1173,23 @@ public class TransformTests
         var result = transform.Transform(graph);
 
         Assert.Equal("gpt-5.2", result.Nodes["coder"].LlmModel); // Explicit wins
+    }
+
+    [Fact]
+    public void StylesheetTransform_AcceptsAiDotRunnerPropertySyntax()
+    {
+        var graph = new Graph
+        {
+            ModelStylesheet = "* { llm_model: \"gpt-5.2\"; llm_provider: \"openai\"; reasoning_effort: \"medium\"; }"
+        };
+        graph.Nodes["coder"] = new GraphNode { Id = "coder", Shape = "box", Prompt = "work" };
+
+        var transform = new StylesheetTransform();
+        var result = transform.Transform(graph);
+
+        Assert.Equal("gpt-5.2", result.Nodes["coder"].LlmModel);
+        Assert.Equal("openai", result.Nodes["coder"].LlmProvider);
+        Assert.Equal("medium", result.Nodes["coder"].ReasoningEffort);
     }
 }
 
@@ -1132,6 +1279,38 @@ public class Phase1FixTests
             Assert.NotNull(outcome.ContextUpdates);
             Assert.Contains("tool_test.stdout", outcome.ContextUpdates!.Keys);
             Assert.Contains("hello", outcome.ContextUpdates["tool_test.stdout"]);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ToolHandler_ExpandsGraphAndContextVariables()
+    {
+        var handler = new ToolHandler();
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        try
+        {
+            var node = new GraphNode
+            {
+                Id = "tool_expand",
+                Shape = "parallelogram",
+                RawAttributes = new Dictionary<string, string>
+                {
+                    ["tool_command"] = "printf '%s|%s|%s' '$task' '${context.answer}' '$goal'"
+                }
+            };
+            var context = new PipelineContext();
+            context.Set("answer", "42");
+            var graph = new Graph { Goal = "Ship the CLI" };
+            graph.Attributes["task"] = "Implement reporter";
+
+            var outcome = await handler.ExecuteAsync(node, context, graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            Assert.Equal("Implement reporter|42|Ship the CLI", outcome.ContextUpdates!["tool_expand.stdout"]);
         }
         finally
         {
@@ -1871,7 +2050,7 @@ public class HandlerAdditionalTests
         var outcome = await handler.ExecuteAsync(
             graph.Nodes["fanin"], context, graph, "/tmp");
 
-        Assert.Equal(OutcomeStatus.Success, outcome.Status);
+        Assert.Equal(OutcomeStatus.Fail, outcome.Status);
     }
 
     [Fact]
@@ -2356,7 +2535,7 @@ public class ParityMatrixTests
             new() { FromNode = "a", ToNode = "c", Condition = "outcome=success", Weight = 1 }
         };
         var result = EdgeSelector.SelectEdge(edges, new Outcome(OutcomeStatus.Success), new PipelineContext());
-        Assert.Equal("c", result!.ToNode); // Condition match wins
+        Assert.Equal("c", result!.ToNode); // Conditional matches outrank unconditional edges
     }
 
     [Fact]
@@ -2467,6 +2646,7 @@ public class ParityMatrixTests
             var parallelOutcome = await parallelHandler.ExecuteAsync(
                 graph.Nodes["parallel"], context, graph, tempDir);
             Assert.Equal(OutcomeStatus.Success, parallelOutcome.Status);
+            context.Set("parallel.results", parallelOutcome.ContextUpdates!["parallel.results"]);
 
             // Fan-in
             var fanInOutcome = await fanInHandler.ExecuteAsync(
@@ -2933,7 +3113,7 @@ public class ParallelHandlerPolicyTests
 public class FanInHandlerTests
 {
     [Fact]
-    public async Task FanInHandler_ReturnsSuccess_WhenNoResults()
+    public async Task FanInHandler_ReturnsFail_WhenNoResults()
     {
         var handler = new FanInHandler();
         var context = new PipelineContext();
@@ -2944,7 +3124,52 @@ public class FanInHandlerTests
         try
         {
             var outcome = await handler.ExecuteAsync(node, context, graph, tempDir);
-            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Contains("missing", outcome.Notes, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task FanInHandler_ReturnsFail_WhenResultsMalformed()
+    {
+        var handler = new FanInHandler();
+        var context = new PipelineContext();
+        var graph = new Graph();
+        var node = new GraphNode { Id = "fan_in", Shape = "tripleoctagon" };
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        context.Set("parallel.results", "{not-json");
+
+        try
+        {
+            var outcome = await handler.ExecuteAsync(node, context, graph, tempDir);
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Contains("malformed", outcome.Notes, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task FanInHandler_ReturnsFail_WhenResultsEmpty()
+    {
+        var handler = new FanInHandler();
+        var context = new PipelineContext();
+        var graph = new Graph();
+        var node = new GraphNode { Id = "fan_in", Shape = "tripleoctagon" };
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        context.Set("parallel.results", "[]");
+
+        try
+        {
+            var outcome = await handler.ExecuteAsync(node, context, graph, tempDir);
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Contains("empty", outcome.Notes, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -3426,6 +3651,36 @@ public class T5_ToolHandlerTimeoutTests
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
     }
+
+    [Fact]
+    public async Task ToolHandler_TimesOut_WhenTimeoutUsesDurationSuffix()
+    {
+        var handler = new ToolHandler();
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        try
+        {
+            var node = new GraphNode
+            {
+                Id = "timeout_test_duration", Shape = "parallelogram",
+                RawAttributes = new Dictionary<string, string>
+                {
+                    ["tool_command"] = "sleep 30",
+                    ["timeout"] = "500ms"
+                }
+            };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), new Graph(), tempDir);
+            sw.Stop();
+
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Contains("timed out", outcome.Notes);
+            Assert.True(sw.ElapsedMilliseconds < 10000, $"Timeout took {sw.ElapsedMilliseconds}ms, expected < 10s");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
 }
 
 public class T6_ToolHandlerEnvFilteringTests
@@ -3849,7 +4104,7 @@ public class T16_CheckpointFidelityDegradationTests
             // Build a graph: start → coder → done
             var graph = new Graph { Goal = "test" };
             graph.Nodes["start"] = new GraphNode { Id = "start", Shape = "Mdiamond" };
-            graph.Nodes["coder"] = new GraphNode { Id = "coder", Shape = "box", Prompt = "work" };
+            graph.Nodes["coder"] = new GraphNode { Id = "coder", Shape = "box", Prompt = "work", Fidelity = "full" };
             graph.Nodes["done"] = new GraphNode { Id = "done", Shape = "Msquare" };
             graph.Edges.Add(new GraphEdge { FromNode = "start", ToNode = "coder" });
             graph.Edges.Add(new GraphEdge { FromNode = "coder", ToNode = "done" });

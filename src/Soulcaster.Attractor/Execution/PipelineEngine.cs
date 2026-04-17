@@ -21,8 +21,15 @@ public record PipelineResult(
 
 public class PipelineEngine
 {
+    private const string PendingForkContextKey = "implicit_fork.pending";
+
     private readonly PipelineConfig _config;
     private readonly HandlerRegistry _registry;
+
+    private sealed record PendingForkState(
+        string SourceNodeId,
+        string JoinNodeId,
+        List<string> RemainingTargetIds);
 
     public PipelineEngine(PipelineConfig config)
     {
@@ -145,11 +152,45 @@ public class PipelineEngine
                     }
                 }
 
-                // Execute exit handler
+                currentNode = ResolveRuntimeNode(currentNode, currentNodeId, incomingEdge, graph, context);
+
+                if (_config.RuntimeObserver is not null)
+                    await _config.RuntimeObserver.OnStageStartedAsync(currentNodeId, currentNode, context, ct);
+
+                var exitStageStartedAt = DateTimeOffset.UtcNow;
+                await WriteTelemetryEventAsync(
+                    eventType: "stage_start",
+                    nodeId: currentNodeId,
+                    data: new Dictionary<string, object?>
+                    {
+                        ["shape"] = currentNode.Shape,
+                        ["fidelity"] = currentNode.Fidelity,
+                        ["thread_id"] = currentNode.ThreadId
+                    },
+                    ct: ct);
+
                 var exitHandler = _registry.GetHandlerOrThrow(currentNode.Shape);
-                var exitOutcome = await exitHandler.ExecuteAsync(currentNode, context, graph, _config.LogsRoot, ct);
+                var exitOutcome = await ExecuteWithTimeoutAsync(exitHandler, currentNode, context, graph, ct);
+                context.MergeUpdates(exitOutcome.ContextUpdates);
                 completedNodes.Add(currentNodeId);
                 nodeOutcomes[currentNodeId] = exitOutcome;
+
+                var exitStageDurationMs = (long)Math.Max(0, (DateTimeOffset.UtcNow - exitStageStartedAt).TotalMilliseconds);
+                var exitStageEndData = new Dictionary<string, object?>
+                {
+                    ["status"] = StageStatusContract.ToStatusString(exitOutcome.Status),
+                    ["preferred_next_label"] = exitOutcome.PreferredLabel,
+                    ["notes"] = exitOutcome.Notes,
+                    ["duration_ms"] = exitStageDurationMs
+                };
+                MergeTelemetry(exitStageEndData, exitOutcome.Telemetry);
+
+                await WriteTelemetryEventAsync(
+                    eventType: "stage_end",
+                    nodeId: currentNodeId,
+                    data: exitStageEndData,
+                    ct: ct);
+                await WriteNodeStatusAsync(currentNodeId, exitOutcome, ct);
 
                 // ── FINALIZE phase ──────────────────────────────────────
                 var duration = DateTimeOffset.UtcNow - startTime;
@@ -398,6 +439,34 @@ public class PipelineEngine
                 continue;
             }
 
+            if (TryContinueImplicitFork(
+                    currentNodeId,
+                    outcome,
+                    graph,
+                    context,
+                    out var continuedForkNode,
+                    out var continuedForkIncomingEdge))
+            {
+                await SaveCheckpointAsync(currentNodeId, continuedForkNode!, selectedEdge: null, completedNodes, context, retryCounts, ct);
+                currentNodeId = continuedForkNode!;
+                incomingEdge = continuedForkIncomingEdge;
+                continue;
+            }
+
+            if (TryStartImplicitFork(
+                    currentNodeId,
+                    outcome,
+                    graph,
+                    context,
+                    out var startedForkNode,
+                    out var startedForkIncomingEdge))
+            {
+                await SaveCheckpointAsync(currentNodeId, startedForkNode!, selectedEdge: startedForkIncomingEdge, completedNodes, context, retryCounts, ct);
+                currentNodeId = startedForkNode!;
+                incomingEdge = startedForkIncomingEdge;
+                continue;
+            }
+
             // Step 4: Select next edge
             var outgoingEdges = graph.OutgoingEdges(currentNodeId);
             if (outgoingEdges.Count == 0)
@@ -482,7 +551,7 @@ public class PipelineEngine
         if (!string.IsNullOrWhiteSpace(graph.DefaultFidelity))
             return graph.DefaultFidelity;
 
-        return "full";
+        return "compact";
     }
 
     private static string ResolveThreadId(GraphNode node, string nodeId, GraphEdge? incomingEdge, Graph graph)
@@ -504,7 +573,7 @@ public class PipelineEngine
 
     private static bool IsFullFidelity(string fidelity)
     {
-        return string.IsNullOrWhiteSpace(fidelity) || fidelity.Equals("full", StringComparison.OrdinalIgnoreCase);
+        return fidelity.Equals("full", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<Outcome> ExecuteWithTimeoutAsync(
@@ -774,6 +843,211 @@ public class PipelineEngine
         }
 
         return graph.Nodes.ContainsKey(nextNodeId) ? nextNodeId : null;
+    }
+
+    private static bool TryContinueImplicitFork(
+        string currentNodeId,
+        Outcome outcome,
+        Graph graph,
+        PipelineContext context,
+        out string? nextNodeId,
+        out GraphEdge? incomingEdge)
+    {
+        nextNodeId = null;
+        incomingEdge = null;
+
+        var pending = LoadPendingForkState(context);
+        if (pending is null)
+            return false;
+
+        var eligibleJoinEdge = graph.OutgoingEdges(currentNodeId)
+            .FirstOrDefault(edge =>
+                edge.ToNode == pending.JoinNodeId &&
+                (string.IsNullOrWhiteSpace(edge.Condition) || ConditionEvaluator.Evaluate(edge.Condition, outcome, context)));
+
+        if (eligibleJoinEdge is null)
+            return false;
+
+        if (pending.RemainingTargetIds.Count == 0)
+        {
+            StorePendingForkState(context, null);
+            return false;
+        }
+
+        var selectedNextNodeId = pending.RemainingTargetIds[0];
+        nextNodeId = selectedNextNodeId;
+        pending.RemainingTargetIds.RemoveAt(0);
+        StorePendingForkState(context, pending.RemainingTargetIds.Count > 0 ? pending : null);
+        incomingEdge = graph.OutgoingEdges(pending.SourceNodeId).FirstOrDefault(edge => edge.ToNode == selectedNextNodeId);
+        return true;
+    }
+
+    private static bool TryStartImplicitFork(
+        string currentNodeId,
+        Outcome outcome,
+        Graph graph,
+        PipelineContext context,
+        out string? nextNodeId,
+        out GraphEdge? incomingEdge)
+    {
+        nextNodeId = null;
+        incomingEdge = null;
+
+        var outgoingEdges = graph.OutgoingEdges(currentNodeId);
+
+        if (LoadPendingForkState(context) is not null ||
+            HasSupportedExplicitRouteDirective(outcome, outgoingEdges))
+        {
+            return false;
+        }
+
+        var forkEdges = DetectImplicitForkEdges(currentNodeId, outcome, graph, context);
+        if (forkEdges.Count < 2)
+            return false;
+
+        var joinNodeId = FindImplicitForkJoinNode(graph, forkEdges);
+        if (string.IsNullOrWhiteSpace(joinNodeId))
+            return false;
+
+        nextNodeId = forkEdges[0].ToNode;
+        incomingEdge = forkEdges[0];
+
+        var remaining = forkEdges.Skip(1).Select(edge => edge.ToNode).ToList();
+        if (remaining.Count > 0)
+        {
+            StorePendingForkState(context, new PendingForkState(
+                SourceNodeId: currentNodeId,
+                JoinNodeId: joinNodeId!,
+                RemainingTargetIds: remaining));
+        }
+
+        return true;
+    }
+
+    private static bool HasSupportedExplicitRouteDirective(Outcome outcome, IReadOnlyList<GraphEdge> outgoingEdges)
+    {
+        if (!string.IsNullOrWhiteSpace(outcome.PreferredLabel))
+        {
+            var normalizedPreferred = EdgeSelector.NormalizeLabel(outcome.PreferredLabel);
+            if (outgoingEdges.Any(edge =>
+                    string.IsNullOrWhiteSpace(edge.Condition) &&
+                    !string.IsNullOrWhiteSpace(edge.Label) &&
+                    EdgeSelector.NormalizeLabel(edge.Label) == normalizedPreferred))
+            {
+                return true;
+            }
+        }
+
+        if (outcome.SuggestedNextIds is { Count: > 0 } &&
+            outcome.SuggestedNextIds.Any(suggestedId =>
+                outgoingEdges.Any(edge =>
+                    string.IsNullOrWhiteSpace(edge.Condition) &&
+                    edge.ToNode == suggestedId)))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static List<GraphEdge> DetectImplicitForkEdges(
+        string currentNodeId,
+        Outcome outcome,
+        Graph graph,
+        PipelineContext context)
+    {
+        var edges = graph.OutgoingEdges(currentNodeId)
+            .Where(edge =>
+                !edge.LoopRestart &&
+                !edge.ContextReset)
+            .ToList();
+
+        if (edges.Count < 2)
+            return [];
+
+        var unconditional = edges
+            .Where(edge => string.IsNullOrWhiteSpace(edge.Condition))
+            .ToList();
+        if (unconditional.Count > 1)
+            return unconditional;
+
+        var conditionGroups = new Dictionary<string, List<GraphEdge>>(StringComparer.Ordinal);
+        foreach (var edge in edges)
+        {
+            if (string.IsNullOrWhiteSpace(edge.Condition) ||
+                !ConditionEvaluator.Evaluate(edge.Condition, outcome, context))
+            {
+                continue;
+            }
+
+            if (!conditionGroups.TryGetValue(edge.Condition, out var group))
+            {
+                group = new List<GraphEdge>();
+                conditionGroups[edge.Condition] = group;
+            }
+
+            group.Add(edge);
+        }
+
+        foreach (var edge in edges)
+        {
+            if (!string.IsNullOrWhiteSpace(edge.Condition) &&
+                conditionGroups.TryGetValue(edge.Condition, out var group) &&
+                group.Count > 1)
+            {
+                return group;
+            }
+        }
+
+        return [];
+    }
+
+    private static string? FindImplicitForkJoinNode(Graph graph, IReadOnlyList<GraphEdge> forkEdges)
+    {
+        if (forkEdges.Count == 0)
+            return null;
+
+        var candidates = graph.OutgoingEdges(forkEdges[0].ToNode)
+            .Select(edge => edge.ToNode)
+            .Distinct(StringComparer.Ordinal)
+            .ToHashSet(StringComparer.Ordinal);
+
+        if (candidates.Count == 0)
+            return null;
+
+        foreach (var edge in forkEdges.Skip(1))
+        {
+            var successors = graph.OutgoingEdges(edge.ToNode)
+                .Select(successor => successor.ToNode)
+                .Distinct(StringComparer.Ordinal)
+                .ToHashSet(StringComparer.Ordinal);
+            candidates.IntersectWith(successors);
+            if (candidates.Count == 0)
+                return null;
+        }
+
+        return candidates.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault();
+    }
+
+    private static PendingForkState? LoadPendingForkState(PipelineContext context)
+    {
+        var raw = context.Get(PendingForkContextKey);
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<PendingForkState>(raw);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void StorePendingForkState(PipelineContext context, PendingForkState? state)
+    {
+        context.Set(PendingForkContextKey, state is null ? string.Empty : JsonSerializer.Serialize(state));
     }
 
     private static void MergeParallelBranchResults(

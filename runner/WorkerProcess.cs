@@ -128,6 +128,12 @@ internal sealed class WorkerProcess
             args.Add(Quote(_parentOptions.BackendScriptPath));
         }
 
+        foreach (var (key, value) in _parentOptions.Variables ?? new Dictionary<string, string>(StringComparer.Ordinal))
+        {
+            args.Add("--var");
+            args.Add(Quote($"{key}={value}"));
+        }
+
         return string.Join(' ', args);
     }
 

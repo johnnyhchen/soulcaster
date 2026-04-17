@@ -212,6 +212,149 @@ public class PipelineEngineRegressionTests
                 Directory.Delete(tempDir, true);
         }
     }
+
+    [Fact]
+    public async Task PipelineEngine_ImplicitFork_DrainsSiblingBranches_BeforeJoin()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_implicitfork_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new Soulcaster.Tests.Helpers.DeterministicBackend()
+                .On("fork", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(
+                    contextUpdates: new Dictionary<string, string> { ["outcome"] = "needs_dod" },
+                    notes: "fan out"))
+                .On("branch_gpt", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "gpt"))
+                .On("branch_opus", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "opus"))
+                .On("branch_gemini", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "gemini"))
+                .On("join", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "join"));
+
+            var graph = new Graph();
+            graph.Nodes["start"] = new GraphNode { Id = "start", Shape = "Mdiamond" };
+            graph.Nodes["fork"] = new GraphNode { Id = "fork", Shape = "box", Prompt = "fork" };
+            graph.Nodes["branch_gpt"] = new GraphNode { Id = "branch_gpt", Shape = "box", Prompt = "gpt" };
+            graph.Nodes["branch_opus"] = new GraphNode { Id = "branch_opus", Shape = "box", Prompt = "opus" };
+            graph.Nodes["branch_gemini"] = new GraphNode { Id = "branch_gemini", Shape = "box", Prompt = "gemini" };
+            graph.Nodes["join"] = new GraphNode { Id = "join", Shape = "box", Prompt = "join" };
+            graph.Nodes["done"] = new GraphNode { Id = "done", Shape = "Msquare" };
+
+            graph.Edges.Add(new GraphEdge { FromNode = "start", ToNode = "fork" });
+            graph.Edges.Add(new GraphEdge { FromNode = "fork", ToNode = "branch_gpt", Condition = "outcome=needs_dod" });
+            graph.Edges.Add(new GraphEdge { FromNode = "fork", ToNode = "branch_opus", Condition = "outcome=needs_dod" });
+            graph.Edges.Add(new GraphEdge { FromNode = "fork", ToNode = "branch_gemini", Condition = "outcome=needs_dod" });
+            graph.Edges.Add(new GraphEdge { FromNode = "branch_gpt", ToNode = "join" });
+            graph.Edges.Add(new GraphEdge { FromNode = "branch_opus", ToNode = "join" });
+            graph.Edges.Add(new GraphEdge { FromNode = "branch_gemini", ToNode = "join" });
+            graph.Edges.Add(new GraphEdge { FromNode = "join", ToNode = "done" });
+
+            var engine = new PipelineEngine(new PipelineConfig(LogsRoot: tempDir, Backend: backend));
+            var result = await engine.RunAsync(graph);
+
+            Assert.Equal(OutcomeStatus.Success, result.Status);
+            Assert.Contains("branch_gpt", result.CompletedNodes);
+            Assert.Contains("branch_opus", result.CompletedNodes);
+            Assert.Contains("branch_gemini", result.CompletedNodes);
+
+            var joinIndex = result.CompletedNodes.IndexOf("join");
+            Assert.True(joinIndex > result.CompletedNodes.IndexOf("branch_gpt"));
+            Assert.True(joinIndex > result.CompletedNodes.IndexOf("branch_opus"));
+            Assert.True(joinIndex > result.CompletedNodes.IndexOf("branch_gemini"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task PipelineEngine_ImplicitFork_IgnoresUnsupportedRouteHints()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_implicitforkhints_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new Soulcaster.Tests.Helpers.DeterministicBackend()
+                .On("fork", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(
+                    preferredNextLabel: "not-a-real-label",
+                    suggestedNextIds: ["missing-node"],
+                    contextUpdates: new Dictionary<string, string> { ["outcome"] = "needs_dod" },
+                    notes: "fan out despite bad hints"))
+                .On("branch_a", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "a"))
+                .On("branch_b", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "b"))
+                .On("join", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "join"));
+
+            var graph = new Graph();
+            graph.Nodes["start"] = new GraphNode { Id = "start", Shape = "Mdiamond" };
+            graph.Nodes["fork"] = new GraphNode { Id = "fork", Shape = "box", Prompt = "fork" };
+            graph.Nodes["branch_a"] = new GraphNode { Id = "branch_a", Shape = "box", Prompt = "a" };
+            graph.Nodes["branch_b"] = new GraphNode { Id = "branch_b", Shape = "box", Prompt = "b" };
+            graph.Nodes["join"] = new GraphNode { Id = "join", Shape = "box", Prompt = "join" };
+            graph.Nodes["done"] = new GraphNode { Id = "done", Shape = "Msquare" };
+
+            graph.Edges.Add(new GraphEdge { FromNode = "start", ToNode = "fork" });
+            graph.Edges.Add(new GraphEdge { FromNode = "fork", ToNode = "branch_a", Condition = "outcome=needs_dod" });
+            graph.Edges.Add(new GraphEdge { FromNode = "fork", ToNode = "branch_b", Condition = "outcome=needs_dod" });
+            graph.Edges.Add(new GraphEdge { FromNode = "branch_a", ToNode = "join" });
+            graph.Edges.Add(new GraphEdge { FromNode = "branch_b", ToNode = "join" });
+            graph.Edges.Add(new GraphEdge { FromNode = "join", ToNode = "done" });
+
+            var engine = new PipelineEngine(new PipelineConfig(LogsRoot: tempDir, Backend: backend));
+            var result = await engine.RunAsync(graph);
+
+            Assert.Equal(OutcomeStatus.Success, result.Status);
+            Assert.Contains("branch_a", result.CompletedNodes);
+            Assert.Contains("branch_b", result.CompletedNodes);
+            Assert.Contains("join", result.CompletedNodes);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task PipelineEngine_ExitNode_WritesTelemetryAndStatusArtifacts()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_exittelemetry_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new Soulcaster.Tests.Helpers.DeterministicBackend()
+                .On("step", _ => Soulcaster.Tests.Helpers.DeterministicBackend.Result(notes: "step complete"));
+
+            var graph = new Graph();
+            graph.Nodes["start"] = new GraphNode { Id = "start", Shape = "Mdiamond" };
+            graph.Nodes["step"] = new GraphNode { Id = "step", Shape = "box", Prompt = "step" };
+            graph.Nodes["done"] = new GraphNode { Id = "done", Shape = "Msquare" };
+            graph.Edges.Add(new GraphEdge { FromNode = "start", ToNode = "step" });
+            graph.Edges.Add(new GraphEdge { FromNode = "step", ToNode = "done" });
+
+            var engine = new PipelineEngine(new PipelineConfig(LogsRoot: tempDir, Backend: backend));
+            var result = await engine.RunAsync(graph);
+
+            Assert.Equal(OutcomeStatus.Success, result.Status);
+
+            var doneStatusPath = Path.Combine(tempDir, "done", "status.json");
+            Assert.True(File.Exists(doneStatusPath));
+
+            using var doneStatus = JsonDocument.Parse(File.ReadAllText(doneStatusPath));
+            Assert.Equal("success", doneStatus.RootElement.GetProperty("status").GetString());
+
+            var events = Soulcaster.Tests.Helpers.ProcessRunHarness.ReadEvents(Path.Combine(tempDir, "events.jsonl"));
+            Assert.Contains(events, evt => Equals(evt["node_id"], "done") && Equals(evt["event_type"], "stage_start"));
+            Assert.Contains(events, evt => Equals(evt["node_id"], "done") && Equals(evt["event_type"], "stage_end"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
+        }
+    }
 }
 
 public class CodergenPromptPathRegressionTests
@@ -240,6 +383,36 @@ public class CodergenPromptPathRegressionTests
             var normalizedPrompt = backend.LastPrompt!.Replace('\\', '/');
             Assert.Contains($"{tempDir.Replace('\\', '/')}/checkpoint_test/STEP-A.md", normalizedPrompt);
             Assert.Contains($"{Path.Combine(Path.GetDirectoryName(tempDir)!, "gates").Replace('\\', '/')}/review-gate.json", normalizedPrompt);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task CodergenHandler_DefaultFidelity_FallsBackToCompact()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_promptfidelity_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new PromptCapturingBackend();
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Goal = "compact fidelity" };
+            var node = new GraphNode
+            {
+                Id = "writer",
+                Shape = "box",
+                Prompt = "Write the artifact."
+            };
+            graph.Nodes[node.Id] = node;
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            Assert.Contains("Runtime fidelity: compact", backend.LastPrompt, StringComparison.Ordinal);
         }
         finally
         {
@@ -288,7 +461,9 @@ public class RunCommandSupportTests
                 "--steer-file", "/tmp/steer.txt",
                 "--backend", "scripted",
                 "--backend-script", "/tmp/backend.json",
-                "--crash-after-stage", "verify"
+                "--crash-after-stage", "verify",
+                "--var", "task=Ship reporter",
+                "--var", "definition_of_done=CLI plus tests"
             ]);
 
         Assert.Equal("qa-smoke.dot", options.DotFilePath);
@@ -300,6 +475,8 @@ public class RunCommandSupportTests
         Assert.Equal("scripted", options.BackendMode);
         Assert.Equal("/tmp/backend.json", options.BackendScriptPath);
         Assert.Equal("verify", options.CrashAfterStage);
+        Assert.Equal("Ship reporter", options.Variables!["task"]);
+        Assert.Equal("CLI plus tests", options.Variables!["definition_of_done"]);
     }
 
     [Fact]
@@ -315,10 +492,27 @@ public class RunCommandSupportTests
             SteerFilePath: null,
             BackendMode: "live",
             BackendScriptPath: null,
-            CrashAfterStage: null);
+            CrashAfterStage: null,
+            Variables: null);
         var workingDir = RunCommandSupport.ResolveWorkingDirectory("/repo/dotfiles/qa-smoke.dot", options);
 
         Assert.Equal(Path.GetFullPath("/tmp/existing-run"), workingDir);
+    }
+
+    [Fact]
+    public void ResolveProjectRoot_UsesParentOfDotfilesDirectory()
+    {
+        var projectRoot = RunCommandSupport.ResolveProjectRoot("/repo/project/dotfiles/sample.dot");
+
+        Assert.Equal(Path.GetFullPath("/repo/project"), projectRoot);
+    }
+
+    [Fact]
+    public void ResolveProjectRoot_UsesDotfileDirectoryWhenNotNestedUnderDotfiles()
+    {
+        var projectRoot = RunCommandSupport.ResolveProjectRoot("/repo/tmp/simple.dot");
+
+        Assert.Equal(Path.GetFullPath("/repo/tmp"), projectRoot);
     }
 
     [Fact]
@@ -436,6 +630,72 @@ Return stage status JSON.
 
 public class CodergenLoopTerminationRegressionTests
 {
+    [Fact]
+    public async Task RunnerBackendFactory_ScriptedBackend_UsesSessionConfigDefaultProviderTimeout()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_runnerdefaulttimeout_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var planPath = Path.Combine(tempDir, "backend-plan.json");
+            var plan = new ScriptedBackendPlan
+            {
+                DefaultResponse = new ScriptedResponsePlan
+                {
+                    AssistantText = """
+                        {
+                          "status": "success",
+                          "preferred_next_label": "",
+                          "suggested_next_ids": [],
+                          "context_updates": {},
+                          "notes": "ok"
+                        }
+                        """
+                }
+            };
+            File.WriteAllText(planPath, JsonSerializer.Serialize(plan));
+
+            var options = new RunOptions(
+                DotFilePath: Path.Combine(tempDir, "dummy.dot"),
+                Resume: false,
+                AutoResumePolicy: AutoResumePolicy.Off,
+                ResumeFrom: null,
+                StartAt: null,
+                SteerText: null,
+                SteerFilePath: null,
+                BackendMode: "scripted",
+                BackendScriptPath: planPath,
+                CrashAfterStage: null,
+                Variables: null);
+
+            using var backend = RunnerBackendFactory.Create(tempDir, tempDir, options);
+
+            const string prompt = """
+[PIPELINE CONTEXT]
+Runtime fidelity: truncate
+Runtime thread: timeout-default-test
+Resume mode: fresh
+[/PIPELINE CONTEXT]
+
+You are executing node "plan".
+
+Return stage status JSON.
+""";
+
+            var result = await backend.RunAsync(prompt, model: "gpt-5.2", provider: "openai");
+
+            Assert.Equal(OutcomeStatus.Success, result.Status);
+            Assert.Equal(
+                new SessionConfig().MaxProviderResponseMs,
+                Convert.ToInt32(result.Telemetry!["provider_timeout_ms"], System.Globalization.CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
     [Fact]
     public async Task AgentCodergenBackend_ExplorationStall_ReturnsRetryWithoutExtraStatusReminders()
     {

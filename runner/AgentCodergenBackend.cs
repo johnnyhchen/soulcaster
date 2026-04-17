@@ -6,6 +6,11 @@ using Soulcaster.UnifiedLlm;
 
 namespace Soulcaster.Runner;
 
+internal static class RunnerSessionDefaults
+{
+    public static readonly int MaxProviderResponseMs = new SessionConfig().MaxProviderResponseMs;
+}
+
 public static class RunnerBackendFactory
 {
     public static AgentCodergenBackend Create(string workingDir, string projectRoot, RunOptions options)
@@ -28,7 +33,7 @@ public static class RunnerBackendFactory
                     MaxToolRoundsPerInput: 50,
                     DefaultCommandTimeoutMs: 30_000,
                     MaxCommandTimeoutMs: 120_000,
-                    MaxProviderResponseMs: executionOptions?.MaxProviderResponseMs ?? 90_000,
+                    MaxProviderResponseMs: executionOptions?.MaxProviderResponseMs ?? RunnerSessionDefaults.MaxProviderResponseMs,
                     ReasoningEffort: reasoningEffort);
                 return new Session(new ScriptedProviderAdapter(plan), profile, env, config);
             };
@@ -95,6 +100,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         var shouldPool = ShouldPoolSession(hints);
         Session? session = null;
         var pooledSession = false;
+        var retainedForCarryover = false;
         var helperArtifacts = new Dictionary<string, string>(StringComparer.Ordinal);
         var helperTelemetry = new List<Dictionary<string, object?>>();
 
@@ -125,7 +131,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             var stageStartedAt = DateTimeOffset.UtcNow;
             var historyStartIndex = session.History.Count;
 
-            Console.WriteLine(
+            Console.Error.WriteLine(
                 $"  [codergen] Starting agent session (model={model ?? "default"}, fidelity={hints.Fidelity}, thread={hints.ThreadId}, pooled={pooledSession})");
 
             StageStatusContract? parsedStatus = null;
@@ -205,7 +211,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 firstResponse = finalResponse;
 
             if (finalTurn is not null)
-                Console.WriteLine($"  [codergen] Session complete ({finalTurn.ToolCalls.Count} tool calls made)");
+                Console.Error.WriteLine($"  [codergen] Session complete ({finalTurn.ToolCalls.Count} tool calls made)");
 
             var classification = ClassifyTerminalResponse(finalResponse, session.LastError);
             var status = parsedStatus?.Status ?? classification.Status;
@@ -228,6 +234,12 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             {
                 telemetry["helper_session_count"] = helperTelemetry.Count;
                 telemetry["helper_sessions"] = helperTelemetry;
+            }
+
+            if (!pooledSession && session.History.Count > 0)
+            {
+                PreserveCarryoverSession(hints.ThreadId, session);
+                retainedForCarryover = true;
             }
 
             return new CodergenResult(
@@ -268,7 +280,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         }
         finally
         {
-            if (!pooledSession && session is not null)
+            if (!pooledSession && session is not null && !retainedForCarryover)
                 session.Close();
         }
     }
@@ -324,7 +336,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             MaxToolRoundsPerInput: 120,
             DefaultCommandTimeoutMs: 30_000,
             MaxCommandTimeoutMs: 600_000,
-            MaxProviderResponseMs: options?.MaxProviderResponseMs ?? 90_000,
+            MaxProviderResponseMs: options?.MaxProviderResponseMs ?? RunnerSessionDefaults.MaxProviderResponseMs,
             ReasoningEffort: reasoningEffort);
 
         var session = new Session(adapter, profile, env, sessionConfig);
@@ -334,23 +346,44 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
 
     private static (IProviderAdapter Adapter, IProviderProfile Profile) BuildProvider(string? resolvedProvider)
     {
-        switch (resolvedProvider?.ToLowerInvariant())
+        var effectiveProvider = string.IsNullOrWhiteSpace(resolvedProvider)
+            ? ResolveDefaultProviderFromEnvironment()
+            : resolvedProvider;
+
+        switch (effectiveProvider?.ToLowerInvariant())
         {
             case "openai":
                 var openAiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
                     ?? throw new InvalidOperationException("OPENAI_API_KEY not set.");
-                return (new OpenAIAdapter(openAiKey), new OpenAIProfile());
+                var openAiBaseUrl = Environment.GetEnvironmentVariable("OPENAI_BASE_URL");
+                return (new OpenAIAdapter(openAiKey, string.IsNullOrWhiteSpace(openAiBaseUrl) ? "https://api.openai.com" : openAiBaseUrl), new OpenAIProfile());
 
             case "gemini":
                 var geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY")
                     ?? throw new InvalidOperationException("GEMINI_API_KEY not set.");
-                return (new GeminiAdapter(geminiKey), new GeminiProfile());
+                var geminiBaseUrl = Environment.GetEnvironmentVariable("GEMINI_BASE_URL");
+                return (new GeminiAdapter(geminiKey, string.IsNullOrWhiteSpace(geminiBaseUrl) ? "https://generativelanguage.googleapis.com" : geminiBaseUrl), new GeminiProfile());
 
             default:
                 var anthropicKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
                     ?? throw new InvalidOperationException("ANTHROPIC_API_KEY not set.");
-                return (new AnthropicAdapter(anthropicKey), new AnthropicProfile());
+                var anthropicBaseUrl = Environment.GetEnvironmentVariable("ANTHROPIC_BASE_URL");
+                return (new AnthropicAdapter(anthropicKey, string.IsNullOrWhiteSpace(anthropicBaseUrl) ? "https://api.anthropic.com" : anthropicBaseUrl), new AnthropicProfile());
         }
+    }
+
+    private static string ResolveDefaultProviderFromEnvironment()
+    {
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")))
+            return "anthropic";
+
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OPENAI_API_KEY")))
+            return "openai";
+
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY")))
+            return "gemini";
+
+        throw new InvalidOperationException("No provider API key is configured.");
     }
 
     private static void SubscribeSessionEvents(Session session)
@@ -361,14 +394,14 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             {
                 case EventKind.ToolCallStart:
                     var toolName = evt.Data.GetValueOrDefault("toolName");
-                    Console.WriteLine($"  [tool] {toolName}");
+                    Console.Error.WriteLine($"  [tool] {toolName}");
                     break;
                 case EventKind.AssistantTextDelta:
                     var text = evt.Data.GetValueOrDefault("text") as string;
                     if (!string.IsNullOrEmpty(text))
                     {
                         var preview = text.Length > 200 ? text[..200] + "..." : text;
-                        Console.Write(preview);
+                        Console.Error.Write(preview);
                     }
                     break;
             }
@@ -398,7 +431,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         if (!string.Equals(session.Config.ReasoningEffort, reasoningEffort, StringComparison.OrdinalIgnoreCase))
             return false;
 
-        if (session.Config.MaxProviderResponseMs != (options?.MaxProviderResponseMs ?? 90_000))
+        if (session.Config.MaxProviderResponseMs != (options?.MaxProviderResponseMs ?? RunnerSessionDefaults.MaxProviderResponseMs))
             return false;
 
         return session.State != SessionState.Closed;
@@ -407,6 +440,15 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
     private bool ShouldPoolSession(RuntimeHints hints)
     {
         return hints.Fidelity.Equals("full", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void PreserveCarryoverSession(string threadId, Session session)
+    {
+        if (string.IsNullOrWhiteSpace(threadId))
+            return;
+
+        _sessionPool.Discard(threadId);
+        _sessionPool.GetOrCreate(threadId, () => session);
     }
 
     private void ApplyInitialSteer(Session session)
@@ -1561,9 +1603,9 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
             if (message.Role != Role.User)
                 continue;
 
-            var match = NodeIdPattern.Match(message.Text ?? string.Empty);
-            if (match.Success)
-                return match.Groups["id"].Value;
+            var matches = NodeIdPattern.Matches(message.Text ?? string.Empty);
+            if (matches.Count > 0)
+                return matches[^1].Groups["id"].Value;
         }
 
         return "default";

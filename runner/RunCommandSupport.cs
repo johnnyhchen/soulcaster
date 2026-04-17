@@ -12,7 +12,8 @@ public sealed record RunOptions(
     string? SteerFilePath,
     string BackendMode,
     string? BackendScriptPath,
-    string? CrashAfterStage)
+    string? CrashAfterStage,
+    IReadOnlyDictionary<string, string>? Variables)
 {
     public bool Autoresume => AutoResumePolicy != AutoResumePolicy.Off;
 
@@ -25,6 +26,7 @@ public sealed record RunOptions(
         string? steerFilePath = null;
         string? backendScriptPath = null;
         string? crashAfterStage = null;
+        var variables = new Dictionary<string, string>(StringComparer.Ordinal);
         var backendMode = "live";
         var resume = false;
         var autoResumePolicy = AutoResumePolicy.On;
@@ -73,6 +75,9 @@ public sealed record RunOptions(
                 case "--crash-after-stage" when i + 1 < args.Length:
                     crashAfterStage = args[++i];
                     break;
+                case "--var" when i + 1 < args.Length:
+                    ParseVariable(args[++i], variables);
+                    break;
                 default:
                     if (!arg.StartsWith("--", StringComparison.Ordinal))
                         dotFile ??= arg;
@@ -90,12 +95,35 @@ public sealed record RunOptions(
             SteerFilePath: steerFilePath,
             BackendMode: backendMode,
             BackendScriptPath: backendScriptPath,
-            CrashAfterStage: crashAfterStage);
+            CrashAfterStage: crashAfterStage,
+            Variables: variables);
+    }
+
+    private static void ParseVariable(string raw, IDictionary<string, string> variables)
+    {
+        var separatorIndex = raw.IndexOf('=');
+        if (separatorIndex <= 0)
+            throw new ArgumentException($"Invalid --var value '{raw}'. Expected key=value.", nameof(raw));
+
+        var key = raw[..separatorIndex].Trim();
+        if (string.IsNullOrWhiteSpace(key))
+            throw new ArgumentException($"Invalid --var value '{raw}'. Expected key=value.", nameof(raw));
+
+        variables[key] = raw[(separatorIndex + 1)..];
     }
 }
 
 public static class RunCommandSupport
 {
+    public static string ResolveProjectRoot(string dotFilePath)
+    {
+        var dotDirectory = Path.GetFullPath(Path.GetDirectoryName(dotFilePath)!);
+        if (string.Equals(Path.GetFileName(dotDirectory), "dotfiles", StringComparison.OrdinalIgnoreCase))
+            return Path.GetFullPath(Path.Combine(dotDirectory, ".."));
+
+        return dotDirectory;
+    }
+
     public static string ResolveWorkingDirectory(string dotFilePath, RunOptions options)
     {
         return string.IsNullOrWhiteSpace(options.ResumeFrom)

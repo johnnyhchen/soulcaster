@@ -76,7 +76,7 @@ public class ScenarioHarnessTests
         digraph scenario {
             goal = "resume fidelity"
             start [shape=Mdiamond]
-            coder [shape=box, prompt="work"]
+            coder [shape=box, prompt="work", fidelity="full"]
             done [shape=Msquare]
             start -> coder -> done
         }

@@ -18,6 +18,7 @@ var command = args.Length > 0 ? args[0] : "help";
 return command switch
 {
     "run" => await RunPipeline(args[1..]),
+    "conformance" => await ConformanceCommand.RunAsync(args[1..]),
     "providers" => await RunProviders(args[1..]),
     "gate" when args.Length > 1 && args[1] == "answer" => await GateAnswer(args[2..]),
     "gate" when args.Length > 1 && args[1] == "watch" => await GateWatch(args[2..]),
@@ -4054,9 +4055,7 @@ static async Task<int> RunPipeline(string[] args)
     var workingDir = RunCommandSupport.ResolveWorkingDirectory(dotFilePath, options);
     Directory.CreateDirectory(workingDir);
 
-    // Convention: dotfile lives at {project}/dotfiles/{name}.dot,
-    // so the project root is the dotfile directory's parent.
-    var projectRoot = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(dotFilePath)!, ".."));
+    var projectRoot = RunCommandSupport.ResolveProjectRoot(dotFilePath);
 
     var logsDir = Path.Combine(workingDir, "logs");
     Directory.CreateDirectory(logsDir);
@@ -4138,6 +4137,10 @@ static async Task<int> RunPipeline(string[] args)
     var dotSource = await File.ReadAllTextAsync(dotFilePath);
     var graph = DotParser.Parse(dotSource);
     graph.Attributes["source_path"] = dotFilePath;
+    graph.Attributes["project_root"] = projectRoot;
+    graph.Attributes["output_root"] = workingDir;
+    foreach (var (key, value) in options.Variables ?? new Dictionary<string, string>(StringComparer.Ordinal))
+        graph.Attributes[key] = value;
 
     if (!string.IsNullOrWhiteSpace(options.StartAt))
     {
@@ -4335,6 +4338,7 @@ static int ShowHelp()
     Console.WriteLine("  attractor web [--dir <dir>] [--port N] Launch web dashboard");
     Console.WriteLine("  attractor providers <subcommand>      Ping providers or sync new provider models");
     Console.WriteLine("  attractor lint [path] [--recursive]  Lint one file or a directory of dotfiles");
+    Console.WriteLine("  attractor conformance <subcommand>     Parse, validate, run, or list handlers for AttractorBench");
     Console.WriteLine("  attractor builder <subcommand>        Create or edit DOT pipelines");
     Console.WriteLine("  attractor interactive <dotfile>       Open the line-oriented workflow editor");
     Console.WriteLine();
@@ -4350,6 +4354,7 @@ static int ShowHelp()
     Console.WriteLine("  --backend <mode>         Backend mode: live | scripted");
     Console.WriteLine("  --backend-script <path>  JSON plan for the scripted backend");
     Console.WriteLine("  --crash-after-stage <id> Inject a crash after checkpointing a stage (QA/test)");
+    Console.WriteLine("  --var <key=value>        Inject graph/task variables for prompt expansion");
     Console.WriteLine();
     Console.WriteLine("Output directory resolution:");
     Console.WriteLine("  1. --dir <path> flag");

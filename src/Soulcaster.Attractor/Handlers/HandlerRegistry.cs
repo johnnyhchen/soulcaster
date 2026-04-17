@@ -6,8 +6,6 @@ public class HandlerRegistry
 
     public HandlerRegistry(ICodergenBackend? backend = null, IInterviewer? interviewer = null, ISupervisorController? supervisorController = null)
     {
-        backend = backend is null ? null : SynchronizedCodergenBackend.Wrap(backend);
-
         // Register default handlers
         _handlers["Mdiamond"] = new StartHandler();
         _handlers["Msquare"] = new ExitHandler();
@@ -37,6 +35,13 @@ public class HandlerRegistry
             : throw new InvalidOperationException($"No handler registered for shape '{shape}'.");
     }
 
+    public IReadOnlyList<string> GetRegisteredShapes()
+    {
+        return _handlers.Keys
+            .OrderBy(shape => shape, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     /// <summary>
     /// Null backend that returns fail for any codergen call when no backend is configured.
     /// </summary>
@@ -57,41 +62,4 @@ public class HandlerRegistry
         }
     }
 
-    private sealed class SynchronizedCodergenBackend : ICodergenBackend, ISessionControlBackend
-    {
-        private readonly ICodergenBackend _inner;
-        private readonly SemaphoreSlim _runLock = new(1, 1);
-
-        private SynchronizedCodergenBackend(ICodergenBackend inner)
-        {
-            _inner = inner;
-        }
-
-        public static ICodergenBackend Wrap(ICodergenBackend backend) =>
-            backend is SynchronizedCodergenBackend ? backend : new SynchronizedCodergenBackend(backend);
-
-        public async Task<CodergenResult> RunAsync(
-            string prompt,
-            string? model = null,
-            string? provider = null,
-            string? reasoningEffort = null,
-            CancellationToken ct = default,
-            CodergenExecutionOptions? options = null)
-        {
-            await _runLock.WaitAsync(ct);
-            try
-            {
-                return await _inner.RunAsync(prompt, model, provider, reasoningEffort, ct, options);
-            }
-            finally
-            {
-                _runLock.Release();
-            }
-        }
-
-        public bool ResetThread(string threadId)
-        {
-            return _inner is ISessionControlBackend sessionControl && sessionControl.ResetThread(threadId);
-        }
-    }
 }

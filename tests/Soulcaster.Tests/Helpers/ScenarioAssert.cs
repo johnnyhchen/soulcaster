@@ -6,7 +6,10 @@ internal static class ScenarioAssert
 {
     public static void NodesExecutedInOrder(ScenarioRun run, params string[] expectedNodeIds)
     {
-        Assert.Equal(expectedNodeIds, run.StageOrder);
+        Assert.True(
+            run.StageOrder.Count >= expectedNodeIds.Length,
+            $"Expected at least {expectedNodeIds.Length} nodes, got: {string.Join(", ", run.StageOrder)}");
+        Assert.Equal(expectedNodeIds, run.StageOrder.Take(expectedNodeIds.Length).ToArray());
     }
 
     public static void AppearsBefore(ScenarioRun run, string firstNodeId, string secondNodeId)

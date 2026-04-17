@@ -311,6 +311,7 @@ public class DotParser
             case "model_stylesheet":
                 graph.ModelStylesheet = value;
                 break;
+            case "default_max_retries":
             case "default_max_retry":
                 if (int.TryParse(value, out int maxRetry))
                     graph.DefaultMaxRetry = maxRetry;
@@ -322,33 +323,45 @@ public class DotParser
                 graph.FallbackRetryTarget = value;
                 break;
             case "default_fidelity":
+            case "context_fidelity_default":
                 graph.DefaultFidelity = value;
+                break;
+            case "default_thread_id":
+            case "context_thread_default":
+                graph.Attributes["default_thread_id"] = value;
                 break;
         }
     }
 
     private static GraphNode BuildGraphNode(string id, Dictionary<string, string> attrs)
     {
+        var type = GetFirstValue(attrs, "type", "node_type");
+        var label = attrs.GetValueOrDefault("label", id);
+        var timeout = NormalizeTimeout(attrs.TryGetValue("timeout", out var rawTimeout) ? rawTimeout : null, attrs);
+        var allowPartial = TryParseBoolean(attrs.GetValueOrDefault("allow_partial", ""), out var explicitAllowPartial)
+            ? explicitAllowPartial
+            : IsCodergenNode(type, attrs);
+
         return new GraphNode
         {
             Id = id,
-            Label = attrs.GetValueOrDefault("label", id),
-            Shape = attrs.GetValueOrDefault("shape", "box"),
-            Type = attrs.GetValueOrDefault("type", ""),
-            Prompt = attrs.GetValueOrDefault("prompt", ""),
-            MaxRetries = int.TryParse(attrs.GetValueOrDefault("max_retries", "0"), out var mr) ? mr : 0,
+            Label = label,
+            Shape = NormalizeShape(id, label, type, attrs),
+            Type = type,
+            Prompt = GetFirstValue(attrs, "prompt", "llm_prompt"),
+            MaxRetries = int.TryParse(GetFirstValue(attrs, "max_retries", "max_retry"), out var mr) ? mr : 0,
             GoalGate = attrs.GetValueOrDefault("goal_gate", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
             RetryTarget = attrs.GetValueOrDefault("retry_target", ""),
             FallbackRetryTarget = attrs.GetValueOrDefault("fallback_retry_target", ""),
-            Fidelity = attrs.GetValueOrDefault("fidelity", ""),
-            ThreadId = attrs.GetValueOrDefault("thread_id", ""),
+            Fidelity = GetFirstValue(attrs, "fidelity", "context_fidelity_in"),
+            ThreadId = GetFirstValue(attrs, "thread_id", "context_thread"),
             Class = attrs.GetValueOrDefault("class", ""),
-            Timeout = attrs.TryGetValue("timeout", out var timeout) ? timeout : null,
-            LlmModel = attrs.GetValueOrDefault("model", ""),
-            LlmProvider = attrs.GetValueOrDefault("provider", ""),
-            ReasoningEffort = attrs.GetValueOrDefault("reasoning_effort", "high"),
+            Timeout = timeout,
+            LlmModel = GetFirstValue(attrs, "model", "llm_model"),
+            LlmProvider = GetFirstValue(attrs, "provider", "llm_provider"),
+            ReasoningEffort = GetFirstValue(attrs, "reasoning_effort", "model_reasoning_effort", "high"),
             AutoStatus = attrs.GetValueOrDefault("auto_status", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
-            AllowPartial = attrs.GetValueOrDefault("allow_partial", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
+            AllowPartial = allowPartial,
             RawAttributes = new Dictionary<string, string>(attrs)
         };
     }
@@ -367,5 +380,122 @@ public class DotParser
             LoopRestart = attrs.GetValueOrDefault("loop_restart", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
             ContextReset = attrs.GetValueOrDefault("context_reset", "false").Equals("true", StringComparison.OrdinalIgnoreCase)
         };
+    }
+
+    private static string GetFirstValue(Dictionary<string, string> attrs, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (attrs.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return string.Empty;
+    }
+
+    private static bool TryParseBoolean(string raw, out bool value)
+    {
+        if (string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            value = true;
+            return true;
+        }
+
+        if (string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase))
+        {
+            value = false;
+            return true;
+        }
+
+        value = false;
+        return false;
+    }
+
+    private static string NormalizeShape(string id, string label, string type, Dictionary<string, string> attrs)
+    {
+        if (IsStartNode(id, label, type, attrs))
+            return "Mdiamond";
+
+        if (IsExitNode(id, label, type, attrs))
+            return "Msquare";
+
+        if (IsWaitHumanNode(type, attrs))
+            return "hexagon";
+
+        return type.ToLowerInvariant() switch
+        {
+            "parallel.queue" or "parallel.tree" => "component",
+            "parallel.fan_in" => "tripleoctagon",
+            "stack.manager_loop" => "house",
+            "shell" or "tool" => "parallelogram",
+            _ when IsCodergenNode(type, attrs) => "box",
+            _ => attrs.GetValueOrDefault("shape", "box")
+        };
+    }
+
+    private static bool IsStartNode(string id, string label, string type, Dictionary<string, string> attrs)
+    {
+        if (type.Equals("start", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var shape = attrs.GetValueOrDefault("shape", "");
+        return shape.Equals("Mdiamond", StringComparison.OrdinalIgnoreCase) ||
+               (shape.Equals("circle", StringComparison.OrdinalIgnoreCase) &&
+                (id.Equals("start", StringComparison.OrdinalIgnoreCase) ||
+                 label.Equals("start", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static bool IsExitNode(string id, string label, string type, Dictionary<string, string> attrs)
+    {
+        if (type.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
+            type.Equals("end", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var shape = attrs.GetValueOrDefault("shape", "");
+        return shape.Equals("Msquare", StringComparison.OrdinalIgnoreCase) ||
+               (shape.Equals("doublecircle", StringComparison.OrdinalIgnoreCase) &&
+                (id.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
+                 id.Equals("end", StringComparison.OrdinalIgnoreCase) ||
+                 label.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
+                 label.Equals("end", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static bool IsWaitHumanNode(string type, Dictionary<string, string> attrs)
+    {
+        return type.Equals("wait.human", StringComparison.OrdinalIgnoreCase) ||
+               attrs.GetValueOrDefault("wait_for_human", "false").Equals("true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCodergenNode(string type, Dictionary<string, string> attrs)
+    {
+        if (attrs.GetValueOrDefault("is_codergen", "false").Equals("true", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return type.ToLowerInvariant() switch
+        {
+            "codergen" or "codex.generate" or "llm" or "stack.observe" or "stack.steer" => true,
+            _ => false
+        };
+    }
+
+    private static string? NormalizeTimeout(string? rawTimeout, Dictionary<string, string> attrs)
+    {
+        if (string.IsNullOrWhiteSpace(rawTimeout))
+            return rawTimeout;
+
+        var trimmed = rawTimeout.Trim();
+        if (!trimmed.All(char.IsDigit))
+            return rawTimeout;
+
+        var usesUpstreamAliases =
+            attrs.ContainsKey("llm_prompt") ||
+            attrs.ContainsKey("llm_model") ||
+            attrs.ContainsKey("llm_provider") ||
+            attrs.ContainsKey("node_type") ||
+            attrs.ContainsKey("is_codergen");
+
+        return usesUpstreamAliases ? trimmed + "s" : rawTimeout;
     }
 }

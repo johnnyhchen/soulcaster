@@ -42,9 +42,9 @@ digraph attractor_run {
     // ─── Model Stylesheet ────────────────────────────────────────────
     model_stylesheet = "
         * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
-        .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
-        .codex { provider = \"openai\";    model = \"codex-5.2\";  reasoning_effort = \"high\" }
-        .gpt   { provider = \"openai\";    model = \"gpt-5.2\";   reasoning_effort = \"high\" }
+        .planner { provider = \"anthropic\"; model = \"claude-sonnet-4-6\"; timeout = \"300s\" }
+        .codex   { provider = \"openai\";    model = \"codex-5.2\";         reasoning_effort = \"high\"; timeout = \"900s\" }
+        .gpt     { provider = \"openai\";    model = \"gpt-5.2\";           reasoning_effort = \"high\"; timeout = \"300s\" }
     "
 
     // ─── Defaults ────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ digraph attractor_run {
     // ═══════════════════════════════════════════════════════════════════
 
     orient [
-        class="opus",
+        class="planner",
         label="Orient: Python environment",
         prompt="Check the working directory and Python environment:
 1. python3 --version
@@ -77,7 +77,7 @@ Write to logs/orient/ORIENT-{N}.md."
     ]
 
     plan [
-        class="opus",
+        class="planner",
         label="Plan: Architecture",
         prompt="Read logs/orient/ORIENT-*.md.
 
@@ -121,7 +121,7 @@ Write to logs/plan/PLAN-{N}.md."
     // ═══════════════════════════════════════════════════════════════════
 
     breakdown [
-        class="opus",
+        class="planner",
         label="Break Down: Commit Chunks",
         prompt="Read logs/plan/PLAN-*.md. Exclude DONE items from logs/implement/PROGRESS-*.md.
 
@@ -159,10 +159,11 @@ Write to logs/breakdown/BREAKDOWN-{N}.md."
 
 For each commit:
 1. Implement the changes
-2. Run: python -m pytest tests/ -v (or specific test file from breakdown QA plan)
-3. Also verify: python -m salvo --help (CLI loads without error)
+2. Run: python3 -m pytest tests/ -v (or specific test file from breakdown QA plan)
+3. Also verify: python3 -m salvo --help (CLI loads without error)
 4. Mark DONE/FAILED immediately
 
+IMPORTANT: Use python3 and pip3 consistently. Do not use bare python or pip.
 IMPORTANT: Use bash heredoc for files over 100 lines.
 IMPORTANT: Use explicit file paths.
 
@@ -174,27 +175,29 @@ Write progress to logs/implement/PROGRESS-{N}.md."
     // ═══════════════════════════════════════════════════════════════════
 
     validate [
-        class="opus",
+        class="planner",
+        timeout="900s",
         label="Validate: Full QA",
         goal_gate=true,
         retry_target="plan",
         prompt="Read logs/plan/PLAN-*.md, logs/breakdown/BREAKDOWN-*.md, logs/implement/PROGRESS-*.md.
 
 Validate:
-1. pip install -e . — installs without error
-2. python -m pytest tests/ -v — all tests pass
+1. pip3 install -e . — installs without error
+2. python3 -m pytest tests/ -v — all tests pass
 3. Smoke test against the built-in echo server:
-   - python -m salvo echo-server --port 9300 &
-   - salvo http://localhost:9300 -n 100 -c 10 — completes, shows stats
-   - salvo http://localhost:9300 -n 50 -c 5 --rps 20 — rate limited run
-   - salvo http://localhost:9300 -d 3s -c 5 — duration mode
-   - salvo http://localhost:9300 -n 20 --har /tmp/test.har — HAR export exists and is valid JSON
+   - python3 -m salvo echo-server --port 9300 &
+   - python3 -m salvo http://localhost:9300 -n 100 -c 10 — completes, shows stats
+   - python3 -m salvo http://localhost:9300 -n 50 -c 5 --rps 20 — rate limited run
+   - python3 -m salvo http://localhost:9300 -d 3s -c 5 — duration mode
+   - python3 -m salvo http://localhost:9300 -n 20 --har /tmp/test.har — HAR export exists and is valid JSON
    - kill the echo server
-4. Verify --help output documents all flags
-5. Verify non-zero exit code: salvo http://localhost:1 -n 1 (unreachable target)
+4. Verify python3 -m salvo --help output documents all flags
+5. Verify non-zero exit code: python3 -m salvo http://localhost:1 -n 1 (unreachable target)
 
 Compare against prior logs/validate/VALIDATION-RUN-*.md.
 
+IMPORTANT: Use python3 and pip3 consistently. Do not use bare python or pip.
 Write to logs/validate/VALIDATION-RUN-{N}.md."
     ]
 
@@ -216,6 +219,7 @@ Write to logs/validate/VALIDATION-RUN-{N}.md."
 
     critique_harsh [
         class="gpt",
+        timeout="600s",
         label="Critique: Adversarial Review",
         prompt="Read all .py files in the project. Also read logs/plan/PLAN-*.md and logs/validate/VALIDATION-RUN-*.md.
 
@@ -237,7 +241,8 @@ Write to logs/critique/CRITIQUE-HARSH-{N}.md."
     ]
 
     critique_pareto [
-        class="opus",
+        class="planner",
+        timeout="600s",
         label="Critique: Filter",
         prompt="Read logs/critique/CRITIQUE-HARSH-*.md (latest). Filter into MUST FIX / SHOULD FIX / NICE TO HAVE.
 

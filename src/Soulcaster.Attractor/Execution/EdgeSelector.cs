@@ -18,46 +18,29 @@ public static class EdgeSelector
         if (outgoingEdges.Count == 0)
             return null;
 
-        // A single edge still needs to honor its condition when one is present.
-        if (outgoingEdges.Count == 1)
-        {
-            var only = outgoingEdges[0];
-            return string.IsNullOrWhiteSpace(only.Condition) || ConditionEvaluator.Evaluate(only.Condition, outcome, context)
-                ? only
-                : null;
-        }
+        // Step 1: condition-matching edges only.
+        var conditionMatched = outgoingEdges
+            .Where(e => !string.IsNullOrWhiteSpace(e.Condition) && ConditionEvaluator.Evaluate(e.Condition, outcome, context))
+            .ToList();
 
-        // Step 1: Condition-matching edges
-        var conditionalEdges = outgoingEdges.Where(e => !string.IsNullOrWhiteSpace(e.Condition)).ToList();
-        if (conditionalEdges.Count > 0)
-        {
-            var matching = conditionalEdges
-                .Where(e => ConditionEvaluator.Evaluate(e.Condition, outcome, context))
-                .ToList();
-
-            if (matching.Count == 1)
-                return matching[0];
-
-            if (matching.Count > 1)
-            {
-                // Among matching conditional edges, apply subsequent steps
-                return ApplyTiebreakers(matching, outcome);
-            }
-        }
+        if (conditionMatched.Count > 0)
+            return ApplyWeightAndLexical(conditionMatched);
 
         // Step 2: Preferred label match
         if (!string.IsNullOrWhiteSpace(outcome.PreferredLabel))
         {
             var normalizedPreferred = NormalizeLabel(outcome.PreferredLabel);
-            var labelMatch = outgoingEdges
-                .Where(e => !string.IsNullOrWhiteSpace(e.Label) && NormalizeLabel(e.Label) == normalizedPreferred)
-                .ToList();
+            foreach (var edge in outgoingEdges)
+            {
+                if (!string.IsNullOrWhiteSpace(edge.Condition))
+                    continue;
 
-            if (labelMatch.Count == 1)
-                return labelMatch[0];
-
-            if (labelMatch.Count > 1)
-                return ApplyWeightAndLexical(labelMatch);
+                if (!string.IsNullOrWhiteSpace(edge.Label) &&
+                    NormalizeLabel(edge.Label) == normalizedPreferred)
+                {
+                    return edge;
+                }
+            }
         }
 
         // Step 3: Suggested next IDs
@@ -65,7 +48,9 @@ public static class EdgeSelector
         {
             foreach (var suggestedId in outcome.SuggestedNextIds)
             {
-                var match = outgoingEdges.FirstOrDefault(e => e.ToNode == suggestedId);
+                var match = outgoingEdges.FirstOrDefault(e =>
+                    string.IsNullOrWhiteSpace(e.Condition) &&
+                    e.ToNode == suggestedId);
                 if (match != null)
                     return match;
             }
@@ -76,28 +61,7 @@ public static class EdgeSelector
             .Where(e => string.IsNullOrWhiteSpace(e.Condition))
             .ToList();
 
-        if (unconditional.Count > 0)
-            return ApplyWeightAndLexical(unconditional);
-
-        // Fallback: apply weight and lexical to all edges
-        return ApplyWeightAndLexical(outgoingEdges.ToList());
-    }
-
-    private static GraphEdge ApplyTiebreakers(List<GraphEdge> edges, Outcome outcome)
-    {
-        // Step 2 within conditional matches: preferred label
-        if (!string.IsNullOrWhiteSpace(outcome.PreferredLabel))
-        {
-            var normalizedPreferred = NormalizeLabel(outcome.PreferredLabel);
-            var labelMatch = edges
-                .Where(e => !string.IsNullOrWhiteSpace(e.Label) && NormalizeLabel(e.Label) == normalizedPreferred)
-                .ToList();
-
-            if (labelMatch.Count >= 1)
-                return ApplyWeightAndLexical(labelMatch);
-        }
-
-        return ApplyWeightAndLexical(edges);
+        return unconditional.Count == 0 ? null : ApplyWeightAndLexical(unconditional);
     }
 
     private static GraphEdge ApplyWeightAndLexical(List<GraphEdge> edges)
@@ -134,6 +98,11 @@ public static class EdgeSelector
                 normalized = normalized[(closeBracket + 2)..];
             }
         }
+
+        if (normalized.Length >= 3 && normalized[1] == ')' && normalized[2] == ' ')
+            normalized = normalized[3..];
+        else if (normalized.Length >= 4 && normalized[1] == ' ' && normalized[2] == '-' && normalized[3] == ' ')
+            normalized = normalized[4..];
 
         return normalized.Trim();
     }

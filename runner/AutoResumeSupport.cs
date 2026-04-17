@@ -153,6 +153,12 @@ public static class AutoResumeSupport
             args.Add(Quote(options.BackendScriptPath));
         }
 
+        foreach (var (key, value) in options.Variables ?? new Dictionary<string, string>(StringComparer.Ordinal))
+        {
+            args.Add("--var");
+            args.Add(Quote($"{key}={value}"));
+        }
+
         return string.Join(' ', args);
     }
 

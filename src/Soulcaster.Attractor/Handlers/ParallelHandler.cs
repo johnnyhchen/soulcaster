@@ -448,7 +448,7 @@ public class ParallelHandler : INodeHandler
         if (!string.IsNullOrWhiteSpace(graph.DefaultFidelity))
             return graph.DefaultFidelity;
 
-        return "full";
+        return "compact";
     }
 
     private static string ResolveThreadId(GraphNode node, string nodeId, GraphEdge? incomingEdge, Graph graph)

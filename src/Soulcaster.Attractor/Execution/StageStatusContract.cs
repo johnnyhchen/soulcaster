@@ -137,10 +137,27 @@ public sealed record StageStatusContract(
             }
 
             var root = doc.RootElement;
-            var statusText = ReadString(root, "status", "outcome");
-            if (string.IsNullOrWhiteSpace(statusText) || !TryParseStatus(statusText, out var parsedStatus))
+            var statusText = ReadString(root, "status");
+            var rawOutcome = ReadString(root, "outcome");
+
+            OutcomeStatus parsedStatus;
+            if (!string.IsNullOrWhiteSpace(statusText) && TryParseStatus(statusText, out parsedStatus))
             {
-                error = $"Invalid or missing status value '{statusText ?? "<null>"}'.";
+                // Parsed from explicit status.
+            }
+            else if (!string.IsNullOrWhiteSpace(rawOutcome) && TryParseStatus(rawOutcome, out parsedStatus))
+            {
+                // Legacy/alternate contract that only emits outcome.
+            }
+            else if (!string.IsNullOrWhiteSpace(rawOutcome))
+            {
+                // Upstream ai-dot-runner graphs frequently use custom route outcomes
+                // such as "needs_dod" or "yes" while still signaling a successful stage.
+                parsedStatus = OutcomeStatus.Success;
+            }
+            else
+            {
+                error = $"Invalid or missing status value '{statusText ?? rawOutcome ?? "<null>"}'.";
                 return false;
             }
 
@@ -175,6 +192,18 @@ public sealed record StageStatusContract(
                     else
                         updates[property.Name] = property.Value.ToString();
                 }
+            }
+
+            if (!string.IsNullOrWhiteSpace(rawOutcome) &&
+                !TryParseStatus(rawOutcome, out var parsedOutcomeStatus))
+            {
+                updates["outcome"] = rawOutcome;
+            }
+            else if (!string.IsNullOrWhiteSpace(rawOutcome) &&
+                     string.IsNullOrWhiteSpace(statusText) &&
+                     TryParseStatus(rawOutcome, out parsedOutcomeStatus))
+            {
+                updates["outcome"] = ToStatusString(parsedOutcomeStatus);
             }
 
             status = new StageStatusContract(

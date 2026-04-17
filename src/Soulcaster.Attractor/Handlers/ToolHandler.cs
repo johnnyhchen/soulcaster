@@ -20,19 +20,17 @@ public class ToolHandler : INodeHandler
         string executable = !string.IsNullOrWhiteSpace(toolCommand) ? toolCommand
             : !string.IsNullOrWhiteSpace(command) ? command : tool;
 
-        // Expand variables in command
-        executable = executable.Replace("$goal", graph.Goal);
-        foreach (var (key, value) in context.All)
-        {
-            executable = executable.Replace($"${{context.{key}}}", value);
-        }
+        executable = VariableExpander.Expand(executable, graph.Attributes, context.All, graph.Goal);
 
         // Create stage directory
         string stageDir = RuntimeStageResolver.ResolveStageDir(logsRoot, context, node.Id);
         Directory.CreateDirectory(stageDir);
 
         // Determine effective cancellation token (with timeout if specified)
-        int? timeoutMs = node.RawAttributes.TryGetValue("timeout", out var timeoutStr) && int.TryParse(timeoutStr, out var t) ? t : null;
+        int? timeoutMs = node.RawAttributes.TryGetValue("timeout", out var timeoutStr) &&
+                         RuntimeDurationParser.TryParseMilliseconds(timeoutStr, out var t)
+            ? t
+            : null;
         CancellationTokenSource? timeoutCts = null;
         CancellationTokenSource? linkedCts = null;
         var effectiveCt = ct;

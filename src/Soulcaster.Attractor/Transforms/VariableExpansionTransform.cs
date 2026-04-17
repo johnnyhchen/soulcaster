@@ -4,21 +4,20 @@ public class VariableExpansionTransform : IGraphTransform
 {
     public Graph Transform(Graph graph)
     {
-        if (string.IsNullOrEmpty(graph.Goal))
-            return graph;
+        graph.Goal = VariableExpander.Expand(graph.Goal, graph.Attributes, contextValues: null, goal: null);
+        if (string.IsNullOrWhiteSpace(graph.Goal) &&
+            graph.Attributes.TryGetValue("goal", out var goalOverride) &&
+            !string.IsNullOrWhiteSpace(goalOverride))
+        {
+            graph.Goal = goalOverride;
+        }
 
         var updatedNodes = new Dictionary<string, GraphNode>();
 
         foreach (var (id, node) in graph.Nodes)
         {
-            if (!string.IsNullOrEmpty(node.Prompt) && node.Prompt.Contains("$goal"))
-            {
-                updatedNodes[id] = node with { Prompt = node.Prompt.Replace("$goal", graph.Goal) };
-            }
-            else
-            {
-                updatedNodes[id] = node;
-            }
+            var expandedPrompt = VariableExpander.Expand(node.Prompt, graph.Attributes, contextValues: null, goal: graph.Goal);
+            updatedNodes[id] = node with { Prompt = expandedPrompt };
         }
 
         // Replace nodes in graph

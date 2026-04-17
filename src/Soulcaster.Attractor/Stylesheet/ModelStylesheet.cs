@@ -46,7 +46,7 @@ public class ModelStylesheet
 
                 // Read property name
                 int keyStart = pos;
-                while (pos < text.Length && text[pos] != '=' && text[pos] != '}')
+                while (pos < text.Length && text[pos] != '=' && text[pos] != ':' && text[pos] != '}')
                     pos++;
 
                 if (pos >= text.Length || text[pos] == '}') break;
@@ -80,7 +80,7 @@ public class ModelStylesheet
                 }
 
                 if (!string.IsNullOrEmpty(key))
-                    properties[key] = value;
+                    properties[NormalizePropertyKey(key)] = value;
 
                 // Skip optional semicolons / newlines
                 while (pos < text.Length && (text[pos] == ';' || text[pos] == '\n' || text[pos] == '\r'))
@@ -160,6 +160,16 @@ public class ModelStylesheet
     {
         while (pos < text.Length && char.IsWhiteSpace(text[pos]))
             pos++;
+    }
+
+    private static string NormalizePropertyKey(string key)
+    {
+        return key.Trim().ToLowerInvariant() switch
+        {
+            "llm_model" => "model",
+            "llm_provider" => "provider",
+            _ => key.Trim()
+        };
     }
 }
 

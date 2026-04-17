@@ -116,6 +116,42 @@ public class CodergenConsensusPlanTests
     }
 
     [Fact]
+    public async Task CodergenHandler_PromotesPreferredLabelToOutcomeContext_WhenRoutingUsesOutcomeConditions()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_routeoutcome_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new DeterministicBackend()
+                .On("router", _ => DeterministicBackend.Result(preferredNextLabel: "needs_dod", notes: "route to DoD"));
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Name = "route-outcome" };
+            var node = new GraphNode
+            {
+                Id = "router",
+                Shape = "box",
+                Prompt = "Decide the next route."
+            };
+            graph.Nodes[node.Id] = node;
+            graph.Nodes["dod"] = new GraphNode { Id = "dod", Shape = "box", Prompt = "define dod" };
+            graph.Nodes["retry"] = new GraphNode { Id = "retry", Shape = "box", Prompt = "retry" };
+            graph.Edges.Add(new GraphEdge { FromNode = "router", ToNode = "dod", Condition = "outcome=needs_dod" });
+            graph.Edges.Add(new GraphEdge { FromNode = "router", ToNode = "retry", Condition = "outcome=retry" });
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            Assert.Equal("needs_dod", outcome.PreferredLabel);
+            Assert.Equal("needs_dod", outcome.ContextUpdates!["outcome"]);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
     public async Task CodergenHandler_ImplementationNode_ZeroTouchedFiles_DowngradesToFail()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"jc_implguard_{Guid.NewGuid():N}");
@@ -178,6 +214,45 @@ public class CodergenConsensusPlanTests
             var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
 
             Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task CodergenHandler_ProgressArtifactReference_DoesNotInferRequireEdits()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_progressartifact_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new DeterministicBackend();
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Name = "progress-artifact-reference" };
+            var node = new GraphNode
+            {
+                Id = "orient",
+                Shape = "box",
+                Label = "Orient: Python environment",
+                Prompt = """
+                    Check for prior run artifacts: logs/orient/ORIENT-*.md, logs/implement/PROGRESS-*.md, logs/validate/VALIDATION-RUN-*.md.
+
+                    Write to logs/orient/ORIENT-{N}.md.
+                    """
+            };
+            graph.Nodes[node.Id] = node;
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+
+            using var statusDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(tempDir, node.Id, "status.json")));
+            Assert.Equal("none", statusDocument.RootElement.GetProperty("edit_state").GetString());
+            Assert.True(statusDocument.RootElement.GetProperty("advance_allowed").GetBoolean());
+            Assert.False(statusDocument.RootElement.GetProperty("effective_policy").GetProperty("require_edits").GetBoolean());
         }
         finally
         {

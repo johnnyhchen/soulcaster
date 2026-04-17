@@ -17,7 +17,7 @@ public class FanInHandler : INodeHandler
         var resultsJson = context.Get("parallel.results");
         if (string.IsNullOrEmpty(resultsJson))
         {
-            return new Outcome(OutcomeStatus.Success, Notes: $"Fan-in node '{node.Id}' synchronized (no parallel results found).");
+            return new Outcome(OutcomeStatus.Fail, Notes: $"Fan-in node '{node.Id}' failed: parallel.results was missing.");
         }
 
         List<Dictionary<string, object?>>? branchResults;
@@ -27,12 +27,12 @@ public class FanInHandler : INodeHandler
         }
         catch
         {
-            return new Outcome(OutcomeStatus.Success, Notes: $"Fan-in node '{node.Id}' synchronized (could not parse parallel results).");
+            return new Outcome(OutcomeStatus.Fail, Notes: $"Fan-in node '{node.Id}' failed: parallel.results was malformed.");
         }
 
         if (branchResults is null || branchResults.Count == 0)
         {
-            return new Outcome(OutcomeStatus.Success, Notes: $"Fan-in node '{node.Id}' synchronized (empty results).");
+            return new Outcome(OutcomeStatus.Fail, Notes: $"Fan-in node '{node.Id}' failed: parallel.results was empty.");
         }
 
         // If node has a prompt, use LLM-based evaluation

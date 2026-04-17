@@ -51,16 +51,18 @@ public class CodergenHandler : INodeHandler
         Directory.CreateDirectory(stageDir);
         var artifactPaths = BuildArtifactPaths(stageDir);
 
-        var outgoingLabels = graph.OutgoingEdges(node.Id)
+        var outgoingEdges = graph.OutgoingEdges(node.Id);
+        var outgoingLabels = outgoingEdges
             .Where(e => !string.IsNullOrWhiteSpace(e.Label))
             .Select(e => e.Label.Trim())
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(l => l, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        var outcomeRouteValues = ExtractOutcomeRouteValues(outgoingEdges);
 
         expandedPrompt =
-            BuildPreamble(node, graph, logsRoot, context, outgoingLabels, executionOptions) +
-            BuildStageContractInstructions(outgoingLabels) +
+            BuildPreamble(node, graph, logsRoot, context, outgoingLabels, outcomeRouteValues, executionOptions) +
+            BuildStageContractInstructions(outgoingLabels, outcomeRouteValues) +
             expandedPrompt;
 
         await File.WriteAllTextAsync(Path.Combine(stageDir, "prompt.md"), expandedPrompt, ct);
@@ -140,6 +142,9 @@ public class CodergenHandler : INodeHandler
             }
 
             if (stageStatus is not null)
+                stageStatus = NormalizeRouteOutcome(stageStatus, outgoingEdges);
+
+            if (stageStatus is not null)
                 break;
 
             // Preserve legacy retry/fail semantics for backends that haven't
@@ -149,7 +154,7 @@ public class CodergenHandler : INodeHandler
 
             if (attempt < MaxContractAttempts)
             {
-                var reminder = BuildReminder(contractError, outgoingLabels);
+                var reminder = BuildReminder(contractError, outgoingLabels, outcomeRouteValues);
                 await File.WriteAllTextAsync(Path.Combine(stageDir, $"reminder-{attempt}.md"), reminder, ct);
                 attemptPrompt = expandedPrompt + "\n\n[STAGE CONTRACT REMINDER]\n" + reminder;
             }
@@ -359,8 +364,7 @@ public class CodergenHandler : INodeHandler
     {
         return ContainsImplementationCue(node.Id) ||
                ContainsImplementationCue(node.Label) ||
-               ContainsImplementationCue(node.Class) ||
-               ContainsImplementationCue(node.Prompt);
+               ContainsImplementationCue(node.Class);
     }
 
     private static bool ContainsImplementationCue(string? text)
@@ -1412,13 +1416,16 @@ public class CodergenHandler : INodeHandler
             RegexOptions.CultureInvariant);
     }
 
-    private static string BuildStageContractInstructions(IReadOnlyList<string> outgoingLabels)
+    private static string BuildStageContractInstructions(
+        IReadOnlyList<string> outgoingLabels,
+        IReadOnlyList<string> outcomeRouteValues)
     {
         var sb = new StringBuilder();
         sb.AppendLine("[STAGE STATUS CONTRACT]");
         sb.AppendLine("Before finishing this stage, output a valid JSON object (optionally in ```json fences) with these fields:");
         sb.AppendLine("  status: success | retry | fail | partial_success");
         sb.AppendLine("  preferred_next_label: string (optional)");
+        sb.AppendLine("  outcome: string (optional; use this when routing depends on outcome=... edge conditions)");
         sb.AppendLine("  suggested_next_ids: string[] (optional)");
         sb.AppendLine("  context_updates: object<string,string> (optional)");
         sb.AppendLine("  notes: string (optional)");
@@ -1426,21 +1433,28 @@ public class CodergenHandler : INodeHandler
         sb.AppendLine("  blocking_question: string | object (optional when you need Soulcaster to auto-answer a blocking question)");
         if (outgoingLabels.Count > 0)
             sb.AppendLine($"If preferred_next_label is set, it MUST be one of: {string.Join(", ", outgoingLabels)}");
+        if (outcomeRouteValues.Count > 0)
+            sb.AppendLine($"If this node routes via outcome=... conditions, allowed outcome values are: {string.Join(", ", outcomeRouteValues)}");
         sb.AppendLine("[/STAGE STATUS CONTRACT]");
         sb.AppendLine();
 
         return sb.ToString();
     }
 
-    private static string BuildReminder(string reason, IReadOnlyList<string> outgoingLabels)
+    private static string BuildReminder(
+        string reason,
+        IReadOnlyList<string> outgoingLabels,
+        IReadOnlyList<string> outcomeRouteValues)
     {
         var sb = new StringBuilder();
         sb.AppendLine("Your previous output did not satisfy the stage status contract.");
         if (!string.IsNullOrWhiteSpace(reason))
             sb.AppendLine($"Reason: {reason}");
-        sb.AppendLine("Return ONLY a valid JSON object with keys: status, preferred_next_label, suggested_next_ids, context_updates, notes, failure_reason.");
+        sb.AppendLine("Return ONLY a valid JSON object with keys: status, outcome, preferred_next_label, suggested_next_ids, context_updates, notes, failure_reason.");
         if (outgoingLabels.Count > 0)
             sb.AppendLine($"Allowed preferred_next_label values: {string.Join(", ", outgoingLabels)}");
+        if (outcomeRouteValues.Count > 0)
+            sb.AppendLine($"Allowed outcome values for routing: {string.Join(", ", outcomeRouteValues)}");
         return sb.ToString();
     }
 
@@ -1450,18 +1464,20 @@ public class CodergenHandler : INodeHandler
         string logsRoot,
         PipelineContext context,
         IReadOnlyList<string> outgoingLabels,
+        IReadOnlyList<string> outcomeRouteValues,
         CodergenExecutionOptions executionOptions)
     {
-        // logsRoot is the absolute path to the logs/ directory.
-        // outputRoot = logs parent = the run output directory (e.g. dotfiles/output/run-name).
-        var outputRoot = Path.GetFullPath(Path.Combine(logsRoot, ".."));
+        var outputRoot = graph.Attributes.TryGetValue("output_root", out var configuredOutputRoot) &&
+                         !string.IsNullOrWhiteSpace(configuredOutputRoot)
+            ? Path.GetFullPath(configuredOutputRoot)
+            : Path.GetFullPath(Path.Combine(logsRoot, ".."));
 
-        // Project root: dotfile lives at {project}/dotfiles/{name}.dot,
-        // so output is at {project}/dotfiles/output/{run}. Going up three
-        // levels from logsRoot (logs → output/run → output → dotfiles → project).
-        var projectRoot = Path.GetFullPath(Path.Combine(logsRoot, "..", "..", "..", ".."));
+        var projectRoot = graph.Attributes.TryGetValue("project_root", out var configuredProjectRoot) &&
+                          !string.IsNullOrWhiteSpace(configuredProjectRoot)
+            ? Path.GetFullPath(configuredProjectRoot)
+            : ResolveProjectRootFromGraph(graph, logsRoot);
 
-        var fidelity = string.IsNullOrWhiteSpace(node.Fidelity) ? "full" : node.Fidelity;
+        var fidelity = string.IsNullOrWhiteSpace(node.Fidelity) ? "compact" : node.Fidelity;
         var thread = string.IsNullOrWhiteSpace(node.ThreadId) ? node.Id : node.ThreadId;
         var stageId = RuntimeStageResolver.ResolveStageId(context, node.Id);
         var resumeMode = context.Get("pipeline.resume_mode");
@@ -1495,6 +1511,8 @@ public class CodergenHandler : INodeHandler
             sb.AppendLine($"  Helper reasoning effort: {helperReasoning}");
         if (outgoingLabels.Count > 0)
             sb.AppendLine($"  Outgoing labels: {string.Join(", ", outgoingLabels)}");
+        if (outcomeRouteValues.Count > 0)
+            sb.AppendLine($"  Conditional outcome routes: {string.Join(", ", outcomeRouteValues)}");
         if (!string.IsNullOrWhiteSpace(executionOptions.StageClass))
             sb.AppendLine($"  Stage class: {executionOptions.StageClass}");
         if (executionOptions.MaxProviderResponseMs is int timeoutMs)
@@ -1545,19 +1563,92 @@ public class CodergenHandler : INodeHandler
         return sb.ToString();
     }
 
-    private static string ExpandVariables(string prompt, PipelineContext context, Graph graph)
+    private static string ResolveProjectRootFromGraph(Graph graph, string logsRoot)
     {
-        if (string.IsNullOrEmpty(prompt))
-            return prompt;
-
-        var expanded = prompt.Replace("$goal", graph.Goal);
-
-        foreach (var (key, value) in context.All)
+        if (graph.Attributes.TryGetValue("source_path", out var sourcePath) &&
+            !string.IsNullOrWhiteSpace(sourcePath))
         {
-            expanded = expanded.Replace($"${{context.{key}}}", value);
+            var dotDirectory = Path.GetDirectoryName(Path.GetFullPath(sourcePath));
+            if (!string.IsNullOrWhiteSpace(dotDirectory))
+            {
+                if (string.Equals(Path.GetFileName(dotDirectory), "dotfiles", StringComparison.OrdinalIgnoreCase))
+                    return Path.GetFullPath(Path.Combine(dotDirectory, ".."));
+
+                return Path.GetFullPath(dotDirectory);
+            }
         }
 
-        return expanded;
+        return Path.GetFullPath(Path.Combine(logsRoot, "..", ".."));
+    }
+
+    private static IReadOnlyList<string> ExtractOutcomeRouteValues(IReadOnlyCollection<GraphEdge> outgoingEdges)
+    {
+        return outgoingEdges
+            .Select(ExtractOutcomeRouteValue)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .Cast<string>()
+            .ToList();
+    }
+
+    private static string? ExtractOutcomeRouteValue(GraphEdge edge)
+    {
+        if (string.IsNullOrWhiteSpace(edge.Condition))
+            return null;
+
+        var match = Regex.Match(
+            edge.Condition,
+            @"^\s*outcome\s*=\s*(?<value>.+?)\s*$",
+            RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return null;
+
+        var rawValue = match.Groups["value"].Value.Trim();
+        if ((rawValue.StartsWith('"') && rawValue.EndsWith('"')) ||
+            (rawValue.StartsWith('\'') && rawValue.EndsWith('\'')))
+        {
+            rawValue = rawValue[1..^1];
+        }
+
+        return string.IsNullOrWhiteSpace(rawValue) ? null : rawValue;
+    }
+
+    private static StageStatusContract NormalizeRouteOutcome(
+        StageStatusContract stageStatus,
+        IReadOnlyCollection<GraphEdge> outgoingEdges)
+    {
+        if (stageStatus.ContextUpdates.ContainsKey("outcome") ||
+            string.IsNullOrWhiteSpace(stageStatus.PreferredNextLabel))
+        {
+            return stageStatus;
+        }
+
+        var preferredLabelMatchesEdge = outgoingEdges.Any(edge =>
+            !string.IsNullOrWhiteSpace(edge.Label) &&
+            EdgeSelector.NormalizeLabel(edge.Label) == EdgeSelector.NormalizeLabel(stageStatus.PreferredNextLabel));
+        if (preferredLabelMatchesEdge)
+            return stageStatus;
+
+        var matchingOutcome = outgoingEdges
+            .Select(ExtractOutcomeRouteValue)
+            .FirstOrDefault(value =>
+                !string.IsNullOrWhiteSpace(value) &&
+                EdgeSelector.NormalizeLabel(value) == EdgeSelector.NormalizeLabel(stageStatus.PreferredNextLabel));
+        if (string.IsNullOrWhiteSpace(matchingOutcome))
+            return stageStatus;
+
+        var updatedContext = new Dictionary<string, string>(stageStatus.ContextUpdates, StringComparer.Ordinal)
+        {
+            ["outcome"] = matchingOutcome
+        };
+
+        return stageStatus with { ContextUpdates = updatedContext };
+    }
+
+    private static string ExpandVariables(string prompt, PipelineContext context, Graph graph)
+    {
+        return VariableExpander.Expand(prompt, graph.Attributes, context.All, graph.Goal);
     }
 
     private static string ResolveHelperAttribute(GraphNode node, Graph graph, string suffix)
