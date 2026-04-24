@@ -30,7 +30,7 @@ public class Session
         SessionConfig? config = null)
     {
         LlmClient = llmClient;
-        ProviderProfile = providerProfile;
+        ProviderProfile = new SessionOwnedProfile(providerProfile);
         ExecutionEnv = executionEnv;
         Config = config ?? new SessionConfig();
         EventEmitter.SessionId = Id;
@@ -41,8 +41,9 @@ public class Session
     /// </summary>
     public Subagent SpawnSubagent(string? model = null)
     {
-        if (Depth >= Subagent.DefaultMaxDepth)
-            throw new InvalidOperationException($"Max subagent depth ({Subagent.DefaultMaxDepth}) reached.");
+        var maxSubagentDepth = Config.MaxSubagentDepth > 0 ? Config.MaxSubagentDepth : Subagent.DefaultMaxDepth;
+        if (Depth >= maxSubagentDepth)
+            throw new InvalidOperationException($"Max subagent depth ({maxSubagentDepth}) reached.");
 
         var childSession = new Session(
             LlmClient,
@@ -113,13 +114,21 @@ public class Session
     /// and iterates until the assistant produces a final text response or limits are reached.
     /// </summary>
     public Task<AssistantTurn> ProcessInputAsync(string userInput, CancellationToken ct = default) =>
-        ProcessInputAsync(Message.UserMsg(userInput), ct);
+        ProcessInputAsync(Message.UserMsg(userInput), requestOptions: null, ct);
 
     /// <summary>
     /// The core agentic loop for multimodal user input. Processes user content through the LLM,
     /// executes tool calls, and iterates until the assistant produces a final response or limits are reached.
     /// </summary>
     public async Task<AssistantTurn> ProcessInputAsync(Message userMessage, CancellationToken ct = default)
+    {
+        return await ProcessInputAsync(userMessage, requestOptions: null, ct);
+    }
+
+    public async Task<AssistantTurn> ProcessInputAsync(
+        Message userMessage,
+        SessionRequestOptions? requestOptions,
+        CancellationToken ct = default)
     {
         if (userMessage.Role != Role.User)
             throw new ArgumentException("ProcessInputAsync requires a user-role message.", nameof(userMessage));
@@ -242,12 +251,14 @@ public class Session
                     var projectDocs = ProjectDocs.Discover(ExecutionEnv.WorkingDirectory);
                     var systemPrompt = ProviderProfile.BuildSystemPrompt(ExecutionEnv, projectDocs.Count > 0 ? projectDocs : null);
 
+                    var tools = ProviderProfile.Tools().ToList();
                     var request = new Request
                     {
                         Model = ProviderProfile.Model,
                         Messages = messages,
-                        Tools = ProviderProfile.Tools().ToList(),
-                        ToolChoice = ToolChoice.Auto,
+                        Tools = tools,
+                        ToolChoice = requestOptions?.ToolChoice ?? (tools.Count > 0 ? ToolChoice.Auto : ToolChoice.NoneChoice),
+                        OutputModalities = requestOptions?.OutputModalities?.ToList(),
                         ReasoningEffort = Config.ReasoningEffort,
                         ProviderOptions = ProviderProfile.ProviderOptions()
                     };
@@ -329,7 +340,7 @@ public class Session
                     History.Add(assistantTurn);
 
                     // If no tool calls, this is the final response
-                    if (toolCalls.Count == 0)
+                    if (toolCalls.Count == 0 || requestOptions?.ExecuteToolCalls == false)
                     {
                         // Check for follow-up messages
                         if (_followUpQueue.Count > 0)
@@ -399,7 +410,9 @@ public class Session
         CancellationToken ct)
     {
         // Execute tool calls in parallel when the profile supports it and there are multiple calls
-        if (ProviderProfile.SupportsParallelToolCalls && toolCalls.Count > 1)
+        if (ProviderProfile.SupportsParallelToolCalls &&
+            toolCalls.Count > 1 &&
+            toolCalls.All(toolCall => !IsSessionManagedTool(toolCall.Name)))
         {
             var tasks = toolCalls.Select(async toolCall =>
             {
@@ -472,6 +485,10 @@ public class Session
     /// </summary>
     private async Task<ToolResultData> ExecuteSingleToolAsync(ToolCallData toolCall, CancellationToken ct)
     {
+        var sessionManagedResult = await ExecuteSessionManagedToolAsync(toolCall, ct);
+        if (sessionManagedResult is not null)
+            return sessionManagedResult;
+
         var tool = ProviderProfile.ToolRegistry.Get(toolCall.Name);
         if (tool is null)
         {
@@ -499,6 +516,116 @@ public class Session
         }
     }
 
+    private async Task<ToolResultData?> ExecuteSessionManagedToolAsync(ToolCallData toolCall, CancellationToken ct)
+    {
+        if (!IsSessionManagedTool(toolCall.Name))
+            return null;
+
+        using var json = JsonDocument.Parse(toolCall.Arguments);
+        var root = json.RootElement;
+
+        try
+        {
+            return toolCall.Name switch
+            {
+                "spawn_agent" => await ExecuteSpawnAgentToolAsync(toolCall.Id, root, ct),
+                "send_input" => await ExecuteSendInputToolAsync(toolCall.Id, root, ct),
+                "wait_agent" => await ExecuteWaitAgentToolAsync(toolCall.Id, root, ct),
+                "close_agent" => ExecuteCloseAgentTool(toolCall.Id, root),
+                _ => null
+            };
+        }
+        catch (InvalidOperationException ex)
+        {
+            return new ToolResultData(toolCall.Id, $"Error: {ex.Message}", IsError: true);
+        }
+        catch (ArgumentException ex)
+        {
+            return new ToolResultData(toolCall.Id, $"Error: {ex.Message}", IsError: true);
+        }
+    }
+
+    private async Task<ToolResultData> ExecuteSpawnAgentToolAsync(string toolCallId, JsonElement args, CancellationToken ct)
+    {
+        var prompt = GetRequiredString(args, "prompt");
+        string? model = TryGetOptionalString(args, "model");
+
+        var subagent = SpawnSubagent(model);
+        await subagent.EnqueueInputAsync(prompt, ct);
+
+        return new ToolResultData(
+            toolCallId,
+            $"Agent {subagent.Id} spawned.\nState: {FormatSubagentState(subagent.State)}\nPending inputs: {subagent.PendingInputCount}",
+            IsError: false);
+    }
+
+    private async Task<ToolResultData> ExecuteSendInputToolAsync(string toolCallId, JsonElement args, CancellationToken ct)
+    {
+        var agentId = GetRequiredString(args, "agent_id");
+        var message = GetRequiredString(args, "message");
+        var subagent = GetSubagent(agentId);
+        if (subagent is null)
+        {
+            return new ToolResultData(
+                toolCallId,
+                $"Error: Agent '{agentId}' not found.",
+                IsError: true);
+        }
+
+        await subagent.EnqueueInputAsync(message, ct);
+        return new ToolResultData(
+            toolCallId,
+            $"Agent {agentId} accepted input.\nState: {FormatSubagentState(subagent.State)}\nPending inputs: {subagent.PendingInputCount}",
+            IsError: false);
+    }
+
+    private async Task<ToolResultData> ExecuteWaitAgentToolAsync(string toolCallId, JsonElement args, CancellationToken ct)
+    {
+        var agentId = GetRequiredString(args, "agent_id");
+        var subagent = GetSubagent(agentId);
+        if (subagent is null)
+        {
+            return new ToolResultData(
+                toolCallId,
+                $"Error: Agent '{agentId}' not found.",
+                IsError: true);
+        }
+
+        var output = await subagent.WaitForCompletionAsync(ct);
+        return new ToolResultData(toolCallId, output, IsError: false);
+    }
+
+    private ToolResultData ExecuteCloseAgentTool(string toolCallId, JsonElement args)
+    {
+        var agentId = GetRequiredString(args, "agent_id");
+        var subagent = GetSubagent(agentId);
+        if (subagent is null)
+        {
+            return new ToolResultData(
+                toolCallId,
+                $"Error: Agent '{agentId}' not found.",
+                IsError: true);
+        }
+
+        CloseSubagent(agentId);
+        return new ToolResultData(toolCallId, $"Agent '{agentId}' closed.", IsError: false);
+    }
+
+    private static bool IsSessionManagedTool(string toolName) => toolName is "spawn_agent" or "send_input" or "wait_agent" or "close_agent";
+
+    private static string FormatSubagentState(SubagentState state) => state.ToString().ToLowerInvariant();
+
+    private static string GetRequiredString(JsonElement args, string name)
+    {
+        if (!args.TryGetProperty(name, out var value) || string.IsNullOrWhiteSpace(value.GetString()))
+            throw new ArgumentException($"'{name}' is required.", name);
+
+        return value.GetString()!;
+    }
+
+    private static string? TryGetOptionalString(JsonElement args, string name) =>
+        args.TryGetProperty(name, out var value) ? value.GetString() : null;
+
     /// <summary>
     /// Converts the session history into the LLM message format.
     /// </summary>
@@ -521,7 +648,10 @@ public class Session
                 {
                     if (assistantTurn.Parts is { Count: > 0 })
                     {
-                        messages.Add(new Message(Role.Assistant, new List<ContentPart>(assistantTurn.Parts)));
+                        messages.Add(new Message(
+                            Role.Assistant,
+                            new List<ContentPart>(assistantTurn.Parts),
+                            ResponseId: assistantTurn.ResponseId));
                         break;
                     }
 
@@ -553,7 +683,7 @@ public class Session
 
                     if (parts.Count > 0)
                     {
-                        messages.Add(new Message(Role.Assistant, parts));
+                        messages.Add(new Message(Role.Assistant, parts, ResponseId: assistantTurn.ResponseId));
                     }
                     break;
                 }
@@ -607,6 +737,6 @@ public class Session
         if (parts.Count == 0)
             return false;
 
-        return parts.Any(p => p.Kind != ContentKind.Text);
+        return parts.Any(p => p.Kind != ContentKind.Text || !string.IsNullOrWhiteSpace(p.Signature));
     }
 }

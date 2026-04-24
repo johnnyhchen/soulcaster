@@ -74,6 +74,44 @@ public class SessionTests
     }
 
     [Fact]
+    public async Task Session_WithNoTools_UsesToolChoiceNone()
+    {
+        var provider = new CapturingProvider();
+        var profile = new FakeProfile(provider);
+        profile.ToolRegistry.Clear();
+        var session = new Session(provider, profile, new FakeExecutionEnvironment());
+
+        var result = await session.ProcessInputAsync("hello");
+
+        Assert.Equal("captured", result.Content);
+        Assert.NotNull(provider.LastRequest);
+        Assert.Empty(provider.LastRequest!.Tools);
+        Assert.Equal(ToolChoiceMode.None, provider.LastRequest.ToolChoice?.Mode);
+    }
+
+    [Fact]
+    public async Task Session_RequestOptions_ForwardOutputModalities_AndDisableToolExecution()
+    {
+        var provider = new CapturingProvider();
+        var profile = new FakeProfile(provider);
+        var session = new Session(provider, profile, new FakeExecutionEnvironment());
+
+        var result = await session.ProcessInputAsync(
+            Message.UserMsg("render an image"),
+            new SessionRequestOptions(
+                ToolChoice: ToolChoice.NoneChoice,
+                OutputModalities: [ResponseModality.Text, ResponseModality.Image],
+                ExecuteToolCalls: false));
+
+        Assert.Equal("captured", result.Content);
+        Assert.NotNull(provider.LastRequest);
+        Assert.Equal(ToolChoiceMode.None, provider.LastRequest!.ToolChoice?.Mode);
+        Assert.Equal(
+            [ResponseModality.Text, ResponseModality.Image],
+            provider.LastRequest.OutputModalities);
+    }
+
+    [Fact]
     public async Task Session_ReturnsToIdle_AfterProcessing()
     {
         var session = CreateSession();
@@ -284,6 +322,18 @@ public class ProviderProfileTests
     {
         var profile = new GeminiProfile();
         Assert.Equal("gemini", profile.Id);
+    }
+
+    [Fact]
+    public void ProviderProfiles_DefaultModels_AreCatalogedAndToolCapable()
+    {
+        foreach (var profile in new IProviderProfile[] { new AnthropicProfile(), new OpenAIProfile(), new GeminiProfile() })
+        {
+            var info = ModelCatalog.GetModelInfo(profile.Model);
+            Assert.NotNull(info);
+            Assert.Equal(profile.Id, info!.Provider);
+            Assert.True(info.SupportsTools == true);
+        }
     }
 }
 
@@ -852,6 +902,79 @@ public class SubagentTests
 
         Assert.Null(session.GetSubagent("nonexistent"));
     }
+
+    [Fact]
+    public async Task Subagent_EnqueueInputAsync_RunsInBackground_AndWaitsForCompletion()
+    {
+        var provider = new ControlledResponseProvider();
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        var subagent = session.SpawnSubagent();
+        await subagent.EnqueueInputAsync("first task");
+
+        Assert.Contains(subagent.State, new[] { SubagentState.Queued, SubagentState.Running });
+
+        var waitTask = subagent.WaitForCompletionAsync();
+        Assert.False(waitTask.IsCompleted);
+
+        await provider.WaitForCallCountAsync(1);
+        provider.CompleteNext("first done");
+
+        var output = await waitTask;
+
+        Assert.Equal("first done", output);
+        Assert.Equal(SubagentState.Completed, subagent.State);
+    }
+
+    [Fact]
+    public async Task Subagent_ProcessesQueuedInputs_Sequentially()
+    {
+        var provider = new ControlledResponseProvider();
+        var session = new Session(
+            provider,
+            new FakeProfile(provider),
+            new FakeExecutionEnvironment());
+
+        var subagent = session.SpawnSubagent();
+        await subagent.EnqueueInputAsync("first task");
+        await subagent.EnqueueInputAsync("second task");
+
+        var waitTask = subagent.WaitForCompletionAsync();
+        Assert.False(waitTask.IsCompleted);
+
+        await provider.WaitForCallCountAsync(1);
+        provider.CompleteNext("first done");
+        Assert.False(waitTask.IsCompleted);
+
+        await provider.WaitForCallCountAsync(2);
+        provider.CompleteNext("second done");
+        var output = await waitTask;
+
+        Assert.Equal("second done", output);
+        Assert.Equal(2, provider.CallCount);
+        Assert.Equal(["first task", "second task"], provider.ReceivedInputs);
+        Assert.Equal(SubagentState.Completed, subagent.State);
+    }
+
+    [Fact]
+    public void SpawnSubagent_ModelOverride_DoesNotMutateParentProfile()
+    {
+        var provider = new FakeProvider("test");
+        var profile = new FakeProfile(provider) { Model = "parent-model" };
+        var session = new Session(
+            provider,
+            profile,
+            new FakeExecutionEnvironment());
+
+        var subagent = session.SpawnSubagent("child-model");
+
+        Assert.Equal("parent-model", profile.Model);
+        Assert.Equal("parent-model", session.ProviderProfile.Model);
+        Assert.Equal("child-model", subagent.Session.ProviderProfile.Model);
+    }
 }
 
 // ── Tool Parameter Tests ────────────────────────────────────────────────────
@@ -1291,6 +1414,72 @@ internal class SlowProvider : IProviderAdapter
     public async IAsyncEnumerable<StreamEvent> StreamAsync(Request request, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         await Task.Delay(TimeSpan.FromMinutes(5), ct);
+        yield break;
+    }
+}
+
+internal sealed class ControlledResponseProvider : IProviderAdapter
+{
+    private readonly Queue<TaskCompletionSource<Response>> _pendingResponses = new();
+
+    public string Name => "controlled";
+    public int CallCount { get; private set; }
+    public List<string> ReceivedInputs { get; } = new();
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
+    {
+        CallCount++;
+        var userMessage = request.Messages.Last(message => message.Role == Role.User);
+        ReceivedInputs.Add(userMessage.Text);
+
+        var completion = new TaskCompletionSource<Response>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ct.Register(() => completion.TrySetCanceled(ct));
+
+        lock (_pendingResponses)
+            _pendingResponses.Enqueue(completion);
+
+        return completion.Task;
+    }
+
+    public void CompleteNext(string text)
+    {
+        TaskCompletionSource<Response> completion;
+        lock (_pendingResponses)
+            completion = _pendingResponses.Dequeue();
+
+        completion.TrySetResult(new Response(
+            Id: Guid.NewGuid().ToString(),
+            Model: "controlled-model",
+            Provider: Name,
+            Message: Message.AssistantMsg(text),
+            FinishReason: FinishReason.Stop,
+            Usage: Usage.Empty));
+    }
+
+    public async Task WaitForCallCountAsync(int expectedCount, int timeoutMs = 1000)
+    {
+        var startedAt = DateTime.UtcNow;
+        while (true)
+        {
+            int pendingCount;
+            lock (_pendingResponses)
+                pendingCount = _pendingResponses.Count;
+
+            if (CallCount >= expectedCount && pendingCount > 0)
+                return;
+
+            if ((DateTime.UtcNow - startedAt).TotalMilliseconds > timeoutMs)
+                throw new TimeoutException($"Timed out waiting for {expectedCount} calls. Observed {CallCount}.");
+
+            await Task.Delay(10);
+        }
+    }
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(
+        Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await Task.CompletedTask;
         yield break;
     }
 }

@@ -1,3 +1,6 @@
+using System.Text;
+using System.Threading.Channels;
+
 namespace Soulcaster.UnifiedLlm;
 
 /// <summary>
@@ -87,23 +90,10 @@ public sealed class Client
     /// </summary>
     public async Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
     {
-        var provider = GetProviderForRequest(request);
-
-        // Build the base handler
-        Func<Request, Task<Response>> handler = req => provider.CompleteAsync(req, ct);
-
-        // Apply middleware in reverse order so the first middleware wraps outermost
-        if (_middleware is not null)
-        {
-            for (var i = _middleware.Count - 1; i >= 0; i--)
-            {
-                var mw = _middleware[i];
-                var next = handler;
-                handler = req => mw(req, next);
-            }
-        }
-
-        return await handler(request).ConfigureAwait(false);
+        var normalizedRequest = NormalizeRequest(request);
+        var provider = GetProviderForRequest(normalizedRequest);
+        var handler = BuildMiddlewarePipeline(req => provider.CompleteAsync(req, ct));
+        return await handler(normalizedRequest).ConfigureAwait(false);
     }
 
     // ── StreamAsync ────────────────────────────────────────────────────
@@ -117,39 +107,72 @@ public sealed class Client
         Request request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        var provider = GetProviderForRequest(request);
-
-        // Apply middleware to transform the request (middleware can't wrap individual stream events,
-        // but can pre/post-process the request itself)
-        var effectiveRequest = request;
-        if (_middleware is not null)
+        var normalizedRequest = NormalizeRequest(request);
+        var provider = GetProviderForRequest(normalizedRequest);
+        var channel = Channel.CreateUnbounded<StreamEvent>(new UnboundedChannelOptions
         {
-            // Build a middleware chain that captures the final request
-            Request? transformedRequest = null;
-            Func<Request, Task<Response>> captureHandler = req =>
-            {
-                transformedRequest = req;
-                // Return a dummy response — we only care about the request transformation
-                return Task.FromResult(new Response("", "", "", Message.AssistantMsg(""), FinishReason.Stop, Usage.Empty));
-            };
+            SingleReader = true,
+            SingleWriter = true
+        });
 
-            var handler = captureHandler;
-            for (var i = _middleware.Count - 1; i >= 0; i--)
+        using var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var streamToken = streamCts.Token;
+        var text = new StringBuilder();
+        var usage = Usage.Empty;
+        FinishReason? finishReason = null;
+        Response? finalResponse = null;
+
+        var handler = BuildMiddlewarePipeline(async req =>
+        {
+            await foreach (var evt in provider.StreamAsync(req, streamToken).ConfigureAwait(false))
             {
-                var mw = _middleware[i];
-                var next = handler;
-                handler = req => mw(req, next);
+                if (evt.Type == StreamEventType.TextDelta && evt.Delta is not null)
+                    text.Append(evt.Delta);
+
+                if (evt.Usage is not null)
+                    usage += evt.Usage;
+
+                if (evt.FinishReason is not null)
+                    finishReason = evt.FinishReason;
+
+                if (evt.Response is not null)
+                    finalResponse = evt.Response;
+
+                await channel.Writer.WriteAsync(evt, streamToken).ConfigureAwait(false);
             }
 
-            await handler(request).ConfigureAwait(false);
-            if (transformedRequest is not null)
-                effectiveRequest = transformedRequest;
+            return finalResponse ?? new Response(
+                Id: Guid.NewGuid().ToString(),
+                Model: req.Model,
+                Provider: provider.Name,
+                Message: Message.AssistantMsg(text.ToString()),
+                FinishReason: finishReason ?? FinishReason.Stop,
+                Usage: usage);
+        });
+
+        var producer = Task.Run(async () =>
+        {
+            try
+            {
+                await handler(normalizedRequest).ConfigureAwait(false);
+            }
+            finally
+            {
+                channel.Writer.TryComplete();
+            }
+        });
+
+        try
+        {
+            await foreach (var evt in channel.Reader.ReadAllAsync(streamToken).ConfigureAwait(false))
+                yield return evt;
+        }
+        finally
+        {
+            streamCts.Cancel();
         }
 
-        await foreach (var evt in provider.StreamAsync(effectiveRequest, ct).ConfigureAwait(false))
-        {
-            yield return evt;
-        }
+        await producer.ConfigureAwait(false);
     }
 
     // ── Provider resolution ────────────────────────────────────────────
@@ -160,13 +183,6 @@ public sealed class Client
     /// </summary>
     internal IProviderAdapter GetProviderForRequest(Request request)
     {
-        // Resolve model alias (e.g. "codex-5.2" → "gpt-5.2-codex") via catalog
-        var resolvedModel = ResolveModelAlias(request.Model);
-        if (resolvedModel != request.Model)
-        {
-            request = request with { Model = resolvedModel };
-        }
-
         var providerName = request.Provider;
 
         // If no provider specified, try to infer from model name
@@ -222,5 +238,29 @@ public sealed class Client
             return "gemini";
 
         return null;
+    }
+
+    private static Request NormalizeRequest(Request request)
+    {
+        var resolvedModel = ResolveModelAlias(request.Model);
+        return resolvedModel == request.Model
+            ? request
+            : request with { Model = resolvedModel };
+    }
+
+    private Func<Request, Task<Response>> BuildMiddlewarePipeline(Func<Request, Task<Response>> terminalHandler)
+    {
+        var handler = terminalHandler;
+        if (_middleware is null)
+            return handler;
+
+        for (var i = _middleware.Count - 1; i >= 0; i--)
+        {
+            var mw = _middleware[i];
+            var next = handler;
+            handler = req => mw(req, next);
+        }
+
+        return handler;
     }
 }
