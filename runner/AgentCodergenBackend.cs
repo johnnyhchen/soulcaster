@@ -1,8 +1,10 @@
+using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Soulcaster.Attractor;
 using Soulcaster.CodingAgent;
 using Soulcaster.UnifiedLlm;
+using Soulcaster.UnifiedLlm.Models;
 
 namespace Soulcaster.Runner;
 
@@ -108,6 +110,20 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         {
             shouldPool = false;
             carryoverMode = "summary:high";
+        }
+
+        if (!string.Equals(options?.ExecutionLane ?? "agent", "agent", StringComparison.OrdinalIgnoreCase))
+        {
+            return await RunLeafAsync(
+                prompt,
+                hints,
+                resolvedProvider,
+                model,
+                reasoningEffort,
+                carryoverMode,
+                shouldPool,
+                ct,
+                options);
         }
 
         try
@@ -285,6 +301,241 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
         }
     }
 
+    private async Task<CodergenResult> RunLeafAsync(
+        string prompt,
+        RuntimeHints hints,
+        string? resolvedProvider,
+        string? model,
+        string? reasoningEffort,
+        string carryoverMode,
+        bool shouldPool,
+        CancellationToken ct,
+        CodergenExecutionOptions? options)
+    {
+        Session? session = null;
+        var pooledSession = false;
+        var retainedForCarryover = false;
+
+        try
+        {
+            session = GetSession(
+                shouldPool: shouldPool,
+                hints: hints,
+                resolvedProvider: resolvedProvider,
+                requestedModel: model,
+                reasoningEffort: reasoningEffort,
+                options: options,
+                pooledSession: out pooledSession);
+
+            ApplyInitialSteer(session);
+            ApplySteerFile(session);
+
+            var carryover = BuildCarryoverPreamble(hints.ThreadId, carryoverMode);
+            var effectivePrompt = string.IsNullOrWhiteSpace(carryover)
+                ? prompt
+                : carryover + "\n\n" + prompt;
+            var stageStartedAt = DateTimeOffset.UtcNow;
+            var historyStartIndex = session.History.Count;
+
+            Console.Error.WriteLine(
+                $"  [codergen] Starting {options?.ExecutionLane ?? "leaf"} session (model={model ?? "default"}, fidelity={hints.Fidelity}, thread={hints.ThreadId}, pooled={pooledSession})");
+
+            StageStatusContract? parsedStatus = null;
+            var parseError = string.Empty;
+            var firstResponse = string.Empty;
+            var finalResponse = string.Empty;
+            AssistantTurn? finalTurn = null;
+            string? pendingPrompt = effectivePrompt;
+            var attemptsUsed = 0;
+
+            while (attemptsUsed < MaxStatusParseAttempts)
+            {
+                attemptsUsed++;
+
+                var inputPrompt = pendingPrompt;
+                if (string.IsNullOrWhiteSpace(inputPrompt))
+                    inputPrompt = attemptsUsed == 1 ? effectivePrompt : BuildStageStatusReminder(parseError);
+                pendingPrompt = null;
+
+                ApplySteerFile(session);
+                finalTurn = await session.ProcessInputAsync(
+                    BuildLeafInputMessage(inputPrompt!, options),
+                    new SessionRequestOptions(
+                        ToolChoice: ToolChoice.NoneChoice,
+                        OutputModalities: options?.OutputModalities,
+                        ExecuteToolCalls: false),
+                    ct);
+
+                finalResponse = finalTurn.Content ?? "[no response]";
+                if (string.IsNullOrWhiteSpace(firstResponse))
+                    firstResponse = finalResponse;
+
+                if (IsTerminalSessionSentinel(finalResponse))
+                    break;
+
+                if (StageStatusContract.TryParseAssistantResponse(finalResponse, out parsedStatus, out parseError))
+                    break;
+
+                if (attemptsUsed < MaxStatusParseAttempts)
+                    pendingPrompt = BuildStageStatusReminder(parseError);
+            }
+
+            if (string.IsNullOrWhiteSpace(firstResponse))
+                firstResponse = finalResponse;
+
+            var classification = ClassifyTerminalResponse(finalResponse, session.LastError);
+            var status = parsedStatus?.Status ?? classification.Status;
+            var telemetry = BuildStageTelemetry(session, historyStartIndex, stageStartedAt);
+            telemetry["provider"] = session.ProviderProfile.Id;
+            telemetry["model"] = session.ProviderProfile.Model;
+            telemetry["provider_state"] = classification.ProviderState;
+            telemetry["provider_timeout_ms"] = session.Config.MaxProviderResponseMs;
+            telemetry["tool_injection_mode"] = "disabled";
+            telemetry["attached_image_count"] = options?.InputImagePaths?.Count ?? 0;
+            telemetry["attached_document_count"] = options?.InputDocumentPaths?.Count ?? 0;
+            telemetry["attached_audio_count"] = options?.InputAudioPaths?.Count ?? 0;
+            telemetry["assistant_image_count"] = finalTurn?.Images.Count ?? 0;
+            if (options?.OutputModalities is { Count: > 0 })
+            {
+                telemetry["requested_output_modalities"] = options.OutputModalities
+                    .Select(MapOutputModality)
+                    .Cast<object?>()
+                    .ToList();
+            }
+
+            if (!telemetry.ContainsKey("verification_state"))
+                telemetry["verification_state"] = classification.DefaultVerificationState;
+            if (!string.IsNullOrWhiteSpace(classification.FailureKind))
+                telemetry["failure_kind"] = classification.FailureKind;
+            if (classification.ProviderStatusCode is not null)
+                telemetry["provider_status_code"] = classification.ProviderStatusCode.Value;
+            if (classification.ProviderRetryable is not null)
+                telemetry["provider_retryable"] = classification.ProviderRetryable.Value;
+            if (!string.IsNullOrWhiteSpace(classification.ErrorMessage))
+                telemetry["provider_error_message"] = classification.ErrorMessage;
+
+            if (!pooledSession && session.History.Count > 0)
+            {
+                PreserveCarryoverSession(hints.ThreadId, session);
+                retainedForCarryover = true;
+            }
+
+            return new CodergenResult(
+                Response: firstResponse,
+                Status: status,
+                ContextUpdates: parsedStatus?.ContextUpdates,
+                PreferredLabel: parsedStatus?.PreferredNextLabel,
+                SuggestedNextIds: parsedStatus?.SuggestedNextIds,
+                StageStatus: parsedStatus,
+                RawAssistantResponse: finalResponse,
+                Telemetry: telemetry,
+                BinaryArtifacts: finalTurn is null ? null : BuildBinaryArtifacts(finalTurn));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            if (pooledSession)
+                _sessionPool.Discard(hints.ThreadId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (pooledSession)
+                _sessionPool.Discard(hints.ThreadId);
+            Console.Error.WriteLine($"  [codergen] Error: {ex.Message}");
+            var classification = ClassifyException(ex);
+            return new CodergenResult(
+                Response: $"Agent error: {ex.Message}",
+                Status: classification.Status,
+                Telemetry: new Dictionary<string, object?>
+                {
+                    ["provider_state"] = classification.ProviderState,
+                    ["verification_state"] = classification.DefaultVerificationState,
+                    ["failure_kind"] = classification.FailureKind,
+                    ["provider_status_code"] = classification.ProviderStatusCode,
+                    ["provider_retryable"] = classification.ProviderRetryable,
+                    ["provider_error_message"] = classification.ErrorMessage
+                });
+        }
+        finally
+        {
+            if (!pooledSession && session is not null && !retainedForCarryover)
+                session.Close();
+        }
+    }
+
+    private static Message BuildLeafInputMessage(string prompt, CodergenExecutionOptions? options)
+    {
+        var parts = new List<ContentPart>
+        {
+            ContentPart.TextPart(prompt)
+        };
+
+        foreach (var inputImagePath in options?.InputImagePaths ?? Array.Empty<string>())
+        {
+            if (!File.Exists(inputImagePath))
+                throw new FileNotFoundException($"Leaf execution image input '{inputImagePath}' does not exist.", inputImagePath);
+
+            parts.Add(ContentPart.ImagePart(ImageData.FromFile(inputImagePath)));
+        }
+
+        foreach (var inputDocumentPath in options?.InputDocumentPaths ?? Array.Empty<string>())
+        {
+            if (!File.Exists(inputDocumentPath))
+                throw new FileNotFoundException($"Leaf execution document input '{inputDocumentPath}' does not exist.", inputDocumentPath);
+
+            parts.Add(ContentPart.DocumentPart(DocumentData.FromFile(inputDocumentPath)));
+        }
+
+        foreach (var inputAudioPath in options?.InputAudioPaths ?? Array.Empty<string>())
+        {
+            if (!File.Exists(inputAudioPath))
+                throw new FileNotFoundException($"Leaf execution audio input '{inputAudioPath}' does not exist.", inputAudioPath);
+
+            parts.Add(ContentPart.AudioPart(AudioData.FromFile(inputAudioPath)));
+        }
+
+        return Message.UserMsg(parts.ToArray());
+    }
+
+    private static IReadOnlyList<CodergenBinaryArtifact> BuildBinaryArtifacts(AssistantTurn turn)
+    {
+        if (turn.Parts is null || turn.Parts.Count == 0)
+            return Array.Empty<CodergenBinaryArtifact>();
+
+        var artifacts = new List<CodergenBinaryArtifact>();
+        var imageIndex = 0;
+
+        foreach (var image in turn.Images)
+        {
+            if (image.Data is null || image.Data.Length == 0)
+                continue;
+
+            imageIndex++;
+            artifacts.Add(new CodergenBinaryArtifact(
+                RelativePath: $"generated/image-{imageIndex}{GetImageExtension(image.MediaType)}",
+                Content: image.Data,
+                MediaType: image.MediaType));
+        }
+
+        return artifacts;
+    }
+
+    private static string MapOutputModality(ResponseModality modality) => modality switch
+    {
+        ResponseModality.Text => "text",
+        ResponseModality.Image => "image",
+        _ => modality.ToString().ToLowerInvariant()
+    };
+
+    private static string GetImageExtension(string? mediaType) => mediaType?.ToLowerInvariant() switch
+    {
+        "image/jpeg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        "image/bmp" => ".bmp",
+        _ => ".png"
+    };
+
     private Session GetSession(
         bool shouldPool,
         RuntimeHints hints,
@@ -329,6 +580,24 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
 
         if (!string.IsNullOrEmpty(model))
             SetProfileModel(profile, model);
+
+        if (options?.DisableToolInjection == true)
+            profile.ToolRegistry.Clear();
+
+        ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+            profile.Id,
+            profile.Model,
+            reasoningEffort,
+            new CodergenCapabilityRequirements(
+                ExecutionLane: options?.ExecutionLane ?? "agent",
+                RequireVision: options?.RequireVision ?? false,
+                RequireImageInput: options?.InputImagePaths is { Count: > 0 },
+                RequireDocumentInput: options?.InputDocumentPaths is { Count: > 0 },
+                RequireAudioInput: options?.InputAudioPaths is { Count: > 0 },
+                MaxInputCostPerMillion: options?.MaxInputCostPerMillion,
+                MaxOutputCostPerMillion: options?.MaxOutputCostPerMillion,
+                MaxExpectedLatencyMs: options?.MaxExpectedLatencyMs,
+                OutputModalities: options?.OutputModalities));
 
         var env = new LocalExecutionEnvironment(_projectRoot);
         var sessionConfig = new SessionConfig(
@@ -432,6 +701,11 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             return false;
 
         if (session.Config.MaxProviderResponseMs != (options?.MaxProviderResponseMs ?? RunnerSessionDefaults.MaxProviderResponseMs))
+            return false;
+
+        var expectsTools = options?.DisableToolInjection != true;
+        var sessionHasTools = session.ProviderProfile.Tools().Count > 0;
+        if (expectsTools != sessionHasTools)
             return false;
 
         return session.State != SessionState.Closed;
@@ -1025,6 +1299,12 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
 
         return error switch
         {
+            CapabilityValidationError capability =>
+                new TerminalResponseClassification(
+                    OutcomeStatus.Fail,
+                    "invalid_capability",
+                    "capability_validation",
+                    ErrorMessage: capability.Message),
             AuthenticationError auth =>
                 new TerminalResponseClassification(
                     OutcomeStatus.Fail,
@@ -1496,6 +1776,19 @@ public sealed class ScriptedResponsePlan
     public string? AssistantText { get; init; }
     public List<string>? MustContain { get; init; }
     public List<string>? MustNotContain { get; init; }
+    public List<string>? ExpectedOutputModalities { get; init; }
+    public int? ExpectedRequestImageCount { get; init; }
+    public int? ExpectedRequestDocumentCount { get; init; }
+    public int? ExpectedRequestAudioCount { get; init; }
+    public bool RequireImageProviderState { get; init; }
+    public string? ExpectedImageProviderToken { get; init; }
+    public string? ProviderErrorMessage { get; init; }
+    public int? ProviderErrorStatusCode { get; init; }
+    public bool ProviderErrorRetryable { get; init; }
+    public bool ThrowTimeout { get; init; }
+    public string? ImageBase64 { get; init; }
+    public string? ImageMediaType { get; init; }
+    public string? ImageProviderToken { get; init; }
     public int DelayMs { get; init; }
 }
 
@@ -1525,15 +1818,24 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
     public Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
     {
         var lastUser = request.Messages.LastOrDefault(message => message.Role == Role.User)?.Text ?? string.Empty;
-        var responseText = IsHelperPrompt(lastUser)
-            ? ResolveHelperResponse(lastUser)
-            : ResolveNodeResponse(request.Messages);
+        if (IsHelperPrompt(lastUser))
+        {
+            return Task.FromResult(new Response(
+                Id: Guid.NewGuid().ToString("N"),
+                Model: request.Model,
+                Provider: Name,
+                Message: Message.AssistantMsg(ResolveHelperResponse(lastUser)),
+                FinishReason: FinishReason.Stop,
+                Usage: Usage.Empty));
+        }
 
+        var responsePlan = ResolveNodePlan(request.Messages, out var transcript, out var nodeId);
+        var assistantMessage = BuildAssistantMessage(responsePlan, transcript, nodeId, request);
         return Task.FromResult(new Response(
             Id: Guid.NewGuid().ToString("N"),
             Model: request.Model,
             Provider: Name,
-            Message: Message.AssistantMsg(responseText),
+            Message: assistantMessage,
             FinishReason: FinishReason.Stop,
             Usage: Usage.Empty));
     }
@@ -1549,14 +1851,14 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
         yield return new StreamEvent { Type = StreamEventType.Finish, FinishReason = response.FinishReason, Response = response };
     }
 
-    private string ResolveNodeResponse(IReadOnlyList<Message> messages)
+    private ScriptedResponsePlan? ResolveNodePlan(IReadOnlyList<Message> messages, out string transcript, out string nodeId)
     {
-        var transcript = string.Join(
+        transcript = string.Join(
             "\n",
             messages.Select(message => $"[{message.Role}] {message.Text}"));
-        var nodeId = ExtractNodeId(messages);
+        nodeId = ExtractNodeId(messages);
         if (!_plan.Nodes.TryGetValue(nodeId, out var queue) || queue.Count == 0)
-            return BuildResponseText(_plan.DefaultResponse, transcript, nodeId);
+            return _plan.DefaultResponse;
 
         ScriptedResponsePlan responsePlan;
         lock (_lock)
@@ -1566,7 +1868,7 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
             _nodeCounters[nodeId] = index + 1;
         }
 
-        return BuildResponseText(responsePlan, transcript, nodeId);
+        return responsePlan;
     }
 
     private string ResolveHelperResponse(string prompt)
@@ -1611,10 +1913,18 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
         return "default";
     }
 
-    private static string BuildResponseText(ScriptedResponsePlan? plan, string prompt, string nodeId)
+    private static Message BuildAssistantMessage(
+        ScriptedResponsePlan? plan,
+        string prompt,
+        string nodeId,
+        Request request)
     {
+        string responseText;
         if (plan is null)
-            return BuildDefaultStageStatus($"scripted default for {nodeId}");
+        {
+            responseText = BuildDefaultStageStatus($"scripted default for {nodeId}");
+            return Message.AssistantMsg(responseText);
+        }
 
         if (plan.DelayMs > 0)
             Thread.Sleep(plan.DelayMs);
@@ -1622,18 +1932,144 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
         foreach (var required in plan.MustContain ?? new List<string>())
         {
             if (!prompt.Contains(required, StringComparison.Ordinal))
-                return BuildFailureStageStatus($"scripted assertion failed for {nodeId}: missing '{required}'");
+            {
+                responseText = BuildFailureStageStatus($"scripted assertion failed for {nodeId}: missing '{required}'");
+                return Message.AssistantMsg(responseText);
+            }
         }
 
         foreach (var forbidden in plan.MustNotContain ?? new List<string>())
         {
             if (prompt.Contains(forbidden, StringComparison.Ordinal))
-                return BuildFailureStageStatus($"scripted assertion failed for {nodeId}: found forbidden '{forbidden}'");
+            {
+                responseText = BuildFailureStageStatus($"scripted assertion failed for {nodeId}: found forbidden '{forbidden}'");
+                return Message.AssistantMsg(responseText);
+            }
         }
 
-        return string.IsNullOrWhiteSpace(plan.AssistantText)
+        if (plan.ExpectedOutputModalities is { Count: > 0 } &&
+            !ExpectedOutputModalitiesSatisfied(plan.ExpectedOutputModalities, request))
+        {
+            responseText = BuildFailureStageStatus($"scripted assertion failed for {nodeId}: output modalities did not match.");
+            return Message.AssistantMsg(responseText);
+        }
+
+        var requestImages = request.Messages
+            .SelectMany(message => message.Content)
+            .Where(part => part.Kind == ContentKind.Image && part.Image is not null)
+            .Select(part => part.Image!)
+            .ToList();
+        if (plan.ExpectedRequestImageCount is int expectedImageCount && requestImages.Count != expectedImageCount)
+        {
+            responseText = BuildFailureStageStatus(
+                $"scripted assertion failed for {nodeId}: expected {expectedImageCount} request image(s), got {requestImages.Count}.");
+            return Message.AssistantMsg(responseText);
+        }
+
+        var requestDocuments = request.Messages
+            .SelectMany(message => message.Content)
+            .Count(part => part.Kind == ContentKind.Document && part.Document is not null);
+        if (plan.ExpectedRequestDocumentCount is int expectedDocumentCount && requestDocuments != expectedDocumentCount)
+        {
+            responseText = BuildFailureStageStatus(
+                $"scripted assertion failed for {nodeId}: expected {expectedDocumentCount} request document(s), got {requestDocuments}.");
+            return Message.AssistantMsg(responseText);
+        }
+
+        var requestAudio = request.Messages
+            .SelectMany(message => message.Content)
+            .Count(part => part.Kind == ContentKind.Audio && part.Audio is not null);
+        if (plan.ExpectedRequestAudioCount is int expectedAudioCount && requestAudio != expectedAudioCount)
+        {
+            responseText = BuildFailureStageStatus(
+                $"scripted assertion failed for {nodeId}: expected {expectedAudioCount} request audio attachment(s), got {requestAudio}.");
+            return Message.AssistantMsg(responseText);
+        }
+
+        if (plan.RequireImageProviderState && requestImages.Any(image => image.ProviderState is null))
+        {
+            responseText = BuildFailureStageStatus(
+                $"scripted assertion failed for {nodeId}: expected request images with provider state.");
+            return Message.AssistantMsg(responseText);
+        }
+
+        if (!string.IsNullOrWhiteSpace(plan.ExpectedImageProviderToken))
+        {
+            var tokenMatched = requestImages.Any(image =>
+                string.Equals(
+                    image.ProviderState?["token"]?.GetValue<string>(),
+                    plan.ExpectedImageProviderToken,
+                    StringComparison.Ordinal));
+            if (!tokenMatched)
+            {
+                responseText = BuildFailureStageStatus(
+                    $"scripted assertion failed for {nodeId}: missing image provider token '{plan.ExpectedImageProviderToken}'.");
+                return Message.AssistantMsg(responseText);
+            }
+        }
+
+        if (plan.ThrowTimeout)
+            throw new TimeoutException(string.IsNullOrWhiteSpace(plan.ProviderErrorMessage) ? $"scripted timeout for {nodeId}" : plan.ProviderErrorMessage);
+
+        if (!string.IsNullOrWhiteSpace(plan.ProviderErrorMessage))
+        {
+            throw new ProviderError(
+                plan.ProviderErrorMessage,
+                (HttpStatusCode)(plan.ProviderErrorStatusCode ?? 503),
+                retryable: plan.ProviderErrorRetryable,
+                providerName: "scripted");
+        }
+
+        responseText = string.IsNullOrWhiteSpace(plan.AssistantText)
             ? BuildDefaultStageStatus($"scripted default for {nodeId}")
             : plan.AssistantText!;
+
+        var parts = new List<ContentPart> { ContentPart.TextPart(responseText) };
+        if (!string.IsNullOrWhiteSpace(plan.ImageBase64))
+        {
+            parts.Add(ContentPart.ImagePart(ImageData.FromBytes(
+                Convert.FromBase64String(plan.ImageBase64),
+                plan.ImageMediaType ?? "image/png",
+                providerState: BuildScriptedImageProviderState(plan.ImageProviderToken))));
+        }
+
+        return new Message(Role.Assistant, parts);
+    }
+
+    private static bool ExpectedOutputModalitiesSatisfied(
+        IEnumerable<string> expectedModalities,
+        Request request)
+    {
+        var actual = request.OutputModalities?
+            .Select(NormalizeOutputModality)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase)
+            ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var expected in expectedModalities)
+        {
+            if (!actual.Contains(expected))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string NormalizeOutputModality(ResponseModality modality) => modality switch
+    {
+        ResponseModality.Text => "text",
+        ResponseModality.Image => "image",
+        _ => modality.ToString().ToLowerInvariant()
+    };
+
+    private static System.Text.Json.Nodes.JsonObject? BuildScriptedImageProviderState(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return null;
+
+        return new System.Text.Json.Nodes.JsonObject
+        {
+            ["provider"] = "scripted",
+            ["token"] = token
+        };
     }
 
     private static string BuildDefaultStageStatus(string notes)

@@ -122,6 +122,9 @@ public static class InteractiveEditorCommand
                 case "inspect":
                     Console.WriteLine(BuilderCommandSupport.Describe(graph));
                     break;
+                case "preview":
+                    Console.WriteLine(BuilderCommandSupport.FormatPreview(BuilderCommandSupport.BuildPreview(graph, dotFilePath)));
+                    break;
                 case "save":
                     if (tokens.Count > 1)
                         dotFilePath = Path.GetFullPath(tokens[1]);
@@ -246,6 +249,7 @@ public static class InteractiveEditorCommand
         Console.WriteLine("  reasoning <node-id> <effort>");
         Console.WriteLine("  prompt <node-id>");
         Console.WriteLine("  inspect");
+        Console.WriteLine("  preview");
         Console.WriteLine("  save [path]");
         Console.WriteLine("  run [runner args ...]");
         Console.WriteLine("  quit");

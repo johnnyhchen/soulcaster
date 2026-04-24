@@ -13,7 +13,10 @@ public sealed record RunOptions(
     string BackendMode,
     string? BackendScriptPath,
     string? CrashAfterStage,
-    IReadOnlyDictionary<string, string>? Variables)
+    int CrashAfterStageCount,
+    IReadOnlyDictionary<string, string>? Variables,
+    bool DryRun = false,
+    bool Json = false)
 {
     public bool Autoresume => AutoResumePolicy != AutoResumePolicy.Off;
 
@@ -26,10 +29,13 @@ public sealed record RunOptions(
         string? steerFilePath = null;
         string? backendScriptPath = null;
         string? crashAfterStage = null;
+        var crashAfterStageCount = 0;
         var variables = new Dictionary<string, string>(StringComparer.Ordinal);
         var backendMode = "live";
         var resume = false;
         var autoResumePolicy = AutoResumePolicy.On;
+        var dryRun = false;
+        var json = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -74,6 +80,18 @@ public sealed record RunOptions(
                     break;
                 case "--crash-after-stage" when i + 1 < args.Length:
                     crashAfterStage = args[++i];
+                    if (crashAfterStageCount == 0)
+                        crashAfterStageCount = 1;
+                    break;
+                case "--crash-after-stage-count" when i + 1 < args.Length:
+                    if (!int.TryParse(args[++i], out crashAfterStageCount) || crashAfterStageCount < 0)
+                        throw new ArgumentException($"Invalid --crash-after-stage-count '{args[i]}'.", nameof(args));
+                    break;
+                case "--dry-run":
+                    dryRun = true;
+                    break;
+                case "--json":
+                    json = true;
                     break;
                 case "--var" when i + 1 < args.Length:
                     ParseVariable(args[++i], variables);
@@ -96,7 +114,10 @@ public sealed record RunOptions(
             BackendMode: backendMode,
             BackendScriptPath: backendScriptPath,
             CrashAfterStage: crashAfterStage,
-            Variables: variables);
+            CrashAfterStageCount: crashAfterStageCount,
+            Variables: variables,
+            DryRun: dryRun,
+            Json: json);
     }
 
     private static void ParseVariable(string raw, IDictionary<string, string> variables)

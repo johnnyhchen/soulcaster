@@ -1,4 +1,5 @@
 using Soulcaster.Attractor;
+using Soulcaster.Runner.Storage;
 
 namespace Soulcaster.Runner;
 
@@ -18,22 +19,24 @@ internal sealed class RunnerRuntimeObserver : IPipelineRuntimeObserver
     private readonly RunManifest _manifest;
     private readonly string _manifestPath;
     private readonly string _checkpointPath;
-    private readonly string? _crashAfterStage;
-    private int _crashInjected;
+    private readonly IWorkflowStore? _workflowStore;
+    private readonly SqliteRunStateStore? _runStateStore;
 
     public RunnerRuntimeObserver(
         RunManifest manifest,
         string manifestPath,
         string checkpointPath,
-        string? crashAfterStage)
+        SqliteRunStateStore? runStateStore = null,
+        IWorkflowStore? workflowStore = null)
     {
         _manifest = manifest;
         _manifestPath = manifestPath;
         _checkpointPath = checkpointPath;
-        _crashAfterStage = crashAfterStage;
+        _runStateStore = runStateStore;
+        _workflowStore = workflowStore;
     }
 
-    public Task OnStageStartedAsync(
+    public async Task OnStageStartedAsync(
         string nodeId,
         GraphNode node,
         PipelineContext context,
@@ -42,11 +45,14 @@ internal sealed class RunnerRuntimeObserver : IPipelineRuntimeObserver
         _manifest.active_stage = nodeId;
         _manifest.status = "running";
         _manifest.updated_at = DateTime.UtcNow.ToString("o");
-        _manifest.Save(_manifestPath);
-        return Task.CompletedTask;
+        if (_runStateStore is not null)
+            await _runStateStore.PersistAsync(_manifestPath, _manifest, ct: ct);
+        else
+            _manifest.Save(_manifestPath);
+        await SyncStoreAsync(ct);
     }
 
-    public Task OnCheckpointSavedAsync(
+    public async Task OnCheckpointSavedAsync(
         string currentNodeId,
         string nextNodeId,
         GraphEdge? selectedEdge,
@@ -56,15 +62,42 @@ internal sealed class RunnerRuntimeObserver : IPipelineRuntimeObserver
         _manifest.active_stage = nextNodeId;
         _manifest.updated_at = DateTime.UtcNow.ToString("o");
         _manifest.checkpoint_path = _checkpointPath;
-        _manifest.Save(_manifestPath);
+        if (_runStateStore is not null)
+            await _runStateStore.PersistAsync(_manifestPath, _manifest, ct: ct);
+        else
+            _manifest.Save(_manifestPath);
+        await SyncStoreAsync(ct);
 
-        if (!string.IsNullOrWhiteSpace(_crashAfterStage) &&
-            string.Equals(_crashAfterStage, currentNodeId, StringComparison.Ordinal) &&
-            Interlocked.Exchange(ref _crashInjected, 1) == 0)
+        var crashTarget = _manifest.crash_after_stage;
+        if (!string.IsNullOrWhiteSpace(crashTarget) &&
+            (string.Equals(crashTarget, "*", StringComparison.Ordinal) ||
+             string.Equals(crashTarget, currentNodeId, StringComparison.Ordinal)) &&
+            _manifest.crash_injections_remaining > 0)
         {
+            _manifest.crash_injections_remaining -= 1;
+            _manifest.crash_after_stage = _manifest.crash_injections_remaining > 0 ? "*" : null;
+            _manifest.updated_at = DateTime.UtcNow.ToString("o");
+            if (_runStateStore is not null)
+                await _runStateStore.PersistAsync(_manifestPath, _manifest, ct: ct);
+            else
+                _manifest.Save(_manifestPath);
+
             throw new InjectedRunnerCrashException(currentNodeId);
         }
+    }
 
-        return Task.CompletedTask;
+    private async Task SyncStoreAsync(CancellationToken ct)
+    {
+        if (_workflowStore is null)
+            return;
+
+        try
+        {
+            await _workflowStore.SyncAsync(ct);
+        }
+        catch
+        {
+            // Store sync must not break runtime advancement.
+        }
     }
 }

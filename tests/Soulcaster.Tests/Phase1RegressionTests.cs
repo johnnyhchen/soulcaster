@@ -475,6 +475,7 @@ public class RunCommandSupportTests
         Assert.Equal("scripted", options.BackendMode);
         Assert.Equal("/tmp/backend.json", options.BackendScriptPath);
         Assert.Equal("verify", options.CrashAfterStage);
+        Assert.Equal(1, options.CrashAfterStageCount);
         Assert.Equal("Ship reporter", options.Variables!["task"]);
         Assert.Equal("CLI plus tests", options.Variables!["definition_of_done"]);
     }
@@ -493,6 +494,7 @@ public class RunCommandSupportTests
             BackendMode: "live",
             BackendScriptPath: null,
             CrashAfterStage: null,
+            CrashAfterStageCount: 0,
             Variables: null);
         var workingDir = RunCommandSupport.ResolveWorkingDirectory("/repo/dotfiles/qa-smoke.dot", options);
 
@@ -667,6 +669,7 @@ public class CodergenLoopTerminationRegressionTests
                 BackendMode: "scripted",
                 BackendScriptPath: planPath,
                 CrashAfterStage: null,
+                CrashAfterStageCount: 0,
                 Variables: null);
 
             using var backend = RunnerBackendFactory.Create(tempDir, tempDir, options);

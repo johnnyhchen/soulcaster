@@ -3815,6 +3815,109 @@ public class T8_ParallelFirstSuccessTests
     }
 }
 
+public class T8b_ParallelKOfNTests
+{
+    [Fact]
+    public async Task ParallelHandler_KOfN_SucceedsWhenThresholdMet()
+    {
+        var registry = new HandlerRegistry();
+
+        var graph = new Graph { Goal = "test" };
+        graph.Nodes["parallel"] = new GraphNode
+        {
+            Id = "parallel", Shape = "component",
+            RawAttributes = new Dictionary<string, string>
+            {
+                ["join_policy"] = "k_of_n",
+                ["join_k"] = "2"
+            }
+        };
+        graph.Nodes["good_one"] = new GraphNode
+        {
+            Id = "good_one", Shape = "parallelogram",
+            RawAttributes = new Dictionary<string, string> { ["tool_command"] = "echo one" }
+        };
+        graph.Nodes["good_two"] = new GraphNode
+        {
+            Id = "good_two", Shape = "parallelogram",
+            RawAttributes = new Dictionary<string, string> { ["tool_command"] = "echo two" }
+        };
+        graph.Nodes["bad"] = new GraphNode
+        {
+            Id = "bad", Shape = "parallelogram",
+            RawAttributes = new Dictionary<string, string> { ["tool_command"] = "false" }
+        };
+        graph.Edges.Add(new GraphEdge { FromNode = "parallel", ToNode = "good_one" });
+        graph.Edges.Add(new GraphEdge { FromNode = "parallel", ToNode = "good_two" });
+        graph.Edges.Add(new GraphEdge { FromNode = "parallel", ToNode = "bad" });
+
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        try
+        {
+            var outcome = await registry.GetHandlerOrThrow("component")
+                .ExecuteAsync(graph.Nodes["parallel"], new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            Assert.Equal("2", outcome.ContextUpdates!["parallel.required_successes"]);
+            Assert.Equal("2", outcome.ContextUpdates["parallel.success_count"]);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ParallelHandler_KOfN_FailsWhenThresholdMissed()
+    {
+        var registry = new HandlerRegistry();
+
+        var graph = new Graph { Goal = "test" };
+        graph.Nodes["parallel"] = new GraphNode
+        {
+            Id = "parallel", Shape = "component",
+            RawAttributes = new Dictionary<string, string>
+            {
+                ["join_policy"] = "k_of_n",
+                ["join_k"] = "3"
+            }
+        };
+        graph.Nodes["good_one"] = new GraphNode
+        {
+            Id = "good_one", Shape = "parallelogram",
+            RawAttributes = new Dictionary<string, string> { ["tool_command"] = "echo one" }
+        };
+        graph.Nodes["good_two"] = new GraphNode
+        {
+            Id = "good_two", Shape = "parallelogram",
+            RawAttributes = new Dictionary<string, string> { ["tool_command"] = "echo two" }
+        };
+        graph.Nodes["bad"] = new GraphNode
+        {
+            Id = "bad", Shape = "parallelogram",
+            RawAttributes = new Dictionary<string, string> { ["tool_command"] = "false" }
+        };
+        graph.Edges.Add(new GraphEdge { FromNode = "parallel", ToNode = "good_one" });
+        graph.Edges.Add(new GraphEdge { FromNode = "parallel", ToNode = "good_two" });
+        graph.Edges.Add(new GraphEdge { FromNode = "parallel", ToNode = "bad" });
+
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+        try
+        {
+            var outcome = await registry.GetHandlerOrThrow("component")
+                .ExecuteAsync(graph.Nodes["parallel"], new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Equal("3", outcome.ContextUpdates!["parallel.required_successes"]);
+            Assert.Equal("2", outcome.ContextUpdates["parallel.success_count"]);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+}
+
 public class T9_ParallelFailFastTests
 {
     [Fact]

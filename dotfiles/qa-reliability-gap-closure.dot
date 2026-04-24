@@ -1,0 +1,17 @@
+digraph G {
+    goal = "Exercise crash resume, audited gates, durable store projection, and replay output."
+
+    start [shape=Mdiamond]
+    draft [shape=box, label="Draft", provider="openai", model="gpt-5.4",
+        prompt="Return valid stage status JSON indicating the draft stage completed successfully."]
+    review [shape=hexagon, label="Approve the drafted result?"]
+    finalize [shape=box, label="Finalize", provider="openai", model="gpt-5.4",
+        prompt="Return valid stage status JSON indicating the finalization stage completed successfully."]
+    done [shape=Msquare]
+
+    start -> draft
+    draft -> review
+    review -> finalize [label="approve"]
+    review -> done [label="skip"]
+    finalize -> done
+}

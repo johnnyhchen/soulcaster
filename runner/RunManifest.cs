@@ -18,6 +18,7 @@ public sealed class RunLock
 public sealed class RunManifest
 {
     public string run_id { get; set; } = "";
+    public long state_version { get; set; }
     public int pid { get; set; }
     public string graph_path { get; set; } = "";
     public string started_at { get; set; } = "";
@@ -31,6 +32,14 @@ public sealed class RunManifest
     public string? result_path { get; set; }
     public int respawn_count { get; set; }
     public string? last_respawned_at { get; set; }
+    public string? backend_mode { get; set; }
+    public string? backend_script_path { get; set; }
+    public string? crash_after_stage { get; set; }
+    public int crash_injections_remaining { get; set; }
+    public string? cancel_requested_at { get; set; }
+    public string? cancel_requested_actor { get; set; }
+    public string? cancel_requested_rationale { get; set; }
+    public string? cancel_requested_source { get; set; }
 
     public static RunManifest? Load(string manifestPath)
     {

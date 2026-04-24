@@ -331,6 +331,160 @@ public class CodergenConsensusPlanTests
     }
 
     [Fact]
+    public async Task CodergenHandler_FailsClosed_WhenExplicitModelLacksToolSupport()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_capabilityvalidation_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new DeterministicBackend();
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Name = "capability-validation" };
+            var node = new GraphNode
+            {
+                Id = "implement",
+                Shape = "box",
+                LlmProvider = "gemini",
+                LlmModel = "gemini-2.5-pro",
+                Prompt = "Write the implementation"
+            };
+            graph.Nodes[node.Id] = node;
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Empty(backend.Invocations);
+
+            using var statusDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(tempDir, node.Id, "status.json")));
+            Assert.Equal("capability_validation", statusDocument.RootElement.GetProperty("failure_kind").GetString());
+            Assert.Equal("invalid_capability", statusDocument.RootElement.GetProperty("provider_state").GetString());
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task CodergenHandler_LeafLane_AllowsToollessModel_WhenCapabilitiesOtherwiseFit()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_leaflane_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new DeterministicBackend();
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Name = "leaf-lane" };
+            var node = new GraphNode
+            {
+                Id = "draft",
+                Shape = "box",
+                LlmProvider = "gemini",
+                LlmModel = "gemini-2.5-pro",
+                Prompt = "Write a concise summary.",
+                RawAttributes = new Dictionary<string, string>
+                {
+                    ["execution_lane"] = "leaf"
+                }
+            };
+            graph.Nodes[node.Id] = node;
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            Assert.Single(backend.Invocations);
+
+            using var statusDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(tempDir, node.Id, "status.json")));
+            Assert.Equal("leaf", statusDocument.RootElement.GetProperty("effective_policy").GetProperty("execution_lane").GetString());
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task CodergenHandler_RoutesToFallbackModel_WhenPreferredModelExceedsLatencyCeiling()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_routing_latency_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new DeterministicBackend();
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Name = "routing-latency" };
+            graph.Attributes["preferred_model"] = "gpt-5.4";
+            graph.Attributes["fallback_models"] = "gpt-5.2";
+            graph.Attributes["max_expected_latency_ms"] = "500";
+            var node = new GraphNode
+            {
+                Id = "draft",
+                Shape = "box",
+                LlmProvider = "openai",
+                Prompt = "Write a concise summary."
+            };
+            graph.Nodes[node.Id] = node;
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Success, outcome.Status);
+            var invocation = Assert.Single(backend.Invocations);
+            Assert.Equal("openai", invocation.Provider);
+            Assert.Equal("gpt-5.2", invocation.Model);
+
+            using var statusDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(tempDir, node.Id, "status.json")));
+            Assert.Equal("gpt-5.2", statusDocument.RootElement.GetProperty("model").GetString());
+            Assert.Equal("gpt-5.4", statusDocument.RootElement.GetProperty("effective_policy").GetProperty("preferred_model").GetString());
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task CodergenHandler_BudgetCeiling_FailsClosedBeforeBackendInvocation()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_budgetceiling_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var backend = new DeterministicBackend();
+            var handler = new CodergenHandler(backend);
+            var graph = new Graph { Name = "budget-ceiling" };
+            var node = new GraphNode
+            {
+                Id = "implement",
+                Shape = "box",
+                LlmProvider = "openai",
+                LlmModel = "gpt-5.2",
+                Prompt = "Write the implementation",
+                RawAttributes = new Dictionary<string, string>
+                {
+                    ["max_input_cost_per_million"] = "1.0"
+                }
+            };
+            graph.Nodes[node.Id] = node;
+
+            var outcome = await handler.ExecuteAsync(node, new PipelineContext(), graph, tempDir);
+
+            Assert.Equal(OutcomeStatus.Fail, outcome.Status);
+            Assert.Empty(backend.Invocations);
+
+            using var statusDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(tempDir, node.Id, "status.json")));
+            Assert.Equal("capability_validation", statusDocument.RootElement.GetProperty("failure_kind").GetString());
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
     public async Task CodergenHandler_V2ImplementationNode_RequiresAuthoritativeValidation()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"jc_validationgate_{Guid.NewGuid():N}");

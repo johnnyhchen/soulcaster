@@ -3,8 +3,10 @@ using System.Text.RegularExpressions;
 using System.Diagnostics;
 using System.Net;
 using Soulcaster.Attractor;
+using Soulcaster.Attractor.Execution;
 using Soulcaster.CodingAgent;
 using Soulcaster.Runner;
+using Soulcaster.Runner.Storage;
 using Soulcaster.UnifiedLlm;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -20,11 +22,16 @@ return command switch
     "run" => await RunPipeline(args[1..]),
     "conformance" => await ConformanceCommand.RunAsync(args[1..]),
     "providers" => await RunProviders(args[1..]),
+    "scorecard" or "scorecards" => await RunScorecards(args[1..]),
+    "query" or "queries" => await RunQuery(args[1..]),
+    "control" => await RunControl(args[1..]),
+    "artifact" or "artifacts" => await RunArtifacts(args[1..]),
     "gate" when args.Length > 1 && args[1] == "answer" => await GateAnswer(args[2..]),
     "gate" when args.Length > 1 && args[1] == "watch" => await GateWatch(args[2..]),
     "gate" => await GateShow(args[1..]),
     "status" => await ShowStatus(args[1..]),
     "logs" => await ShowLogs(args[1..]),
+    "replay" => await ReplayRun(args[1..]),
     "web" => await RunWeb(args[1..]),
     "lint" => await RunLint(args[1..]),
     "builder" => await RunBuilder(args[1..]),
@@ -86,6 +93,87 @@ static string[] StripDirFlag(string[] args)
     return result.ToArray();
 }
 
+static string ToTriState(bool? value) => value switch
+{
+    true => "yes",
+    false => "no",
+    null => "unknown"
+};
+
+static void ApplyRunManifest(RunManifest target, RunManifest source)
+{
+    target.run_id = source.run_id;
+    target.state_version = source.state_version;
+    target.pid = source.pid;
+    target.graph_path = source.graph_path;
+    target.started_at = source.started_at;
+    target.updated_at = source.updated_at;
+    target.active_stage = source.active_stage;
+    target.status = source.status;
+    target.crash = source.crash;
+    target.auto_resume_policy = source.auto_resume_policy;
+    target.resume_source = source.resume_source;
+    target.checkpoint_path = source.checkpoint_path;
+    target.result_path = source.result_path;
+    target.respawn_count = source.respawn_count;
+    target.last_respawned_at = source.last_respawned_at;
+    target.backend_mode = source.backend_mode;
+    target.backend_script_path = source.backend_script_path;
+    target.cancel_requested_at = source.cancel_requested_at;
+    target.cancel_requested_actor = source.cancel_requested_actor;
+    target.cancel_requested_rationale = source.cancel_requested_rationale;
+    target.cancel_requested_source = source.cancel_requested_source;
+}
+
+static Dictionary<string, object?> BuildWorkflowPreview(
+    string dotFilePath,
+    IReadOnlyDictionary<string, string>? variables)
+{
+    var projectRoot = RunCommandSupport.ResolveProjectRoot(dotFilePath);
+    var workingDir = RunCommandSupport.ResolveWorkingDirectory(
+        dotFilePath,
+        new RunOptions(
+            DotFilePath: dotFilePath,
+            Resume: false,
+            AutoResumePolicy: AutoResumePolicy.Off,
+            ResumeFrom: null,
+            StartAt: null,
+            SteerText: null,
+            SteerFilePath: null,
+            BackendMode: "live",
+            BackendScriptPath: null,
+            CrashAfterStage: null,
+            CrashAfterStageCount: 0,
+            Variables: variables));
+
+    var graph = BuilderCommandSupport.Load(dotFilePath);
+    graph.Attributes["source_path"] = dotFilePath;
+    graph.Attributes["project_root"] = projectRoot;
+    graph.Attributes["output_root"] = workingDir;
+    foreach (var (key, value) in variables ?? new Dictionary<string, string>(StringComparer.Ordinal))
+        graph.Attributes[key] = value;
+
+    var prepared = BuilderCommandSupport.ApplyStandardTransforms(graph);
+    return BuilderCommandSupport.BuildPreview(prepared, dotFilePath);
+}
+
+static int GetWorkflowPreviewErrorCount(IReadOnlyDictionary<string, object?> preview)
+{
+    if (!preview.TryGetValue("lint", out var lintRaw) || lintRaw is not Dictionary<string, object?> lint)
+        return 0;
+
+    if (!lint.TryGetValue("error_count", out var errorCountRaw) || errorCountRaw is null)
+        return 0;
+
+    return errorCountRaw switch
+    {
+        int value => value,
+        long value => (int)value,
+        string text when int.TryParse(text, out var parsed) => parsed,
+        _ => 0
+    };
+}
+
 static string? FindGatesDir(string outputDir)
 {
     var gatesDir = Path.Combine(outputDir, "gates");
@@ -117,6 +205,110 @@ static string? FindLogsDir(string outputDir)
     }
 
     return null;
+}
+
+static string? ResolvePipelineOutputDir(string[] args)
+{
+    var outputDir = ResolveOutputDir(args);
+    if (outputDir == null)
+        return null;
+
+    if (Directory.Exists(Path.Combine(outputDir, "logs")))
+        return outputDir;
+
+    var pipelineDirs = Directory
+        .GetDirectories(outputDir)
+        .Where(dir => Directory.Exists(Path.Combine(dir, "logs")))
+        .OrderBy(dir => dir, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    return pipelineDirs.Count == 1 ? pipelineDirs[0] : null;
+}
+
+static Dictionary<string, object?> BuildGateAnswerPayload(
+    string resolvedChoice,
+    string answerText,
+    string? actor,
+    string? rationale,
+    string? source)
+{
+    var answeredAt = DateTime.UtcNow.ToString("o");
+    return new Dictionary<string, object?>(StringComparer.Ordinal)
+    {
+        ["text"] = answerText,
+        ["selected_options"] = new[] { resolvedChoice },
+        ["status"] = "answered",
+        ["actor"] = string.IsNullOrWhiteSpace(actor) ? Environment.UserName : actor,
+        ["rationale"] = string.IsNullOrWhiteSpace(rationale) ? null : rationale,
+        ["source"] = string.IsNullOrWhiteSpace(source) ? "unknown" : source,
+        ["answered_at"] = answeredAt,
+        ["timestamp"] = answeredAt
+    };
+}
+
+static async Task AppendRunnerEventAsync(
+    string logsDir,
+    string eventType,
+    Dictionary<string, object?> data,
+    CancellationToken ct = default)
+{
+    await WorkflowEventLog.AppendAsync(logsDir, eventType, data: data, ct: ct);
+}
+
+static async Task SyncWorkflowStoreAsync(IWorkflowStore? workflowStore, CancellationToken ct = default)
+{
+    if (workflowStore is null)
+        return;
+
+    try
+    {
+        await workflowStore.SyncAsync(ct);
+    }
+    catch
+    {
+        // Store projection is best-effort in CLI paths.
+    }
+}
+
+static (string? Choice, string? Actor, string? Rationale, string? Source, string? FreeText) ParseGateAnswerCommandOptions(string[] args)
+{
+    string? actor = null;
+    string? rationale = null;
+    string? source = null;
+    string? freeText = null;
+    var positional = new List<string>();
+
+    for (int i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--dir" when i + 1 < args.Length:
+                i++;
+                break;
+            case "--actor" when i + 1 < args.Length:
+                actor = args[++i];
+                break;
+            case "--reason" or "--rationale" when i + 1 < args.Length:
+                rationale = args[++i];
+                break;
+            case "--source" when i + 1 < args.Length:
+                source = args[++i];
+                break;
+            case "--text" when i + 1 < args.Length:
+                freeText = args[++i];
+                break;
+            default:
+                positional.Add(args[i]);
+                break;
+        }
+    }
+
+    return (
+        Choice: positional.FirstOrDefault(),
+        Actor: actor,
+        Rationale: rationale,
+        Source: source,
+        FreeText: freeText);
 }
 
 static JsonSerializerOptions JsonOpts() => new() { WriteIndented = true };
@@ -168,6 +360,7 @@ static async Task<int> RunProviders(string[] args)
     {
         "ping" => await RunProvidersPing(args[1..]),
         "invoke" => await RunProvidersInvoke(args[1..]),
+        "registry" => await RunProvidersRegistry(args[1..]),
         "sync-models" => await RunProvidersSyncModels(args[1..]),
         "help" or "--help" or "-h" => ShowProvidersHelp(),
         _ => ShowProvidersHelp()
@@ -243,6 +436,150 @@ static async Task<int> RunProvidersPing(string[] args)
     }
 
     return results.All(result => result.Success) ? 0 : 1;
+}
+
+static async Task<int> RunProvidersRegistry(string[] args)
+{
+    var subcommand = args.Length > 0 ? args[0] : "help";
+    return subcommand switch
+    {
+        "refresh" => await RunProvidersRegistryRefresh(args[1..]),
+        "show" => RunProvidersRegistryShow(args[1..]),
+        "help" or "--help" or "-h" => ShowProvidersHelp(),
+        _ => ShowProvidersHelp()
+    };
+}
+
+static async Task<int> RunProvidersRegistryRefresh(string[] args)
+{
+    string? provider = null;
+    var json = false;
+    var ttlSeconds = int.TryParse(Environment.GetEnvironmentVariable("SOULCASTER_MODEL_REGISTRY_TTL_SECONDS"), out var envTtl) && envTtl > 0
+        ? envTtl
+        : 86_400;
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--provider" when i + 1 < args.Length:
+                provider = args[++i];
+                break;
+            case "--ttl-seconds" when i + 1 < args.Length:
+                if (!int.TryParse(args[++i], out ttlSeconds) || ttlSeconds <= 0)
+                {
+                    Console.Error.WriteLine("Expected a positive integer after --ttl-seconds.");
+                    return 1;
+                }
+
+                break;
+            case "--json":
+                json = true;
+                break;
+            default:
+                Console.Error.WriteLine($"Unknown providers registry refresh option: {args[i]}");
+                return 1;
+        }
+    }
+
+    var adapters = ProviderCommandSupport.CreateDiscoveryAdaptersFromEnv();
+    if (adapters.Count == 0)
+    {
+        Console.Error.WriteLine("No provider API keys found in environment.");
+        return 1;
+    }
+
+    var selectedProviders = string.IsNullOrWhiteSpace(provider)
+        ? adapters.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList()
+        : [ProviderCommandSupport.NormalizeProvider(provider)];
+
+    if (selectedProviders.Any(selectedProvider => !adapters.ContainsKey(selectedProvider)))
+    {
+        Console.Error.WriteLine($"Provider '{selectedProviders.First(selectedProvider => !adapters.ContainsKey(selectedProvider))}' is not configured in this environment.");
+        return 1;
+    }
+
+    var results = new List<Dictionary<string, object?>>();
+    foreach (var selectedProvider in selectedProviders)
+    {
+        var models = await adapters[selectedProvider].ListModelsAsync();
+        var cachePath = await ModelRegistry.WriteDiscoveryCacheAsync(
+            selectedProvider,
+            models,
+            TimeSpan.FromSeconds(ttlSeconds));
+        var expiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(ttlSeconds).ToString("o");
+        results.Add(new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["provider"] = selectedProvider,
+            ["model_count"] = models.Count,
+            ["ttl_seconds"] = ttlSeconds,
+            ["cache_path"] = cachePath,
+            ["expires_at_utc"] = expiresAtUtc
+        });
+    }
+
+    if (json)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(results, JsonOpts()));
+    }
+    else
+    {
+        foreach (var result in results)
+        {
+            var providerName = result.GetValueOrDefault("provider")?.ToString();
+            var modelCount = result.GetValueOrDefault("model_count")?.ToString();
+            var cachePath = result.GetValueOrDefault("cache_path")?.ToString();
+            var expiresAt = result.GetValueOrDefault("expires_at_utc")?.ToString();
+            Console.WriteLine($"{providerName,-10} models={modelCount,-4} cache={cachePath} expires={expiresAt}");
+        }
+    }
+
+    return 0;
+}
+
+static int RunProvidersRegistryShow(string[] args)
+{
+    string? provider = null;
+    var json = false;
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--provider" when i + 1 < args.Length:
+                provider = ProviderCommandSupport.NormalizeProvider(args[++i]);
+                break;
+            case "--json":
+                json = true;
+                break;
+            default:
+                Console.Error.WriteLine($"Unknown providers registry show option: {args[i]}");
+                return 1;
+        }
+    }
+
+    var snapshot = ModelCatalog.LoadRegistry();
+    var models = string.IsNullOrWhiteSpace(provider)
+        ? snapshot.Models
+        : snapshot.Models.Where(model => string.Equals(model.Provider, provider, StringComparison.OrdinalIgnoreCase)).ToList();
+
+    if (json)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            generated_at_utc = snapshot.GeneratedAtUtc,
+            sources = snapshot.Sources,
+            models
+        }, JsonOpts()));
+        return 0;
+    }
+
+    foreach (var model in models.OrderBy(item => item.Provider, StringComparer.OrdinalIgnoreCase).ThenBy(item => item.Id, StringComparer.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"{model.Provider,-10} {model.Id,-28} latency={model.ExpectedLatencyMs?.ToString() ?? "?"} tools={ToTriState(model.SupportsTools)} vision={ToTriState(model.SupportsVision)} reasoning={ToTriState(model.SupportsReasoning)}");
+    }
+
+    return 0;
 }
 
 static async Task<int> RunProvidersSyncModels(string[] args)
@@ -548,11 +885,15 @@ static int ShowProvidersHelp()
     Console.WriteLine("Usage:");
     Console.WriteLine("  attractor providers ping [--provider <name>] [--json]");
     Console.WriteLine("  attractor providers invoke --model <id> [--provider <name>] [--prompt <text> | --prompt-file <path>] [--image <path>]... [--output-modalities text,image] [--reasoning-effort <level>] [--max-tokens N] [--save-text <path>] [--save-images-dir <path>] [--json]");
+    Console.WriteLine("  attractor providers registry refresh [--provider <name>] [--ttl-seconds N] [--json]");
+    Console.WriteLine("  attractor providers registry show [--provider <name>] [--json]");
     Console.WriteLine("  attractor providers sync-models --provider <name> [--model <id>] [--max-models N] [--name <run-name>] [--run] [--json]");
     Console.WriteLine();
     Console.WriteLine("Notes:");
     Console.WriteLine("  ping checks provider reachability by listing models.");
     Console.WriteLine("  invoke sends a direct SDK-backed request to a provider and can attach local images.");
+    Console.WriteLine("  registry refresh caches provider discovery results under ~/.attractor/model-registry.");
+    Console.WriteLine("  registry show prints the effective model registry after cache and overrides merge.");
     Console.WriteLine("  sync-models discovers provider models, filters unknown catalog candidates,");
     Console.WriteLine("  writes a manifest plus a dotfile under dotfiles/, and optionally runs it.");
     return 0;
@@ -756,9 +1097,11 @@ static async Task<int> GateAnswer(string[] args)
     }
 
     var gateId = (await File.ReadAllTextAsync(pendingFile)).Trim();
+    var pipelineDir = Path.GetDirectoryName(gatesDir)!;
     var gateDir = Path.Combine(gatesDir, gateId);
     var questionPath = Path.Combine(gateDir, "question.json");
     var answerPath = Path.Combine(gateDir, "answer.json");
+    var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
 
     if (!File.Exists(questionPath))
     {
@@ -778,8 +1121,8 @@ static async Task<int> GateAnswer(string[] args)
     }
 
     // Resolve the choice from remaining args (strip --dir)
-    var remaining = StripDirFlag(args);
-    string? choice = remaining.Length > 0 ? remaining[0] : null;
+    var commandOptions = ParseGateAnswerCommandOptions(args);
+    string? choice = commandOptions.Choice;
 
     if (choice == null)
     {
@@ -810,11 +1153,696 @@ static async Task<int> GateAnswer(string[] args)
         resolvedChoice = match ?? choice;
     }
 
-    var answer = new { text = resolvedChoice, selected_options = new[] { resolvedChoice } };
+    var answerText = !string.IsNullOrWhiteSpace(commandOptions.FreeText)
+        ? commandOptions.FreeText!
+        : resolvedChoice;
+    var rationale = !string.IsNullOrWhiteSpace(commandOptions.Rationale)
+        ? commandOptions.Rationale
+        : string.Equals(answerText, resolvedChoice, StringComparison.Ordinal) ? null : answerText;
+    var answer = BuildGateAnswerPayload(
+        resolvedChoice,
+        answerText,
+        commandOptions.Actor,
+        rationale,
+        commandOptions.Source ?? "cli");
     await File.WriteAllTextAsync(answerPath, JsonSerializer.Serialize(answer, JsonOpts()));
+    await SyncWorkflowStoreAsync(workflowStore);
 
     Console.WriteLine($"Answered gate {gateId}: {resolvedChoice}");
     return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// replay — reconstruct a run timeline from the durable store projection
+// ═════════════════════════════════════════════════════════════════════
+
+static async Task<int> ReplayRun(string[] args)
+{
+    var pipelineDir = ResolvePipelineOutputDir(args);
+    if (pipelineDir == null)
+    {
+        Console.Error.WriteLine("Could not resolve a single pipeline directory. Use --dir <path-to-run>.");
+        return 1;
+    }
+
+    var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+    await SyncWorkflowStoreAsync(workflowStore);
+
+    var replayPath = Path.Combine(workflowStore.StoreDirectory, "replay.json");
+    if (!File.Exists(replayPath))
+    {
+        Console.Error.WriteLine($"Replay data not found at {replayPath}");
+        return 1;
+    }
+
+    var replayJson = await File.ReadAllTextAsync(replayPath);
+    if (args.Contains("--json", StringComparer.Ordinal))
+    {
+        Console.WriteLine(replayJson);
+        return 0;
+    }
+
+    using var document = JsonDocument.Parse(replayJson);
+    var root = document.RootElement;
+    var runId = root.TryGetProperty("run_id", out var runIdElement) ? runIdElement.GetString() : null;
+    Console.WriteLine($"Run: {runId}");
+    Console.WriteLine();
+
+    if (!root.TryGetProperty("events", out var events) || events.ValueKind != JsonValueKind.Array)
+        return 0;
+
+    foreach (var evt in events.EnumerateArray())
+    {
+        var sequence = evt.TryGetProperty("sequence", out var sequenceElement) ? sequenceElement.GetInt32() : 0;
+        var timestamp = evt.TryGetProperty("timestamp_utc", out var timestampElement) ? timestampElement.GetString() : null;
+        var eventType = evt.TryGetProperty("event_type", out var eventTypeElement) ? eventTypeElement.GetString() : null;
+        var summary = evt.TryGetProperty("summary", out var summaryElement) ? summaryElement.GetString() : null;
+        Console.WriteLine($"{sequence,3}  {timestamp}  {eventType}  {summary}");
+    }
+
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// control — audited operator mutations
+// ═════════════════════════════════════════════════════════════════════
+
+static async Task<int> RunControl(string[] args)
+{
+    var subcommand = args.Length > 0 ? args[0] : "help";
+    var pipelineDir = ResolvePipelineOutputDir(args[1..]);
+    if (subcommand is not ("help" or "--help" or "-h") && pipelineDir == null)
+    {
+        Console.Error.WriteLine("Could not resolve a single pipeline directory. Use --dir <path-to-run>.");
+        return 1;
+    }
+
+    try
+    {
+        return subcommand switch
+        {
+            "cancel" => await RunCancelControl(pipelineDir!, args[1..]),
+            "retry-stage" => await RunRetryStageControl(pipelineDir!, args[1..]),
+            "force-advance" => await RunForceAdvanceControl(pipelineDir!, args[1..]),
+            "resume" => await RunResumeControl(pipelineDir!, args[1..]),
+            "help" or "--help" or "-h" => ShowControlHelp(),
+            _ => ShowControlHelp()
+        };
+    }
+    catch (RunStateConflictException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        Console.Error.WriteLine($"Current version: {ex.CurrentVersion}");
+        return 2;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
+
+static async Task<int> RunArtifacts(string[] args)
+{
+    var subcommand = args.Length > 0 ? args[0] : "help";
+    var pipelineDir = ResolvePipelineOutputDir(args[1..]);
+    if (subcommand is not ("help" or "--help" or "-h") && pipelineDir == null)
+    {
+        Console.Error.WriteLine("Could not resolve a single pipeline directory. Use --dir <path-to-run>.");
+        return 1;
+    }
+
+    try
+    {
+        return subcommand switch
+        {
+            "list" => await RunArtifactList(pipelineDir!, args[1..]),
+            "lineage" => await RunArtifactLineage(pipelineDir!, args[1..]),
+            "promote" => await RunArtifactPromote(pipelineDir!, args[1..]),
+            "rollback" => await RunArtifactRollback(pipelineDir!, args[1..]),
+            "help" or "--help" or "-h" => ShowArtifactHelp(),
+            _ => ShowArtifactHelp()
+        };
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
+
+static async Task<int> RunScorecards(string[] args)
+{
+    var pipelineDir = ResolvePipelineOutputDir(args);
+    if (!args.Contains("help", StringComparer.OrdinalIgnoreCase) &&
+        !args.Contains("--help", StringComparer.OrdinalIgnoreCase) &&
+        !args.Contains("-h", StringComparer.OrdinalIgnoreCase) &&
+        pipelineDir == null)
+    {
+        Console.Error.WriteLine("Could not resolve a single pipeline directory. Use --dir <path-to-run>.");
+        return 1;
+    }
+
+    if (args.Contains("help", StringComparer.OrdinalIgnoreCase) ||
+        args.Contains("--help", StringComparer.OrdinalIgnoreCase) ||
+        args.Contains("-h", StringComparer.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("attractor scorecard [--dir <dir>] [--provider <name>] [--model <id>] [--json]");
+        return 0;
+    }
+
+    var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir!);
+    await workflowStore.SyncAsync();
+
+    string? provider = null;
+    string? model = null;
+    var json = false;
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--provider" when i + 1 < args.Length:
+                provider = args[++i];
+                break;
+            case "--model" when i + 1 < args.Length:
+                model = args[++i];
+                break;
+            case "--json":
+                json = true;
+                break;
+        }
+    }
+
+    var scorecards = WorkflowControlPlane.ReadModelScorecards(pipelineDir!)
+        .Where(item => string.IsNullOrWhiteSpace(provider) ||
+                       string.Equals(item.GetValueOrDefault("provider")?.ToString(), provider, StringComparison.OrdinalIgnoreCase))
+        .Where(item => string.IsNullOrWhiteSpace(model) ||
+                       string.Equals(item.GetValueOrDefault("model")?.ToString(), model, StringComparison.OrdinalIgnoreCase))
+        .OrderBy(item => item.GetValueOrDefault("provider")?.ToString(), StringComparer.OrdinalIgnoreCase)
+        .ThenBy(item => item.GetValueOrDefault("model")?.ToString(), StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    if (json)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(scorecards, JsonOpts()));
+        return 0;
+    }
+
+    foreach (var scorecard in scorecards)
+    {
+        Console.WriteLine($"{scorecard.GetValueOrDefault("provider")?.ToString(),-10} {scorecard.GetValueOrDefault("model")?.ToString(),-28} success_rate={scorecard.GetValueOrDefault("success_rate")?.ToString() ?? "0"} avg_ms={scorecard.GetValueOrDefault("avg_duration_ms")?.ToString() ?? "?"} p95_ms={scorecard.GetValueOrDefault("p95_duration_ms")?.ToString() ?? "?"} invocations={scorecard.GetValueOrDefault("invocation_count")?.ToString() ?? "0"}");
+    }
+
+    return 0;
+}
+
+static async Task<int> RunQuery(string[] args)
+{
+    var helpRequested = args.Contains("help", StringComparer.OrdinalIgnoreCase) ||
+                        args.Contains("--help", StringComparer.OrdinalIgnoreCase) ||
+                        args.Contains("-h", StringComparer.OrdinalIgnoreCase);
+    if (helpRequested || args.Length == 0)
+    {
+        ShowQueryHelp();
+        return helpRequested ? 0 : 1;
+    }
+
+    var positional = StripQueryFlags(args);
+    if (positional.Length == 0)
+    {
+        ShowQueryHelp();
+        return 1;
+    }
+
+    var view = positional[0];
+    if (string.Equals(view, "list", StringComparison.OrdinalIgnoreCase))
+    {
+        var payload = WorkflowQueryService.ListSavedQueries()
+            .Select(item => new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["name"] = item.Name,
+                ["description"] = item.Description
+            })
+            .ToList();
+
+        if (args.Contains("--json", StringComparer.Ordinal))
+            Console.WriteLine(JsonSerializer.Serialize(payload, JsonOpts()));
+        else
+            foreach (var query in payload)
+                Console.WriteLine($"{query["name"],-12} {query["description"]}");
+
+        return 0;
+    }
+
+    try
+    {
+        var pipelineDir = ResolvePipelineOutputDir(args);
+        if (pipelineDir == null)
+        {
+            Console.Error.WriteLine("Could not resolve a single pipeline directory. Use --dir <path-to-run>.");
+            return 1;
+        }
+
+        var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+        await workflowStore.SyncAsync();
+
+        var request = ParseWorkflowQueryArgs(view, args);
+        var result = await WorkflowQueryService.ExecuteAsync(pipelineDir, request);
+
+        if (args.Contains("--json", StringComparer.Ordinal))
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new
+            {
+                view = result.View,
+                description = result.Description,
+                row_count = result.Rows.Count,
+                rows = result.Rows
+            }, JsonOpts()));
+            return 0;
+        }
+
+        Console.WriteLine(WorkflowQueryService.Format(result));
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
+
+static WorkflowQueryRequest ParseWorkflowQueryArgs(string view, string[] args)
+{
+    int? limit = null;
+    string? nodeId = null;
+    string? status = null;
+    string? eventType = null;
+    string? provider = null;
+    string? model = null;
+    string? actor = null;
+    string? artifactId = null;
+    string? approvalState = null;
+    string? search = null;
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--dir" when i + 1 < args.Length:
+                i++;
+                break;
+            case "--limit" when i + 1 < args.Length:
+                if (!int.TryParse(args[++i], out var parsedLimit))
+                    throw new InvalidOperationException($"Invalid --limit '{args[i]}'.");
+                limit = parsedLimit;
+                break;
+            case "--node" when i + 1 < args.Length:
+                nodeId = args[++i];
+                break;
+            case "--status" when i + 1 < args.Length:
+                status = args[++i];
+                break;
+            case "--event-type" when i + 1 < args.Length:
+                eventType = args[++i];
+                break;
+            case "--provider" when i + 1 < args.Length:
+                provider = args[++i];
+                break;
+            case "--model" when i + 1 < args.Length:
+                model = args[++i];
+                break;
+            case "--actor" when i + 1 < args.Length:
+                actor = args[++i];
+                break;
+            case "--artifact" when i + 1 < args.Length:
+            case "--artifact-id" when i + 1 < args.Length:
+                artifactId = args[++i];
+                break;
+            case "--approval-state" when i + 1 < args.Length:
+                approvalState = args[++i];
+                break;
+            case "--q" when i + 1 < args.Length:
+            case "--search" when i + 1 < args.Length:
+                search = args[++i];
+                break;
+        }
+    }
+
+    return new WorkflowQueryRequest(
+        View: view,
+        Limit: limit ?? 50,
+        NodeId: nodeId,
+        Status: status,
+        EventType: eventType,
+        Provider: provider,
+        Model: model,
+        Actor: actor,
+        ArtifactId: artifactId,
+        ApprovalState: approvalState,
+        Search: search);
+}
+
+static string[] StripQueryFlags(string[] args)
+{
+    var positional = new List<string>();
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--dir" when i + 1 < args.Length:
+            case "--limit" when i + 1 < args.Length:
+            case "--node" when i + 1 < args.Length:
+            case "--status" when i + 1 < args.Length:
+            case "--event-type" when i + 1 < args.Length:
+            case "--provider" when i + 1 < args.Length:
+            case "--model" when i + 1 < args.Length:
+            case "--actor" when i + 1 < args.Length:
+            case "--artifact" when i + 1 < args.Length:
+            case "--artifact-id" when i + 1 < args.Length:
+            case "--approval-state" when i + 1 < args.Length:
+            case "--q" when i + 1 < args.Length:
+            case "--search" when i + 1 < args.Length:
+                i++;
+                break;
+            case "--json":
+                break;
+            default:
+                if (!args[i].StartsWith("--", StringComparison.Ordinal))
+                    positional.Add(args[i]);
+                break;
+        }
+    }
+
+    return positional.ToArray();
+}
+
+static void ShowQueryHelp()
+{
+    Console.WriteLine("attractor query <view> [--dir <dir>] [filters] [--json]");
+    Console.WriteLine("attractor query list [--json]");
+    Console.WriteLine();
+    Console.WriteLine("Views:");
+    foreach (var query in WorkflowQueryService.ListSavedQueries())
+        Console.WriteLine($"  {query.Name,-12} {query.Description}");
+    Console.WriteLine();
+    Console.WriteLine("Filters:");
+    Console.WriteLine("  --limit <n>            Limit rows (default: 50, max: 500)");
+    Console.WriteLine("  --node <node-id>       Filter by node id when the view supports it");
+    Console.WriteLine("  --status <status>      Filter by stage or gate status when the view supports it");
+    Console.WriteLine("  --event-type <type>    Filter event/operator activity views by event type");
+    Console.WriteLine("  --provider <name>      Filter provider or scorecard views by provider");
+    Console.WriteLine("  --model <id>           Filter provider or scorecard views by model");
+    Console.WriteLine("  --actor <name>         Filter operator or mutation views by actor");
+    Console.WriteLine("  --artifact <id>        Filter artifact or lineage views by artifact id or logical path");
+    Console.WriteLine("  --approval-state <s>   Filter artifact views by approval state");
+    Console.WriteLine("  --search <text>        Apply a simple text match where the view supports it");
+}
+
+static async Task<int> RunCancelControl(string pipelineDir, string[] args)
+{
+    var options = ParseAuditCommandOptions(args);
+    var result = await WorkflowControlPlane.CancelRunAsync(
+        pipelineDir,
+        options.Actor,
+        options.Rationale,
+        options.Source,
+        options.ExpectedVersion);
+    Console.WriteLine(result.Message);
+    return 0;
+}
+
+static async Task<int> RunRetryStageControl(string pipelineDir, string[] args)
+{
+    var options = ParseAuditCommandOptions(args);
+    string? nodeId = null;
+    for (var i = 0; i < args.Length; i++)
+    {
+        if (args[i] == "--node" && i + 1 < args.Length)
+            nodeId = args[++i];
+    }
+
+    var result = await WorkflowControlPlane.RetryStageAsync(
+        pipelineDir,
+        nodeId,
+        options.Actor,
+        options.Rationale,
+        options.Source,
+        options.ExpectedVersion);
+    Console.WriteLine(result.Message);
+    return 0;
+}
+
+static async Task<int> RunForceAdvanceControl(string pipelineDir, string[] args)
+{
+    var options = ParseAuditCommandOptions(args);
+    string? targetNodeId = null;
+    for (var i = 0; i < args.Length; i++)
+    {
+        if ((args[i] == "--node" || args[i] == "--to-node") && i + 1 < args.Length)
+            targetNodeId = args[++i];
+    }
+
+    var result = await WorkflowControlPlane.ForceAdvanceAsync(
+        pipelineDir,
+        targetNodeId ?? string.Empty,
+        options.Actor,
+        options.Rationale,
+        options.Source,
+        options.ExpectedVersion);
+    Console.WriteLine(result.Message);
+    return 0;
+}
+
+static async Task<int> RunResumeControl(string pipelineDir, string[] args)
+{
+    var options = ParseAuditCommandOptions(args);
+    var result = await WorkflowControlPlane.ResumeRunAsync(
+        pipelineDir,
+        options.Actor,
+        options.Rationale,
+        options.Source,
+        options.ExpectedVersion);
+    Console.WriteLine(result.Message);
+    return 0;
+}
+
+static async Task<int> RunArtifactList(string pipelineDir, string[] args)
+{
+    var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+    await workflowStore.SyncAsync();
+
+    var artifacts = WorkflowControlPlane.ReadArtifacts(pipelineDir);
+    var versions = WorkflowControlPlane.ReadArtifactVersions(pipelineDir);
+    if (args.Contains("--json", StringComparer.Ordinal))
+    {
+        Console.WriteLine(JsonSerializer.Serialize(new { artifacts, versions }, JsonOpts()));
+        return 0;
+    }
+
+    foreach (var artifact in artifacts.OrderBy(item => item.GetValueOrDefault("logical_path")?.ToString(), StringComparer.OrdinalIgnoreCase))
+    {
+        var artifactId = artifact.GetValueOrDefault("artifact_id")?.ToString() ?? "";
+        var logicalPath = artifact.GetValueOrDefault("logical_path")?.ToString() ?? artifactId;
+        var currentVersionId = artifact.GetValueOrDefault("current_version_id")?.ToString();
+        Console.WriteLine($"{logicalPath}");
+        Console.WriteLine($"  artifact_id: {artifactId}");
+        Console.WriteLine($"  current:     {currentVersionId}");
+
+        foreach (var version in versions.Where(item => string.Equals(item.GetValueOrDefault("artifact_id")?.ToString(), artifactId, StringComparison.Ordinal)))
+        {
+            var versionId = version.GetValueOrDefault("artifact_version_id")?.ToString();
+            var producedAt = version.GetValueOrDefault("produced_at")?.ToString();
+            var marker = string.Equals(versionId, currentVersionId, StringComparison.Ordinal) ? "*" : " ";
+            Console.WriteLine($"  {marker} {versionId}  {producedAt}");
+        }
+
+        Console.WriteLine();
+    }
+
+    return 0;
+}
+
+static async Task<int> RunArtifactLineage(string pipelineDir, string[] args)
+{
+    var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+    await workflowStore.SyncAsync();
+
+    var lineage = WorkflowControlPlane.ReadArtifactLineage(pipelineDir);
+    var positional = StripControlFlags(args);
+    if (positional.Length > 0)
+    {
+        var selector = positional[0];
+        lineage = lineage
+            .Where(item =>
+                string.Equals(item.GetValueOrDefault("artifact_id")?.ToString(), selector, StringComparison.Ordinal) ||
+                string.Equals(item.GetValueOrDefault("logical_path")?.ToString(), selector, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(item.GetValueOrDefault("artifact_version_id")?.ToString(), selector, StringComparison.Ordinal) ||
+                string.Equals(item.GetValueOrDefault("related_artifact_version_id")?.ToString(), selector, StringComparison.Ordinal))
+            .ToList();
+    }
+
+    if (args.Contains("--json", StringComparer.Ordinal))
+    {
+        Console.WriteLine(JsonSerializer.Serialize(lineage, JsonOpts()));
+        return 0;
+    }
+
+    foreach (var edge in lineage
+                 .OrderBy(item => item.GetValueOrDefault("created_at")?.ToString(), StringComparer.Ordinal)
+                 .ThenBy(item => item.GetValueOrDefault("artifact_version_id")?.ToString(), StringComparer.Ordinal))
+    {
+        var relation = edge.GetValueOrDefault("relation_type")?.ToString() ?? "unknown";
+        var logicalPath = edge.GetValueOrDefault("logical_path")?.ToString() ?? edge.GetValueOrDefault("artifact_id")?.ToString() ?? "";
+        var related = edge.GetValueOrDefault("related_logical_path")?.ToString() ?? edge.GetValueOrDefault("related_artifact_version_id")?.ToString() ?? "";
+        var versionId = edge.GetValueOrDefault("artifact_version_id")?.ToString();
+        Console.WriteLine($"{logicalPath}");
+        Console.WriteLine($"  relation: {relation}");
+        Console.WriteLine($"  related:  {related}");
+        Console.WriteLine($"  version:  {versionId}");
+        if (edge.GetValueOrDefault("source_path")?.ToString() is { Length: > 0 } sourcePath)
+            Console.WriteLine($"  source:   {sourcePath}");
+        Console.WriteLine();
+    }
+
+    return 0;
+}
+
+static async Task<int> RunArtifactPromote(string pipelineDir, string[] args)
+{
+    var options = ParseAuditCommandOptions(args);
+    var positional = StripControlFlags(args);
+    if (positional.Length < 2)
+        throw new InvalidOperationException("artifact promote requires <artifact-id-or-logical-path> <artifact-version-id>.");
+
+    var result = await WorkflowControlPlane.PromoteArtifactAsync(
+        pipelineDir,
+        positional[0],
+        positional[1],
+        options.Actor,
+        options.Rationale,
+        options.Source);
+    Console.WriteLine(result.Message);
+    return 0;
+}
+
+static async Task<int> RunArtifactRollback(string pipelineDir, string[] args)
+{
+    var options = ParseAuditCommandOptions(args);
+    var positional = StripControlFlags(args);
+    if (positional.Length < 1)
+        throw new InvalidOperationException("artifact rollback requires <artifact-id-or-logical-path> [artifact-version-id].");
+
+    var result = await WorkflowControlPlane.RollbackArtifactAsync(
+        pipelineDir,
+        positional[0],
+        positional.Length > 1 ? positional[1] : null,
+        options.Actor,
+        options.Rationale,
+        options.Source);
+    Console.WriteLine(result.Message);
+    return 0;
+}
+
+static (string? Actor, string? Rationale, string? Source, long? ExpectedVersion) ParseAuditCommandOptions(string[] args)
+{
+    string? actor = null;
+    string? rationale = null;
+    string? source = null;
+    long? expectedVersion = null;
+
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--dir" when i + 1 < args.Length:
+            case "--node" when i + 1 < args.Length:
+            case "--to-node" when i + 1 < args.Length:
+                i++;
+                break;
+            case "--actor" when i + 1 < args.Length:
+                actor = args[++i];
+                break;
+            case "--reason" or "--rationale" when i + 1 < args.Length:
+                rationale = args[++i];
+                break;
+            case "--source" when i + 1 < args.Length:
+                source = args[++i];
+                break;
+            case "--expected-version" when i + 1 < args.Length:
+                if (!long.TryParse(args[++i], out var parsed))
+                    throw new InvalidOperationException($"Invalid --expected-version '{args[i]}'.");
+                expectedVersion = parsed;
+                break;
+        }
+    }
+
+    return (actor, rationale, source, expectedVersion);
+}
+
+static string[] StripControlFlags(string[] args)
+{
+    var positional = new List<string>();
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--dir" when i + 1 < args.Length:
+            case "--actor" when i + 1 < args.Length:
+            case "--reason" when i + 1 < args.Length:
+            case "--rationale" when i + 1 < args.Length:
+            case "--source" when i + 1 < args.Length:
+            case "--node" when i + 1 < args.Length:
+            case "--to-node" when i + 1 < args.Length:
+            case "--expected-version" when i + 1 < args.Length:
+                i++;
+                break;
+            case "--json":
+                break;
+            default:
+                if (!args[i].StartsWith("--", StringComparison.Ordinal))
+                    positional.Add(args[i]);
+                break;
+        }
+    }
+
+    return positional.ToArray();
+}
+
+static long? TryGetExpectedVersion(JsonElement body)
+{
+    if (body.ValueKind != JsonValueKind.Object ||
+        !body.TryGetProperty("expected_version", out var expectedVersionElement))
+    {
+        return null;
+    }
+
+    return expectedVersionElement.ValueKind switch
+    {
+        JsonValueKind.Number when expectedVersionElement.TryGetInt64(out var numeric) => numeric,
+        JsonValueKind.String when long.TryParse(expectedVersionElement.GetString(), out var parsed) => parsed,
+        JsonValueKind.Null or JsonValueKind.Undefined => null,
+        _ => throw new InvalidOperationException("expected_version must be an integer.")
+    };
+}
+
+static WorkflowQueryRequest ParseWorkflowQueryHttp(string view, IQueryCollection query)
+{
+    var limit = query.TryGetValue("limit", out var limitValue) && int.TryParse(limitValue, out var parsedLimit)
+        ? parsedLimit
+        : 50;
+
+    return new WorkflowQueryRequest(
+        View: view,
+        Limit: limit,
+        NodeId: query.TryGetValue("node_id", out var nodeValue) ? nodeValue.ToString() : query.TryGetValue("node", out var nodeAlias) ? nodeAlias.ToString() : null,
+        Status: query.TryGetValue("status", out var statusValue) ? statusValue.ToString() : null,
+        EventType: query.TryGetValue("event_type", out var eventTypeValue) ? eventTypeValue.ToString() : null,
+        Provider: query.TryGetValue("provider", out var providerValue) ? providerValue.ToString() : null,
+        Model: query.TryGetValue("model", out var modelValue) ? modelValue.ToString() : null,
+        Actor: query.TryGetValue("actor", out var actorValue) ? actorValue.ToString() : null,
+        ArtifactId: query.TryGetValue("artifact_id", out var artifactValue) ? artifactValue.ToString() : query.TryGetValue("artifact", out var artifactAlias) ? artifactAlias.ToString() : null,
+        ApprovalState: query.TryGetValue("approval_state", out var approvalValue) ? approvalValue.ToString() : null,
+        Search: query.TryGetValue("q", out var searchValue) ? searchValue.ToString() : query.TryGetValue("search", out var searchAlias) ? searchAlias.ToString() : null);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -1416,14 +2444,36 @@ static async Task<int> RunWeb(string[] args)
             var options = qr.TryGetProperty("options", out var opts)
                 ? opts.EnumerateArray().Select(o => o.GetString()).ToList()
                 : new List<string?>();
+            string? nodeId = null;
+            string? defaultChoice = null;
+            if (qr.TryGetProperty("metadata", out var metadata) && metadata.ValueKind == JsonValueKind.Object)
+            {
+                if (metadata.TryGetProperty("node_id", out var nodeIdElement))
+                    nodeId = nodeIdElement.GetString();
+                if (metadata.TryGetProperty("default_choice", out var defaultChoiceElement))
+                    defaultChoice = defaultChoiceElement.GetString();
+            }
+            var createdAt = qr.TryGetProperty("created_at", out var createdAtElement)
+                ? createdAtElement.GetString()
+                : qr.TryGetProperty("timestamp", out var createdTsElement) ? createdTsElement.GetString() : null;
 
             var answerFile = Path.Combine(gateDir, "answer.json");
             string? answerText = null;
             string? answerChoice = null;
+            string? answerActor = null;
+            string? answerRationale = null;
+            string? answerSource = null;
+            string? answeredAt = null;
+            string? answerStatus = null;
             if (File.Exists(answerFile))
             {
                 var a = JsonDocument.Parse(await File.ReadAllTextAsync(answerFile));
                 answerText = a.RootElement.GetProperty("text").GetString();
+                answerActor = a.RootElement.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+                answerRationale = a.RootElement.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+                answerSource = a.RootElement.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : null;
+                answeredAt = a.RootElement.TryGetProperty("answered_at", out var answeredAtEl) ? answeredAtEl.GetString() : null;
+                answerStatus = a.RootElement.TryGetProperty("status", out var statusEl) ? statusEl.GetString() : "answered";
                 if (a.RootElement.TryGetProperty("selected_options", out var selOpts))
                 {
                     var first = selOpts.EnumerateArray().FirstOrDefault();
@@ -1436,10 +2486,18 @@ static async Task<int> RunWeb(string[] args)
             gates.Add(new
             {
                 gate_id = gateId,
+                node_id = nodeId,
                 question = text,
                 options,
+                default_choice = defaultChoice,
+                created_at = createdAt,
                 answer = answerText,
                 answer_choice = answerChoice,
+                answer_actor = answerActor,
+                answer_rationale = answerRationale,
+                answer_source = answerSource,
+                answered_at = answeredAt,
+                answer_status = answerStatus,
                 is_pending = gateId == pendingGateId
             });
         }
@@ -1460,6 +2518,9 @@ static async Task<int> RunWeb(string[] args)
         string? freeText = null;
         if (body.TryGetProperty("text", out var textEl))
             freeText = textEl.GetString();
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
 
         var gateDir = Path.Combine(pipelineDir, "gates", gateId);
         if (!Directory.Exists(gateDir)) return Results.NotFound();
@@ -1488,12 +2549,122 @@ static async Task<int> RunWeb(string[] args)
 
         // Use freeform text if provided, otherwise use the choice label
         var answerText = !string.IsNullOrEmpty(freeText) ? freeText : resolvedChoice;
+        rationale ??= string.Equals(answerText, resolvedChoice, StringComparison.Ordinal) ? null : answerText;
 
         var answerPath = Path.Combine(gateDir, "answer.json");
-        var answer = new { text = answerText, selected_options = new[] { resolvedChoice } };
+        var answer = BuildGateAnswerPayload(resolvedChoice, answerText, actor, rationale, source);
         await File.WriteAllTextAsync(answerPath, JsonSerializer.Serialize(answer, JsonOpts()));
+        await SyncWorkflowStoreAsync(WorkflowStoreFactory.CreateDefault(pipelineDir));
 
-        return Results.Json(new { answered = resolvedChoice, text = answerText });
+        return Results.Json(new { answered = resolvedChoice, text = answerText, actor = answer["actor"], rationale = answer["rationale"] });
+    });
+
+    app.MapPost("/api/pipeline/{id}/cancel", async (string id, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null) return Results.NotFound();
+
+        var body = await JsonSerializer.DeserializeAsync<JsonElement>(request.Body);
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
+        var expectedVersion = TryGetExpectedVersion(body);
+
+        try
+        {
+            var result = await WorkflowControlPlane.CancelRunAsync(pipelineDir, actor, rationale, source, expectedVersion);
+            return Results.Json(new { status = result.Status, message = result.Message, run_version = result.RunVersion });
+        }
+        catch (RunStateConflictException ex)
+        {
+            return Results.Conflict(new { error = ex.Message, current_version = ex.CurrentVersion, expected_version = ex.ExpectedVersion });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    });
+
+    app.MapPost("/api/pipeline/{id}/retry-stage", async (string id, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null) return Results.NotFound();
+
+        var body = await JsonSerializer.DeserializeAsync<JsonElement>(request.Body);
+        var nodeId = body.TryGetProperty("node_id", out var nodeEl) ? nodeEl.GetString() : null;
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
+        var expectedVersion = TryGetExpectedVersion(body);
+
+        try
+        {
+            var result = await WorkflowControlPlane.RetryStageAsync(pipelineDir, nodeId, actor, rationale, source, expectedVersion);
+            return Results.Json(new { status = result.Status, message = result.Message, run_version = result.RunVersion });
+        }
+        catch (RunStateConflictException ex)
+        {
+            return Results.Conflict(new { error = ex.Message, current_version = ex.CurrentVersion, expected_version = ex.ExpectedVersion });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    });
+
+    app.MapPost("/api/pipeline/{id}/force-advance", async (string id, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null) return Results.NotFound();
+
+        var body = await JsonSerializer.DeserializeAsync<JsonElement>(request.Body);
+        var targetNode = body.TryGetProperty("target_node", out var targetEl)
+            ? targetEl.GetString()
+            : body.TryGetProperty("node_id", out var nodeEl) ? nodeEl.GetString() : null;
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
+        var expectedVersion = TryGetExpectedVersion(body);
+
+        try
+        {
+            var result = await WorkflowControlPlane.ForceAdvanceAsync(pipelineDir, targetNode ?? string.Empty, actor, rationale, source, expectedVersion);
+            return Results.Json(new { status = result.Status, message = result.Message, run_version = result.RunVersion });
+        }
+        catch (RunStateConflictException ex)
+        {
+            return Results.Conflict(new { error = ex.Message, current_version = ex.CurrentVersion, expected_version = ex.ExpectedVersion });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    });
+
+    app.MapPost("/api/pipeline/{id}/resume", async (string id, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null) return Results.NotFound();
+
+        var body = await JsonSerializer.DeserializeAsync<JsonElement>(request.Body);
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
+        var expectedVersion = TryGetExpectedVersion(body);
+
+        try
+        {
+            var result = await WorkflowControlPlane.ResumeRunAsync(pipelineDir, actor, rationale, source, expectedVersion);
+            return Results.Json(new { status = result.Status, message = result.Message, pid = result.SpawnedPid, run_version = result.RunVersion });
+        }
+        catch (RunStateConflictException ex)
+        {
+            return Results.Conflict(new { error = ex.Message, current_version = ex.CurrentVersion, expected_version = ex.ExpectedVersion });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
     });
 
     app.MapGet("/api/pipeline/{id}/logs", async (string id) =>
@@ -1772,6 +2943,135 @@ static async Task<int> RunWeb(string[] args)
                 total_tokens = totalTokens
             }
         });
+    });
+
+    app.MapGet("/api/pipeline/{id}/replay", async (string id) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
+
+        var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+        await SyncWorkflowStoreAsync(workflowStore);
+
+        var replayPath = Path.Combine(workflowStore.StoreDirectory, "replay.json");
+        if (!File.Exists(replayPath))
+            return Results.Json(new { run_id = Path.GetFileName(pipelineDir), events = Array.Empty<object>() });
+
+        return Results.Text(await File.ReadAllTextAsync(replayPath), "application/json");
+    });
+
+    app.MapGet("/api/pipeline/{id}/artifacts", async (string id) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
+
+        var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+        await SyncWorkflowStoreAsync(workflowStore);
+        return Results.Json(new
+        {
+            artifacts = WorkflowControlPlane.ReadArtifacts(pipelineDir),
+            versions = WorkflowControlPlane.ReadArtifactVersions(pipelineDir)
+        });
+    });
+
+    app.MapGet("/api/pipeline/{id}/queries", async (string id) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
+
+        var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+        await SyncWorkflowStoreAsync(workflowStore);
+
+        return Results.Json(WorkflowQueryService.ListSavedQueries());
+    });
+
+    app.MapGet("/api/pipeline/{id}/query/{view}", async (string id, string view, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
+
+        var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+        await SyncWorkflowStoreAsync(workflowStore);
+
+        try
+        {
+            var result = await WorkflowQueryService.ExecuteAsync(
+                pipelineDir,
+                ParseWorkflowQueryHttp(view, request.Query));
+            return Results.Json(new
+            {
+                view = result.View,
+                description = result.Description,
+                row_count = result.Rows.Count,
+                rows = result.Rows
+            });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    });
+
+    app.MapPost("/api/pipeline/{id}/artifacts/promote", async (string id, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null) return Results.NotFound();
+
+        var body = await JsonSerializer.DeserializeAsync<JsonElement>(request.Body);
+        var artifact = body.TryGetProperty("artifact_id", out var artifactEl)
+            ? artifactEl.GetString()
+            : body.TryGetProperty("logical_path", out var logicalEl) ? logicalEl.GetString() : null;
+        var versionId = body.TryGetProperty("artifact_version_id", out var versionEl) ? versionEl.GetString() : null;
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
+
+        try
+        {
+            var result = await WorkflowControlPlane.PromoteArtifactAsync(
+                pipelineDir,
+                artifact ?? string.Empty,
+                versionId ?? string.Empty,
+                actor,
+                rationale,
+                source);
+            return Results.Json(new { artifact_id = result.ArtifactId, artifact_version_id = result.ArtifactVersionId, message = result.Message });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    });
+
+    app.MapPost("/api/pipeline/{id}/artifacts/rollback", async (string id, HttpRequest request) =>
+    {
+        var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
+        if (pipelineDir == null) return Results.NotFound();
+
+        var body = await JsonSerializer.DeserializeAsync<JsonElement>(request.Body);
+        var artifact = body.TryGetProperty("artifact_id", out var artifactEl)
+            ? artifactEl.GetString()
+            : body.TryGetProperty("logical_path", out var logicalEl) ? logicalEl.GetString() : null;
+        var versionId = body.TryGetProperty("artifact_version_id", out var versionEl) ? versionEl.GetString() : null;
+        var actor = body.TryGetProperty("actor", out var actorEl) ? actorEl.GetString() : null;
+        var rationale = body.TryGetProperty("rationale", out var rationaleEl) ? rationaleEl.GetString() : null;
+        var source = body.TryGetProperty("source", out var sourceEl) ? sourceEl.GetString() : "web";
+
+        try
+        {
+            var result = await WorkflowControlPlane.RollbackArtifactAsync(
+                pipelineDir,
+                artifact ?? string.Empty,
+                versionId,
+                actor,
+                rationale,
+                source);
+            return Results.Json(new { artifact_id = result.ArtifactId, artifact_version_id = result.ArtifactVersionId, message = result.Message });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
     });
 
     // ── Dashboard HTML ──────────────────────────────────────────────
@@ -3046,6 +4346,14 @@ static string DashboardHtml() => """
   .md-body hr { border: none; height: 1px; background: var(--border-strong); margin: 24px 0; }
   .md-body strong { font-weight: 700; color: var(--text-primary); }
   .md-body del { color: var(--text-tertiary); }
+  .ops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .ops-card { border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; background: rgba(15, 23, 42, 0.28); }
+  .ops-card h4 { margin: 0 0 10px 0; font-size: 13px; color: var(--text-primary); letter-spacing: 0.04em; text-transform: uppercase; }
+  .ops-empty { color: var(--text-tertiary); font-size: 12px; }
+  .ops-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .ops-table th, .ops-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  .ops-table th { color: var(--text-tertiary); font-weight: 600; }
+  .ops-table td { color: var(--text-secondary); }
 
   @media (max-width: 900px) {
     .shell { padding: 12px; gap: 12px; }
@@ -3176,6 +4484,33 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function formatOpsValue(value) {
+  if (value === null || value === undefined || value === '') return '&mdash;';
+  return escapeHtml(String(value));
+}
+
+function renderOpsCard(title, queryResult, columns) {
+  const rows = queryResult?.rows || [];
+  let html = `<div class="ops-card"><h4>${escapeHtml(title)}</h4>`;
+  if (rows.length === 0) {
+    html += `<div class="ops-empty">No rows</div></div>`;
+    return html;
+  }
+
+  html += '<table class="ops-table"><thead><tr>';
+  columns.forEach(column => { html += `<th>${escapeHtml(column.label)}</th>`; });
+  html += '</tr></thead><tbody>';
+  rows.forEach(row => {
+    html += '<tr>';
+    columns.forEach(column => {
+      html += `<td>${formatOpsValue(row[column.key])}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  return html;
+}
+
 // ── Pipeline list ───────────────────────────────────────────────────
 
 async function loadPipelines() {
@@ -3219,13 +4554,19 @@ async function selectPipeline(id) {
 // ── Detail panel ────────────────────────────────────────────────────
 
 async function loadDetail(id) {
-  const [status, gates, logs, summaries, graphSvg, telemetry] = await Promise.all([
+  const [status, gates, logs, summaries, graphSvg, telemetry, failures, operators, hotspots, scorecards, leases, mutations] = await Promise.all([
     fetchJson(`/api/pipeline/${id}/status`),
     fetchJson(`/api/pipeline/${id}/gates`),
     fetchJson(`/api/pipeline/${id}/logs`),
     fetchJson(`/api/pipeline/${id}/summaries`),
     fetchText(`/api/pipeline/${id}/graph`),
-    fetchJson(`/api/pipeline/${id}/telemetry`)
+    fetchJson(`/api/pipeline/${id}/telemetry`),
+    fetchJson(`/api/pipeline/${id}/query/failures?limit=5`),
+    fetchJson(`/api/pipeline/${id}/query/operators?limit=6`),
+    fetchJson(`/api/pipeline/${id}/query/hotspots?limit=6`),
+    fetchJson(`/api/pipeline/${id}/query/scorecards?limit=5`),
+    fetchJson(`/api/pipeline/${id}/query/leases?limit=3`),
+    fetchJson(`/api/pipeline/${id}/query/mutations?limit=6`)
   ]);
 
   let html = '';
@@ -3386,6 +4727,39 @@ async function loadDetail(id) {
     });
     html += `</div>`;
   }
+
+  html += `<div class="section"><div class="section-title">Operational Views</div><div class="ops-grid">`;
+  html += renderOpsCard('Current Failures', failures, [
+    { key: 'node_id', label: 'Node' },
+    { key: 'failure_kind', label: 'Failure' },
+    { key: 'status', label: 'Status' }
+  ]);
+  html += renderOpsCard('Recent Operator Activity', operators, [
+    { key: 'activity_type', label: 'Type' },
+    { key: 'actor', label: 'Actor' },
+    { key: 'details', label: 'Details' }
+  ]);
+  html += renderOpsCard('Stage Hotspots', hotspots, [
+    { key: 'node_id', label: 'Node' },
+    { key: 'failure_count', label: 'Failures' },
+    { key: 'avg_duration_ms', label: 'Avg ms' }
+  ]);
+  html += renderOpsCard('Model Scorecards', scorecards, [
+    { key: 'model', label: 'Model' },
+    { key: 'success_rate', label: 'Success' },
+    { key: 'avg_duration_ms', label: 'Avg ms' }
+  ]);
+  html += renderOpsCard('Lease Ownership', leases, [
+    { key: 'owner_pid', label: 'PID' },
+    { key: 'state', label: 'State' },
+    { key: 'generation', label: 'Gen' }
+  ]);
+  html += renderOpsCard('Control Mutations', mutations, [
+    { key: 'mutation_type', label: 'Type' },
+    { key: 'mutation_status', label: 'Status' },
+    { key: 'message', label: 'Message' }
+  ]);
+  html += `</div></div>`;
 
   patchHtml(document.getElementById('detail'), html);
 }
@@ -3635,17 +5009,19 @@ static Task<int> RunBuilder(string[] args)
 {
     if (args.Length == 0)
     {
-        Console.Error.WriteLine("builder: missing subcommand. Use init | graph | node | edge | inspect.");
+        Console.Error.WriteLine("builder: missing subcommand. Use init | template | graph | node | edge | inspect | preview.");
         return Task.FromResult(1);
     }
 
     return args[0] switch
     {
         "init" => RunBuilderInit(args[1..]),
+        "template" => RunBuilderTemplate(args[1..]),
         "graph" => RunBuilderGraph(args[1..]),
         "node" => RunBuilderNode(args[1..]),
         "edge" => RunBuilderEdge(args[1..]),
         "inspect" => RunBuilderInspect(args[1..]),
+        "preview" => RunBuilderPreview(args[1..]),
         _ => Task.FromResult(ShowBuilderHelp())
     };
 }
@@ -3678,6 +5054,46 @@ static Task<int> RunBuilderInit(string[] args)
     var graph = BuilderCommandSupport.InitializeGraph(name, goal);
     BuilderCommandSupport.Save(dotFilePath, graph);
     Console.WriteLine($"builder: initialized {dotFilePath}");
+    return Task.FromResult(0);
+}
+
+static Task<int> RunBuilderTemplate(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("builder template: usage: attractor builder template <kind> <dotfile> [--name <name>] [--goal <goal>] [--reference-image <path>] [--reference-document <path>]");
+        return Task.FromResult(1);
+    }
+
+    var templateKind = args[0];
+    var dotFilePath = Path.GetFullPath(args[1]);
+    var name = Path.GetFileNameWithoutExtension(dotFilePath);
+    string? goal = null;
+    string? referenceImage = null;
+    string? referenceDocument = null;
+
+    for (var i = 2; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--name" when i + 1 < args.Length:
+                name = args[++i];
+                break;
+            case "--goal" when i + 1 < args.Length:
+                goal = args[++i];
+                break;
+            case "--reference-image" when i + 1 < args.Length:
+                referenceImage = args[++i];
+                break;
+            case "--reference-document" when i + 1 < args.Length:
+                referenceDocument = args[++i];
+                break;
+        }
+    }
+
+    var graph = BuilderCommandSupport.CreateTemplate(templateKind, name, goal, referenceImage, referenceDocument);
+    BuilderCommandSupport.Save(dotFilePath, graph);
+    Console.WriteLine($"builder: created {templateKind} template at {dotFilePath}");
     return Task.FromResult(0);
 }
 
@@ -3802,6 +5218,24 @@ static Task<int> RunBuilderNode(string[] args)
             case "--reasoning-effort" when i + 1 < args.Length:
                 attributes["reasoning_effort"] = args[++i];
                 break;
+            case "--execution-lane" when i + 1 < args.Length:
+                attributes["execution_lane"] = args[++i];
+                break;
+            case "--output-modalities" when i + 1 < args.Length:
+                attributes["output_modalities"] = args[++i];
+                break;
+            case "--input-images" when i + 1 < args.Length:
+            case "--input-image-paths" when i + 1 < args.Length:
+                attributes["input_images"] = args[++i];
+                break;
+            case "--input-documents" when i + 1 < args.Length:
+            case "--input-document-paths" when i + 1 < args.Length:
+                attributes["input_documents"] = args[++i];
+                break;
+            case "--input-audio" when i + 1 < args.Length:
+            case "--input-audio-paths" when i + 1 < args.Length:
+                attributes["input_audio"] = args[++i];
+                break;
             case "--auto-status":
                 attributes["auto_status"] = "true";
                 break;
@@ -3898,6 +5332,46 @@ static Task<int> RunBuilderInspect(string[] args)
     return Task.FromResult(0);
 }
 
+static Task<int> RunBuilderPreview(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.Error.WriteLine("builder preview: missing <dotfile> path.");
+        return Task.FromResult(1);
+    }
+
+    var dotFilePath = Path.GetFullPath(args[0]);
+    if (!File.Exists(dotFilePath))
+    {
+        Console.Error.WriteLine($"builder preview: dotfile not found: {dotFilePath}");
+        return Task.FromResult(1);
+    }
+
+    var json = args.Any(arg => string.Equals(arg, "--json", StringComparison.Ordinal));
+    var variables = new Dictionary<string, string>(StringComparer.Ordinal);
+    for (var i = 1; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--json":
+                break;
+            case "--var" when i + 1 < args.Length:
+                if (!TryParseBuilderAttribute(args[++i], out var key, out var value))
+                    return Task.FromResult(FailBuilderArgument("builder preview", $"invalid --var '{args[i]}' (expected key=value)."));
+                variables[key] = value;
+                break;
+        }
+    }
+
+    var preview = BuildWorkflowPreview(dotFilePath, variables.Count == 0 ? null : variables);
+    if (json)
+        Console.WriteLine(JsonSerializer.Serialize(preview, JsonOpts()));
+    else
+        Console.WriteLine(BuilderCommandSupport.FormatPreview(preview));
+
+    return Task.FromResult(GetWorkflowPreviewErrorCount(preview) == 0 ? 0 : 1);
+}
+
 static bool TryParseBuilderAttribute(string text, out string key, out string value)
 {
     key = string.Empty;
@@ -3923,10 +5397,18 @@ static int ShowBuilderHelp()
     Console.WriteLine();
     Console.WriteLine("Usage:");
     Console.WriteLine("  attractor builder init <dotfile> [--name <name>] [--goal <goal>]");
+    Console.WriteLine("  attractor builder template <kind> <dotfile> [--name <name>] [--goal <goal>] [--reference-image <path>] [--reference-document <path>]");
     Console.WriteLine("  attractor builder graph <dotfile> [--goal <goal>] [--label <label>] [--attr key=value]");
-    Console.WriteLine("  attractor builder node <dotfile> <node-id> [--shape <shape>] [--label <label>] [--prompt <prompt>] [--attr key=value]");
+    Console.WriteLine("  attractor builder node <dotfile> <node-id> [--shape <shape>] [--label <label>] [--prompt <prompt>] [--execution-lane <lane>] [--output-modalities <csv>] [--input-images <csv>] [--input-documents <csv>] [--input-audio <csv>] [--attr key=value]");
     Console.WriteLine("  attractor builder edge <dotfile> <from-node> <to-node> [--label <label>] [--condition <expr>] [--attr key=value]");
     Console.WriteLine("  attractor builder inspect <dotfile>");
+    Console.WriteLine("  attractor builder preview <dotfile> [--json] [--var key=value]");
+    Console.WriteLine();
+    Console.WriteLine("Templates:");
+    Console.WriteLine("  coding-loop     Full plan → review → implement → validate → critique loop");
+    Console.WriteLine("  fanout-review   Parallel gather + merge + human approval");
+    Console.WriteLine("  multimodal-edit-loop  Reference-image-driven visual generation and refinement");
+    Console.WriteLine("  document-critique-loop  Review and iterate on an attached source document");
     return 0;
 }
 
@@ -4052,6 +5534,17 @@ static async Task<int> RunPipeline(string[] args)
         return 1;
     }
 
+    if (options.DryRun)
+    {
+        var preview = BuildWorkflowPreview(dotFilePath, options.Variables);
+        if (options.Json)
+            Console.WriteLine(JsonSerializer.Serialize(preview, JsonOpts()));
+        else
+            Console.WriteLine(BuilderCommandSupport.FormatPreview(preview));
+
+        return GetWorkflowPreviewErrorCount(preview) == 0 ? 0 : 1;
+    }
+
     var workingDir = RunCommandSupport.ResolveWorkingDirectory(dotFilePath, options);
     Directory.CreateDirectory(workingDir);
 
@@ -4062,6 +5555,9 @@ static async Task<int> RunPipeline(string[] args)
 
     var gatesDir = Path.Combine(workingDir, "gates");
     Directory.CreateDirectory(gatesDir);
+    var workflowStore = WorkflowStoreFactory.CreateDefault(workingDir);
+    var runStateStore = new SqliteRunStateStore(workingDir);
+    var lockPath = Path.Combine(workingDir, "run.lock");
 
     var checkpointPath = Path.Combine(logsDir, "checkpoint.json");
     var checkpointExists = File.Exists(checkpointPath);
@@ -4092,15 +5588,39 @@ static async Task<int> RunPipeline(string[] args)
         checkpointExists = false;
     }
 
-    if (!TryAcquireRunLock(Path.Combine(workingDir, "run.lock"), out var lockError))
+    var manifest = resumeDecision.ExistingManifest ?? new RunManifest();
+    var resultPath = Path.Combine(logsDir, "result.json");
+    manifest.run_id = string.IsNullOrWhiteSpace(manifest.run_id) ? Guid.NewGuid().ToString("N") : manifest.run_id;
+    ApplyRunManifest(manifest, (await runStateStore.EnsureInitializedAsync(manifestPath, manifest)).Manifest);
+
+    async Task PersistRunManifestAsync(bool incrementVersion = true, bool preserveCancellationMarkers = true)
     {
+        var snapshot = await runStateStore.PersistAsync(
+            manifestPath,
+            manifest,
+            incrementVersion,
+            preserveCancellationMarkers);
+        ApplyRunManifest(manifest, snapshot.Manifest);
+    }
+
+    var leaseResult = await RunLeaseCoordinator.TryAcquireAsync(
+        workingDir,
+        manifest.run_id,
+        Environment.ProcessId,
+        ProgramSupport.IsProcessAlive);
+    if (!leaseResult.Success)
+    {
+        Console.Error.WriteLine(leaseResult.Error);
+        return 1;
+    }
+
+    if (!TryAcquireRunLock(lockPath, out var lockError))
+    {
+        await RunLeaseCoordinator.ReleaseAsync(workingDir, manifest.run_id, Environment.ProcessId);
         Console.Error.WriteLine(lockError);
         return 1;
     }
 
-    var manifest = resumeDecision.ExistingManifest ?? new RunManifest();
-    var resultPath = Path.Combine(logsDir, "result.json");
-    manifest.run_id = string.IsNullOrWhiteSpace(manifest.run_id) ? Guid.NewGuid().ToString("N") : manifest.run_id;
     manifest.pid = Environment.ProcessId;
     manifest.graph_path = dotFilePath;
     manifest.started_at = string.IsNullOrWhiteSpace(manifest.started_at) ? DateTime.UtcNow.ToString("o") : manifest.started_at;
@@ -4112,7 +5632,25 @@ static async Task<int> RunPipeline(string[] args)
     manifest.resume_source = string.IsNullOrWhiteSpace(options.StartAt) ? resumeDecision.ResumeSource : "start-at";
     manifest.checkpoint_path = checkpointPath;
     manifest.result_path = resultPath;
-    manifest.Save(manifestPath);
+    manifest.backend_mode = options.BackendMode;
+    manifest.backend_script_path = string.IsNullOrWhiteSpace(options.BackendScriptPath)
+        ? null
+        : Path.GetFullPath(options.BackendScriptPath);
+    if (!string.IsNullOrWhiteSpace(options.CrashAfterStage))
+    {
+        manifest.crash_after_stage = options.CrashAfterStage;
+        manifest.crash_injections_remaining = options.CrashAfterStageCount <= 0 ? 1 : options.CrashAfterStageCount;
+    }
+    else if (!shouldResume)
+    {
+        manifest.crash_after_stage = null;
+        manifest.crash_injections_remaining = 0;
+    }
+    manifest.cancel_requested_at = null;
+    manifest.cancel_requested_actor = null;
+    manifest.cancel_requested_rationale = null;
+    manifest.cancel_requested_source = null;
+    await PersistRunManifestAsync(preserveCancellationMarkers: false);
 
     RegisterRun(dotFilePath, workingDir);
 
@@ -4132,6 +5670,8 @@ static async Task<int> RunPipeline(string[] args)
         Console.WriteLine($"Steer file:  {options.SteerFilePath}");
     if (!string.Equals(options.BackendMode, "live", StringComparison.OrdinalIgnoreCase))
         Console.WriteLine($"Backend:     {options.BackendMode}");
+    if (!string.IsNullOrWhiteSpace(manifest.crash_after_stage) && manifest.crash_injections_remaining > 0)
+        Console.WriteLine($"Crash plan:  stage={manifest.crash_after_stage} remaining={manifest.crash_injections_remaining}");
     Console.WriteLine();
 
     var dotSource = await File.ReadAllTextAsync(dotFilePath);
@@ -4141,13 +5681,15 @@ static async Task<int> RunPipeline(string[] args)
     graph.Attributes["output_root"] = workingDir;
     foreach (var (key, value) in options.Variables ?? new Dictionary<string, string>(StringComparer.Ordinal))
         graph.Attributes[key] = value;
+    WorkflowPolicySupport.WriteSnapshot(workingDir, graph);
 
     if (!string.IsNullOrWhiteSpace(options.StartAt))
     {
         if (!RunCommandSupport.TryApplyStartAt(graph, logsDir, options.StartAt, out var startAtError))
         {
             Console.Error.WriteLine(startAtError);
-            ReleaseRunLock(Path.Combine(workingDir, "run.lock"));
+            await RunLeaseCoordinator.ReleaseAsync(workingDir, manifest.run_id, Environment.ProcessId);
+            ReleaseRunLock(lockPath);
             return 1;
         }
         shouldResume = true;
@@ -4160,12 +5702,12 @@ static async Task<int> RunPipeline(string[] args)
     Console.WriteLine();
 
     var backend = RunnerBackendFactory.Create(workingDir, projectRoot, options);
-    var runtimeObserver = new RunnerRuntimeObserver(manifest, manifestPath, checkpointPath, options.CrashAfterStage);
+    var runtimeObserver = new RunnerRuntimeObserver(manifest, manifestPath, checkpointPath, runStateStore, workflowStore);
     var supervisorController = new SupervisorController(options, projectRoot, dotFilePath);
 
     var config = new PipelineConfig(
         LogsRoot: logsDir,
-        Interviewer: new FileInterviewer(gatesDir),
+        Interviewer: new FileInterviewer(gatesDir, onMutation: workflowStore.SyncAsync),
         Backend: backend,
         Transforms: new List<IGraphTransform>
         {
@@ -4183,7 +5725,29 @@ static async Task<int> RunPipeline(string[] args)
     manifest.status = "running";
     manifest.active_stage = Checkpoint.Load(logsDir)?.CurrentNodeId ?? "start";
     manifest.updated_at = DateTime.UtcNow.ToString("o");
-    manifest.Save(manifestPath);
+    await PersistRunManifestAsync();
+    await AppendRunnerEventAsync(
+        logsDir,
+        "lease_acquired",
+        new Dictionary<string, object?>
+        {
+            ["lease_id"] = leaseResult.LeaseId,
+            ["pid"] = Environment.ProcessId,
+            ["started_at"] = DateTime.UtcNow.ToString("o"),
+            ["generation"] = leaseResult.Generation
+        });
+    await AppendRunnerEventAsync(
+        logsDir,
+        "run_started",
+        new Dictionary<string, object?>
+        {
+            ["run_id"] = manifest.run_id,
+            ["graph_path"] = dotFilePath,
+            ["status"] = manifest.status,
+            ["resume_mode"] = shouldResume ? "resume" : "fresh",
+            ["autoresume_policy"] = AutoResumeSupport.FormatPolicy(options.AutoResumePolicy)
+        });
+    await SyncWorkflowStoreAsync(workflowStore);
 
     var exitCode = 0;
     var shouldRespawn = false;
@@ -4213,9 +5777,57 @@ static async Task<int> RunPipeline(string[] args)
         manifest.active_stage = result.CompletedNodes.LastOrDefault() ?? "unknown";
         manifest.updated_at = DateTime.UtcNow.ToString("o");
         manifest.result_path = resultPath;
-        manifest.Save(manifestPath);
+        manifest.crash_after_stage = null;
+        manifest.crash_injections_remaining = 0;
+        await PersistRunManifestAsync();
+        await AppendRunnerEventAsync(
+            logsDir,
+            "run_finished",
+            new Dictionary<string, object?>
+            {
+                ["run_id"] = manifest.run_id,
+                ["status"] = result.Status.ToString().ToLowerInvariant(),
+                ["active_stage"] = manifest.active_stage,
+                ["completed_nodes"] = result.CompletedNodes
+            });
+        await SyncWorkflowStoreAsync(workflowStore);
 
         exitCode = result.Status == OutcomeStatus.Success ? 0 : 1;
+    }
+    catch (RunCancelledException ex)
+    {
+        manifest.status = "cancelled";
+        manifest.active_stage = Checkpoint.Load(logsDir)?.CurrentNodeId ?? manifest.active_stage;
+        manifest.updated_at = DateTime.UtcNow.ToString("o");
+        manifest.crash = null;
+        manifest.crash_after_stage = null;
+        manifest.crash_injections_remaining = 0;
+        await PersistRunManifestAsync();
+
+        var resultPayload = new
+        {
+            status = "cancelled",
+            active_stage = manifest.active_stage,
+            cancelled = DateTime.UtcNow.ToString("o"),
+            actor = ex.Request.Actor,
+            rationale = ex.Request.Rationale,
+            source = ex.Request.Source
+        };
+        await File.WriteAllTextAsync(resultPath, JsonSerializer.Serialize(resultPayload, RunnerJson.Options));
+        await AppendRunnerEventAsync(
+            logsDir,
+            "run_cancelled",
+            new Dictionary<string, object?>
+            {
+                ["run_id"] = manifest.run_id,
+                ["active_stage"] = manifest.active_stage,
+                ["actor"] = ex.Request.Actor,
+                ["rationale"] = ex.Request.Rationale,
+                ["source"] = ex.Request.Source
+            });
+        await SyncWorkflowStoreAsync(workflowStore);
+        Console.Error.WriteLine(ex.Message);
+        exitCode = 130;
     }
     catch (Exception ex)
     {
@@ -4229,13 +5841,45 @@ static async Task<int> RunPipeline(string[] args)
             manifest.last_respawned_at = DateTime.UtcNow.ToString("o");
             shouldRespawn = true;
         }
-        manifest.Save(manifestPath);
+        await PersistRunManifestAsync();
+        await AppendRunnerEventAsync(
+            logsDir,
+            "run_crashed",
+            new Dictionary<string, object?>
+            {
+                ["run_id"] = manifest.run_id,
+                ["error"] = ex.Message,
+                ["active_stage"] = manifest.active_stage,
+                ["will_respawn"] = options.AutoResumePolicy == AutoResumePolicy.Always
+            });
+        if (shouldRespawn)
+        {
+            await AppendRunnerEventAsync(
+                logsDir,
+                "run_respawning",
+                new Dictionary<string, object?>
+                {
+                    ["run_id"] = manifest.run_id,
+                    ["respawn_count"] = manifest.respawn_count
+                });
+        }
+        await SyncWorkflowStoreAsync(workflowStore);
         Console.Error.WriteLine($"Pipeline crashed: {ex.Message}");
         exitCode = options.AutoResumePolicy == AutoResumePolicy.Always ? 134 : 1;
     }
     finally
     {
-        ReleaseRunLock(Path.Combine(workingDir, "run.lock"));
+        await AppendRunnerEventAsync(
+            logsDir,
+            "lease_released",
+            new Dictionary<string, object?>
+            {
+                ["lease_id"] = $"{manifest.run_id}:lease:primary",
+                ["pid"] = Environment.ProcessId
+            });
+        await RunLeaseCoordinator.ReleaseAsync(workingDir, manifest.run_id, Environment.ProcessId);
+        ReleaseRunLock(lockPath);
+        await SyncWorkflowStoreAsync(workflowStore);
         backend.Dispose();
     }
 
@@ -4246,12 +5890,14 @@ static async Task<int> RunPipeline(string[] args)
             manifest.status = "crashed";
             manifest.updated_at = DateTime.UtcNow.ToString("o");
             manifest.crash = $"{manifest.crash} | Respawn failed: {respawnError}";
-            manifest.Save(manifestPath);
+            await PersistRunManifestAsync();
             Console.Error.WriteLine($"Unable to respawn runner: {respawnError}");
+            await SyncWorkflowStoreAsync(workflowStore);
             return 1;
         }
 
         Console.Error.WriteLine($"Respawned runner pid {respawnProcess!.Id} for autoresume.");
+        await SyncWorkflowStoreAsync(workflowStore);
     }
 
     return exitCode;
@@ -4335,8 +5981,13 @@ static int ShowHelp()
     Console.WriteLine("  attractor gate watch [--dir <dir>]   Watch for gates and answer interactively");
     Console.WriteLine("  attractor status [--dir <dir>]       Show pipeline progress");
     Console.WriteLine("  attractor logs [<node>] [--dir <dir>]  View node artifacts");
+    Console.WriteLine("  attractor replay [--dir <dir>]       Reconstruct the run timeline from stored events");
     Console.WriteLine("  attractor web [--dir <dir>] [--port N] Launch web dashboard");
     Console.WriteLine("  attractor providers <subcommand>      Ping providers or sync new provider models");
+    Console.WriteLine("  attractor scorecard [--dir <dir>]     Summarize per-model run telemetry");
+    Console.WriteLine("  attractor query <view> [--dir <dir>]  Query saved durable views from workflow.sqlite");
+    Console.WriteLine("  attractor control <subcommand>        Audited control-plane mutations");
+    Console.WriteLine("  attractor artifact <subcommand>       Inspect or promote versioned artifacts");
     Console.WriteLine("  attractor lint [path] [--recursive]  Lint one file or a directory of dotfiles");
     Console.WriteLine("  attractor conformance <subcommand>     Parse, validate, run, or list handlers for AttractorBench");
     Console.WriteLine("  attractor builder <subcommand>        Create or edit DOT pipelines");
@@ -4354,12 +6005,41 @@ static int ShowHelp()
     Console.WriteLine("  --backend <mode>         Backend mode: live | scripted");
     Console.WriteLine("  --backend-script <path>  JSON plan for the scripted backend");
     Console.WriteLine("  --crash-after-stage <id> Inject a crash after checkpointing a stage (QA/test)");
+    Console.WriteLine("  --crash-after-stage-count <n> Repeat the injected crash on that stage n times across autoresume attempts");
     Console.WriteLine("  --var <key=value>        Inject graph/task variables for prompt expansion");
+    Console.WriteLine("  --dry-run                Parse, transform, lint, and preview without executing");
+    Console.WriteLine("  --json                   Print structured preview JSON when used with --dry-run");
+    Console.WriteLine();
+    Console.WriteLine("Gate answer options:");
+    Console.WriteLine("  --actor <name>          Audit actor identity for the gate answer");
+    Console.WriteLine("  --reason <text>         Structured rationale for the gate answer");
+    Console.WriteLine("  --source <value>        Answer source label, e.g. cli or web");
+    Console.WriteLine("  --text <text>           Freeform answer text or steering notes");
     Console.WriteLine();
     Console.WriteLine("Output directory resolution:");
     Console.WriteLine("  1. --dir <path> flag");
     Console.WriteLine("  2. output/ sibling to a .dot file in cwd");
     Console.WriteLine("  3. dotfiles/output/ relative to cwd");
+    return 0;
+}
+
+static int ShowControlHelp()
+{
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  attractor control cancel --dir <run> --reason <text> [--actor <name>] [--source <label>] [--expected-version <n>]");
+    Console.WriteLine("  attractor control retry-stage --dir <run> [--node <id>] --reason <text> [--actor <name>] [--source <label>] [--expected-version <n>]");
+    Console.WriteLine("  attractor control force-advance --dir <run> --to-node <id> --reason <text> [--actor <name>] [--source <label>] [--expected-version <n>]");
+    Console.WriteLine("  attractor control resume --dir <run> --reason <text> [--actor <name>] [--source <label>] [--expected-version <n>]");
+    return 0;
+}
+
+static int ShowArtifactHelp()
+{
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  attractor artifact list --dir <run> [--json]");
+    Console.WriteLine("  attractor artifact lineage --dir <run> [artifact-id-or-logical-path-or-version-id] [--json]");
+    Console.WriteLine("  attractor artifact promote --dir <run> <artifact-id-or-logical-path> <artifact-version-id> --reason <text> [--actor <name>] [--source <label>]");
+    Console.WriteLine("  attractor artifact rollback --dir <run> <artifact-id-or-logical-path> [artifact-version-id] --reason <text> [--actor <name>] [--source <label>]");
     return 0;
 }
 

@@ -115,6 +115,7 @@ public class ParallelHandler : INodeHandler
         }
 
         var parallelResults = new List<Dictionary<string, object?>>();
+        var successfulCount = 0;
         var allSuccess = true;
         var anyFail = false;
         var notes = new List<string>();
@@ -140,7 +141,9 @@ public class ParallelHandler : INodeHandler
 
             parallelResults.Add(resultPayload);
 
-            if (result.CombinedStatus != OutcomeStatus.Success)
+            if (IsJoinSuccess(result.CombinedStatus))
+                successfulCount++;
+            else
                 allSuccess = false;
             if (result.CombinedStatus == OutcomeStatus.Fail)
                 anyFail = true;
@@ -150,7 +153,8 @@ public class ParallelHandler : INodeHandler
 
         var contextUpdates = new Dictionary<string, string>
         {
-            ["parallel.results"] = JsonSerializer.Serialize(parallelResults)
+            ["parallel.results"] = JsonSerializer.Serialize(parallelResults),
+            ["parallel.success_count"] = successfulCount.ToString()
         };
         if (queueMode)
             contextUpdates["parallel.queue.count"] = results.Length.ToString();
@@ -159,10 +163,33 @@ public class ParallelHandler : INodeHandler
         if (!string.IsNullOrWhiteSpace(nextNodeId))
             contextUpdates["parallel.next_node"] = nextNodeId!;
 
+        var kOfNThreshold = ResolveKOfNThreshold(node, results.Length);
+        if (joinPolicy.Equals("k_of_n", StringComparison.OrdinalIgnoreCase))
+        {
+            if (kOfNThreshold is null)
+            {
+                return new Outcome(
+                    OutcomeStatus.Fail,
+                    ContextUpdates: contextUpdates,
+                    Notes: $"Parallel node '{node.Id}' requires join_k or k when join_policy=k_of_n.");
+            }
+
+            if (kOfNThreshold < 1 || kOfNThreshold > results.Length)
+            {
+                return new Outcome(
+                    OutcomeStatus.Fail,
+                    ContextUpdates: contextUpdates,
+                    Notes: $"Parallel node '{node.Id}' configured k_of_n={kOfNThreshold}, but branch count is {results.Length}.");
+            }
+
+            contextUpdates["parallel.required_successes"] = kOfNThreshold.Value.ToString();
+        }
+
         var combinedStatus = joinPolicy switch
         {
-            "first_success" => results.Any(result => result.CombinedStatus == OutcomeStatus.Success) ? OutcomeStatus.Success : OutcomeStatus.Fail,
-            "quorum" => results.Count(result => result.CombinedStatus == OutcomeStatus.Success) > results.Length / 2 ? OutcomeStatus.Success : OutcomeStatus.Fail,
+            "first_success" => successfulCount > 0 ? OutcomeStatus.Success : OutcomeStatus.Fail,
+            "quorum" => successfulCount > results.Length / 2 ? OutcomeStatus.Success : OutcomeStatus.Fail,
+            "k_of_n" => successfulCount >= kOfNThreshold ? OutcomeStatus.Success : OutcomeStatus.Fail,
             _ => allSuccess ? OutcomeStatus.Success : anyFail ? OutcomeStatus.Fail : OutcomeStatus.PartialSuccess
         };
 
@@ -173,6 +200,30 @@ public class ParallelHandler : INodeHandler
             Status: combinedStatus,
             ContextUpdates: contextUpdates,
             Notes: $"Parallel node '{node.Id}' completed ({joinPolicy}): {string.Join(", ", notes)}");
+    }
+
+    private static bool IsJoinSuccess(OutcomeStatus status) =>
+        status is OutcomeStatus.Success or OutcomeStatus.PartialSuccess;
+
+    private static int? ResolveKOfNThreshold(GraphNode node, int branchCount)
+    {
+        if (node.RawAttributes.TryGetValue("join_k", out var joinKRaw) && int.TryParse(joinKRaw, out var joinK))
+            return joinK;
+
+        if (node.RawAttributes.TryGetValue("k", out var kRaw) && int.TryParse(kRaw, out var k))
+            return k;
+
+        var joinPolicy = node.RawAttributes.GetValueOrDefault("join_policy", string.Empty);
+        if (joinPolicy.StartsWith("k_of_n:", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(joinPolicy["k_of_n:".Length..], out var inlineK))
+        {
+            return inlineK;
+        }
+
+        if (joinPolicy.Equals("quorum", StringComparison.OrdinalIgnoreCase) && branchCount > 0)
+            return branchCount / 2 + 1;
+
+        return null;
     }
 
     private record BranchResult(

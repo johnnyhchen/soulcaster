@@ -1,5 +1,7 @@
 namespace Soulcaster.Attractor.Validation;
 
+using Soulcaster.UnifiedLlm;
+
 public enum LintSeverity { Error, Warning }
 
 public record LintResult(string Rule, LintSeverity Severity, string? NodeId, string? EdgeId, string Message);
@@ -22,6 +24,13 @@ public static class Validator
         ValidateParallelWithoutFanIn(graph, results);
         ValidateQueueParallelNodes(graph, results);
         ValidateGoalGateWithoutRetryTarget(graph, results);
+        ValidateParallelJoinPolicies(graph, results);
+        ValidateExecutionLanes(graph, results);
+        ValidateHumanGateChoices(graph, results);
+        ValidateForceAdvanceTargets(graph, results);
+        ValidateRoutingModelReferences(graph, results);
+        ValidateImageOutputLanes(graph, results);
+        ValidateAttachmentAuthoring(graph, results);
 
         return results;
     }
@@ -307,4 +316,406 @@ public static class Validator
             }
         }
     }
+
+    private static void ValidateParallelJoinPolicies(Graph graph, List<LintResult> results)
+    {
+        foreach (var node in graph.Nodes.Values.Where(n => n.Shape.Equals("component", StringComparison.OrdinalIgnoreCase)))
+        {
+            var joinPolicy = node.RawAttributes.GetValueOrDefault("join_policy", "wait_all").Trim();
+            if (string.IsNullOrWhiteSpace(joinPolicy))
+                joinPolicy = "wait_all";
+
+            var branchCount = graph.Edges.Count(edge => edge.FromNode == node.Id);
+            var normalized = joinPolicy.ToLowerInvariant();
+            var inlineThreshold = default(int?);
+            if (normalized.StartsWith("k_of_n:", StringComparison.Ordinal))
+            {
+                inlineThreshold = int.TryParse(normalized["k_of_n:".Length..], out var parsedInline)
+                    ? parsedInline
+                    : null;
+                normalized = "k_of_n";
+            }
+
+            if (normalized is not ("wait_all" or "first_success" or "quorum" or "k_of_n"))
+            {
+                results.Add(new LintResult(
+                    "parallel_join_policy",
+                    LintSeverity.Error,
+                    node.Id,
+                    null,
+                    $"Parallel node '{node.Id}' uses unknown join_policy '{joinPolicy}'."));
+                continue;
+            }
+
+            if (normalized != "k_of_n")
+                continue;
+
+            var threshold = inlineThreshold
+                ?? ParseInt(node.RawAttributes.GetValueOrDefault("join_k"))
+                ?? ParseInt(node.RawAttributes.GetValueOrDefault("k"));
+            if (threshold is null)
+            {
+                results.Add(new LintResult(
+                    "parallel_join_policy",
+                    LintSeverity.Error,
+                    node.Id,
+                    null,
+                    $"Parallel node '{node.Id}' requires join_k or k when join_policy=k_of_n."));
+                continue;
+            }
+
+            if (threshold < 1 || threshold > branchCount)
+            {
+                results.Add(new LintResult(
+                    "parallel_join_policy",
+                    LintSeverity.Error,
+                    node.Id,
+                    null,
+                    $"Parallel node '{node.Id}' configured k_of_n={threshold}, but branch count is {branchCount}."));
+            }
+        }
+    }
+
+    private static void ValidateExecutionLanes(Graph graph, List<LintResult> results)
+    {
+        foreach (var node in graph.Nodes.Values.Where(n => n.Shape.Equals("box", StringComparison.OrdinalIgnoreCase)))
+        {
+            var lane = ResolveExecutionLane(node, graph);
+            if (lane is "agent" or "leaf" or "multimodal_leaf")
+                continue;
+
+            results.Add(new LintResult(
+                "execution_lane",
+                LintSeverity.Error,
+                node.Id,
+                null,
+                $"Node '{node.Id}' uses unknown execution lane '{lane}'."));
+        }
+    }
+
+    private static void ValidateHumanGateChoices(Graph graph, List<LintResult> results)
+    {
+        foreach (var gate in graph.Nodes.Values.Where(n => n.Shape.Equals("hexagon", StringComparison.OrdinalIgnoreCase)))
+        {
+            var outgoing = graph.Edges.Where(edge => edge.FromNode == gate.Id).ToList();
+            var labels = outgoing
+                .Select(edge => edge.Label?.Trim())
+                .Where(label => !string.IsNullOrWhiteSpace(label))
+                .Cast<string>()
+                .ToList();
+
+            if (labels.Count == 0)
+            {
+                results.Add(new LintResult(
+                    "wait_human_choices",
+                    LintSeverity.Warning,
+                    gate.Id,
+                    null,
+                    $"Human gate '{gate.Id}' should use labelled outgoing edges so choices are explicit."));
+                continue;
+            }
+
+            var duplicates = labels
+                .GroupBy(label => label, StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1)
+                .Select(group => group.Key)
+                .ToList();
+            if (duplicates.Count > 0)
+            {
+                results.Add(new LintResult(
+                    "wait_human_choices",
+                    LintSeverity.Warning,
+                    gate.Id,
+                    null,
+                    $"Human gate '{gate.Id}' has duplicate choice labels: {string.Join(", ", duplicates)}."));
+            }
+        }
+    }
+
+    private static void ValidateForceAdvanceTargets(Graph graph, List<LintResult> results)
+    {
+        if (!graph.Attributes.TryGetValue("force_advance_targets", out var rawTargets) || string.IsNullOrWhiteSpace(rawTargets))
+            return;
+
+        foreach (var target in ParseCsv(rawTargets))
+        {
+            if (!graph.Nodes.TryGetValue(target, out var node))
+            {
+                results.Add(new LintResult(
+                    "force_advance_targets",
+                    LintSeverity.Error,
+                    null,
+                    null,
+                    $"force_advance_targets references unknown node '{target}'."));
+                continue;
+            }
+
+            if (node.Shape.Equals("Mdiamond", StringComparison.OrdinalIgnoreCase))
+            {
+                results.Add(new LintResult(
+                    "force_advance_targets",
+                    LintSeverity.Error,
+                    target,
+                    null,
+                    "force_advance_targets must not include the start node."));
+            }
+        }
+    }
+
+    private static void ValidateRoutingModelReferences(Graph graph, List<LintResult> results)
+    {
+        ValidateModelReferenceSet(
+            graph.Attributes,
+            "graph",
+            results);
+
+        foreach (var node in graph.Nodes.Values)
+            ValidateModelReferenceSet(node.RawAttributes, node.Id, results);
+    }
+
+    private static void ValidateModelReferenceSet(
+        IReadOnlyDictionary<string, string> attributes,
+        string location,
+        List<LintResult> results)
+    {
+        foreach (var (key, value) in attributes)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Contains('$', StringComparison.Ordinal))
+                continue;
+
+            if (key.Equals("model", StringComparison.OrdinalIgnoreCase) ||
+                key.EndsWith("_preferred_model", StringComparison.OrdinalIgnoreCase) ||
+                key.Equals("preferred_model", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ModelCatalog.GetModelInfo(value) is null)
+                {
+                    results.Add(new LintResult(
+                        "routing_model_reference",
+                        LintSeverity.Warning,
+                        location == "graph" ? null : location,
+                        null,
+                        $"Model reference '{value}' in '{key}' is not in the local catalog or registry snapshot."));
+                }
+            }
+
+            if (!key.EndsWith("_fallback_models", StringComparison.OrdinalIgnoreCase) &&
+                !key.Equals("fallback_models", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            foreach (var modelId in ParseCsv(value))
+            {
+                if (ModelCatalog.GetModelInfo(modelId) is null)
+                {
+                    results.Add(new LintResult(
+                        "routing_model_reference",
+                        LintSeverity.Warning,
+                        location == "graph" ? null : location,
+                        null,
+                        $"Fallback model '{modelId}' in '{key}' is not in the local catalog or registry snapshot."));
+                }
+            }
+        }
+    }
+
+    private static void ValidateImageOutputLanes(Graph graph, List<LintResult> results)
+    {
+        foreach (var node in graph.Nodes.Values.Where(n => n.Shape.Equals("box", StringComparison.OrdinalIgnoreCase)))
+        {
+            var outputModalities = ResolveOutputModalities(node, graph);
+            if (!outputModalities.Contains("image", StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            var lane = ResolveExecutionLane(node, graph);
+            if (lane.Equals("multimodal_leaf", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            results.Add(new LintResult(
+                "image_output_lane",
+                LintSeverity.Warning,
+                node.Id,
+                null,
+                $"Node '{node.Id}' requests image output but execution_lane='{lane}'. Prefer execution_lane=multimodal_leaf."));
+        }
+    }
+
+    private static void ValidateAttachmentAuthoring(Graph graph, List<LintResult> results)
+    {
+        foreach (var node in graph.Nodes.Values.Where(n => n.Shape.Equals("box", StringComparison.OrdinalIgnoreCase)))
+        {
+            var lane = ResolveExecutionLane(node, graph);
+            ValidateDeclaredAttachments(graph, results, node, lane, "image", ResolveInputImages(node, graph));
+            ValidateDeclaredAttachments(graph, results, node, lane, "document", ResolveInputDocuments(node, graph));
+            ValidateDeclaredAttachments(graph, results, node, lane, "audio", ResolveInputAudio(node, graph));
+        }
+    }
+
+    private static void ValidateDeclaredAttachments(
+        Graph graph,
+        List<LintResult> results,
+        GraphNode node,
+        string lane,
+        string attachmentKind,
+        IReadOnlyList<string> attachments)
+    {
+        if (attachments.Count == 0)
+            return;
+
+        var recommendedLane = attachmentKind == "image" ? "multimodal_leaf" : "leaf";
+        var laneAllowed = attachmentKind == "image"
+            ? lane.Equals("multimodal_leaf", StringComparison.OrdinalIgnoreCase)
+            : lane.Equals("leaf", StringComparison.OrdinalIgnoreCase) || lane.Equals("multimodal_leaf", StringComparison.OrdinalIgnoreCase);
+        if (!laneAllowed)
+        {
+            var attributeLabel = attachmentKind switch
+            {
+                "image" => "input_images",
+                "document" => "input_documents",
+                "audio" => "input_audio",
+                _ => $"input_{attachmentKind}"
+            };
+            results.Add(new LintResult(
+                $"input_{attachmentKind}_lane",
+                LintSeverity.Warning,
+                node.Id,
+                null,
+                $"Node '{node.Id}' declares {attributeLabel} but execution_lane='{lane}'. Prefer execution_lane={recommendedLane}."));
+        }
+
+        foreach (var rawPath in attachments)
+        {
+            if (LooksLikeRemoteUri(rawPath))
+            {
+                results.Add(new LintResult(
+                    $"input_{attachmentKind}_remote",
+                    LintSeverity.Warning,
+                    node.Id,
+                    null,
+                    $"Node '{node.Id}' references remote input {attachmentKind} '{rawPath}'. The current runner expects local file paths."));
+                continue;
+            }
+
+            var resolvedPath = ResolveInputPath(rawPath, graph);
+            if (IsDeferredArtifactPath(rawPath))
+                continue;
+
+            if (!File.Exists(resolvedPath))
+            {
+                results.Add(new LintResult(
+                    $"input_{attachmentKind}_missing",
+                    LintSeverity.Warning,
+                    node.Id,
+                    null,
+                    $"Node '{node.Id}' references input {attachmentKind} '{rawPath}', but '{resolvedPath}' does not exist."));
+            }
+        }
+    }
+
+    private static string ResolveExecutionLane(GraphNode node, Graph graph)
+    {
+        if (node.RawAttributes.TryGetValue("execution_lane", out var nodeLane) && !string.IsNullOrWhiteSpace(nodeLane))
+            return nodeLane.Trim().ToLowerInvariant();
+        if (node.RawAttributes.TryGetValue("lane", out var shortLane) && !string.IsNullOrWhiteSpace(shortLane))
+            return shortLane.Trim().ToLowerInvariant();
+        if (graph.Attributes.TryGetValue("execution_lane", out var graphLane) && !string.IsNullOrWhiteSpace(graphLane))
+            return graphLane.Trim().ToLowerInvariant();
+        if (graph.Attributes.TryGetValue("default_execution_lane", out var defaultLane) && !string.IsNullOrWhiteSpace(defaultLane))
+            return defaultLane.Trim().ToLowerInvariant();
+        return "agent";
+    }
+
+    private static IReadOnlyList<string> ResolveOutputModalities(GraphNode node, Graph graph)
+    {
+        if (node.RawAttributes.TryGetValue("output_modalities", out var nodeValue) && !string.IsNullOrWhiteSpace(nodeValue))
+            return ParseCsv(nodeValue);
+        if (graph.Attributes.TryGetValue("output_modalities", out var graphValue) && !string.IsNullOrWhiteSpace(graphValue))
+            return ParseCsv(graphValue);
+        if (graph.Attributes.TryGetValue("default_output_modalities", out var defaultValue) && !string.IsNullOrWhiteSpace(defaultValue))
+            return ParseCsv(defaultValue);
+        return Array.Empty<string>();
+    }
+
+    private static IReadOnlyList<string> ResolveInputImages(GraphNode node, Graph graph)
+    {
+        return ResolveAttachmentList(node, graph, "input_images", "input_image_paths", "default_input_images");
+    }
+
+    private static IReadOnlyList<string> ResolveInputDocuments(GraphNode node, Graph graph)
+    {
+        return ResolveAttachmentList(node, graph, "input_documents", "input_document_paths", "default_input_documents");
+    }
+
+    private static IReadOnlyList<string> ResolveInputAudio(GraphNode node, Graph graph)
+    {
+        return ResolveAttachmentList(node, graph, "input_audio", "input_audio_paths", "default_input_audio");
+    }
+
+    private static IReadOnlyList<string> ResolveAttachmentList(GraphNode node, Graph graph, string primaryKey, string aliasKey, string defaultKey)
+    {
+        if (node.RawAttributes.TryGetValue(primaryKey, out var nodeValue) && !string.IsNullOrWhiteSpace(nodeValue))
+            return ParseCsv(nodeValue);
+        if (node.RawAttributes.TryGetValue(aliasKey, out var nodeAliasValue) && !string.IsNullOrWhiteSpace(nodeAliasValue))
+            return ParseCsv(nodeAliasValue);
+        if (graph.Attributes.TryGetValue(primaryKey, out var graphValue) && !string.IsNullOrWhiteSpace(graphValue))
+            return ParseCsv(graphValue);
+        if (graph.Attributes.TryGetValue(defaultKey, out var defaultValue) && !string.IsNullOrWhiteSpace(defaultValue))
+            return ParseCsv(defaultValue);
+        return Array.Empty<string>();
+    }
+
+    private static string ResolveInputPath(string rawPath, Graph graph)
+    {
+        if (string.IsNullOrWhiteSpace(rawPath))
+            return rawPath;
+
+        var expandedPath = VariableExpander.Expand(rawPath, graph.Attributes, contextValues: null, goal: graph.Goal);
+
+        if (Path.IsPathRooted(expandedPath))
+            return Path.GetFullPath(expandedPath);
+
+        var sourcePath = graph.Attributes.TryGetValue("source_path", out var sourcePathValue) &&
+                         !string.IsNullOrWhiteSpace(sourcePathValue)
+            ? sourcePathValue
+            : null;
+        var sourceDirectory = !string.IsNullOrWhiteSpace(sourcePath)
+            ? Path.GetDirectoryName(Path.GetFullPath(sourcePath)) ?? Directory.GetCurrentDirectory()
+            : Directory.GetCurrentDirectory();
+
+        var outputRoot = graph.Attributes.TryGetValue("output_root", out var outputRootValue) &&
+                         !string.IsNullOrWhiteSpace(outputRootValue)
+            ? Path.GetFullPath(outputRootValue)
+            : sourceDirectory;
+
+        var sourceCandidate = Path.GetFullPath(Path.Combine(sourceDirectory, expandedPath));
+        if (File.Exists(sourceCandidate))
+            return sourceCandidate;
+
+        var outputCandidate = Path.GetFullPath(Path.Combine(outputRoot, expandedPath));
+        if (File.Exists(outputCandidate))
+            return outputCandidate;
+
+        return sourceCandidate;
+    }
+
+    private static bool LooksLikeRemoteUri(string rawPath) =>
+        Uri.TryCreate(rawPath, UriKind.Absolute, out var uri) &&
+        (uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ||
+         uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsDeferredArtifactPath(string rawPath)
+    {
+        var normalized = rawPath.Replace('\\', '/');
+        return normalized.StartsWith("logs/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("gates/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<string> ParseCsv(string raw) =>
+        raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private static int? ParseInt(string? raw) =>
+        int.TryParse(raw, out var parsed) ? parsed : null;
 }

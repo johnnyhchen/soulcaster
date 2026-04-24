@@ -766,4 +766,141 @@ public class BuilderEditorWorkflowTests
         Assert.Contains("review [box]", summary);
         Assert.Contains("start -> review", summary);
     }
+
+    [Fact]
+    public void BuilderCommandSupport_CreateTemplate_CodingLoopSeedsDurableControlPolicy()
+    {
+        var graph = BuilderCommandSupport.CreateTemplate("coding-loop", "coding_loop", "Ship the change");
+
+        Assert.Equal("coding_loop", graph.Name);
+        Assert.Equal("false", graph.Attributes["allow_force_advance"]);
+        Assert.Equal("1", graph.Attributes["operator_retry_stage_budget"]);
+        Assert.Contains("review_plan", graph.Nodes.Keys);
+        Assert.Contains(graph.Nodes.Values, node => node.Shape == "hexagon");
+    }
+
+    [Fact]
+    public void BuilderCommandSupport_BuildPreview_IncludesControlPolicyAndOutputModalities()
+    {
+        var graph = BuilderCommandSupport.InitializeGraph("workflow", "Preview the workflow");
+        graph.Attributes["allow_force_advance"] = "false";
+        graph.Attributes["operator_retry_budget"] = "2";
+        BuilderCommandSupport.UpsertNode(graph, "draft", new Dictionary<string, string>
+        {
+            ["shape"] = "box",
+            ["prompt"] = "Draft the visual.",
+            ["execution_lane"] = "multimodal_leaf",
+            ["output_modalities"] = "text,image"
+        });
+        BuilderCommandSupport.UpsertEdge(graph, "start", "draft", new Dictionary<string, string>());
+        BuilderCommandSupport.UpsertEdge(graph, "draft", "done", new Dictionary<string, string>());
+
+        var preview = BuilderCommandSupport.BuildPreview(graph, "/tmp/workflow.dot");
+
+        var controlPolicy = Assert.IsType<Dictionary<string, object?>>(preview["control_policy"]);
+        Assert.Equal(false, controlPolicy["allow_force_advance"]);
+        Assert.Equal(2, controlPolicy["operator_retry_budget"]);
+
+        var nodes = Assert.IsAssignableFrom<IEnumerable<object?>>(preview["nodes"]);
+        var draft = nodes
+            .OfType<Dictionary<string, object?>>()
+            .Single(node => string.Equals(node["id"]?.ToString(), "draft", StringComparison.Ordinal));
+        Assert.Equal("multimodal_leaf", draft["execution_lane"]);
+        var outputModalities = Assert.IsAssignableFrom<IEnumerable<string>>(draft["output_modalities"]);
+        Assert.Contains("image", outputModalities);
+    }
+
+    [Fact]
+    public void BuilderCommandSupport_CreateTemplate_MultimodalEditLoop_SeedsReferenceImagePreview()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc-builder-preview-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var referenceImagePath = Path.Combine(tempDir, "reference.png");
+            File.WriteAllBytes(referenceImagePath, Convert.FromBase64String(UnifiedLlmTestAssets.TestImageBase64));
+
+            var graph = BuilderCommandSupport.CreateTemplate(
+                "multimodal-edit-loop",
+                "visual_loop",
+                "Polish the supplied artwork.",
+                referenceImagePath);
+
+            Assert.Equal(referenceImagePath, graph.Attributes["reference_image"]);
+            Assert.Equal("multimodal_leaf", graph.Nodes["generate"].RawAttributes["execution_lane"]);
+            Assert.Equal("$reference_image", graph.Nodes["generate"].RawAttributes["input_images"]);
+
+            graph.Attributes["source_path"] = Path.Combine(tempDir, "workflow.dot");
+            graph.Attributes["output_root"] = tempDir;
+            var preview = BuilderCommandSupport.BuildPreview(
+                BuilderCommandSupport.ApplyStandardTransforms(graph),
+                Path.Combine(tempDir, "workflow.dot"));
+            var nodes = Assert.IsAssignableFrom<IEnumerable<object?>>(preview["nodes"]);
+            var generate = nodes
+                .OfType<Dictionary<string, object?>>()
+                .Single(node => string.Equals(node["id"]?.ToString(), "generate", StringComparison.Ordinal));
+
+            var resolvedInputImages = Assert.IsAssignableFrom<IEnumerable<object?>>(generate["resolved_input_images"]);
+            var imagePreview = resolvedInputImages
+                .OfType<Dictionary<string, object?>>()
+                .Single();
+
+            Assert.Equal(referenceImagePath, imagePreview["resolved_path"]?.ToString());
+            Assert.Equal(true, imagePreview["exists"]);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void BuilderCommandSupport_CreateTemplate_DocumentCritiqueLoop_SeedsReferenceDocumentPreview()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc-builder-doc-preview-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var referenceDocumentPath = Path.Combine(tempDir, "brief.md");
+            File.WriteAllText(referenceDocumentPath, "# Brief\n\nShip the critique.");
+
+            var graph = BuilderCommandSupport.CreateTemplate(
+                "document-critique-loop",
+                "document_loop",
+                "Review the supplied brief.",
+                referenceImage: null,
+                referenceDocument: referenceDocumentPath);
+
+            Assert.Equal(referenceDocumentPath, graph.Attributes["reference_document"]);
+            Assert.Equal("leaf", graph.Nodes["review_document"].RawAttributes["execution_lane"]);
+            Assert.Equal("$reference_document", graph.Nodes["review_document"].RawAttributes["input_documents"]);
+
+            graph.Attributes["source_path"] = Path.Combine(tempDir, "workflow.dot");
+            graph.Attributes["output_root"] = tempDir;
+            var preview = BuilderCommandSupport.BuildPreview(
+                BuilderCommandSupport.ApplyStandardTransforms(graph),
+                Path.Combine(tempDir, "workflow.dot"));
+            var nodes = Assert.IsAssignableFrom<IEnumerable<object?>>(preview["nodes"]);
+            var review = nodes
+                .OfType<Dictionary<string, object?>>()
+                .Single(node => string.Equals(node["id"]?.ToString(), "review_document", StringComparison.Ordinal));
+
+            var resolvedDocuments = Assert.IsAssignableFrom<IEnumerable<object?>>(review["resolved_input_documents"]);
+            var documentPreview = resolvedDocuments
+                .OfType<Dictionary<string, object?>>()
+                .Single();
+
+            Assert.Equal(referenceDocumentPath, documentPreview["resolved_path"]?.ToString());
+            Assert.Equal(true, documentPreview["exists"]);
+            Assert.Equal("text/markdown", documentPreview["media_type"]?.ToString());
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
 }

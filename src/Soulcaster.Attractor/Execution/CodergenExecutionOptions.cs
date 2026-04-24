@@ -2,6 +2,8 @@ namespace Soulcaster.Attractor.Execution;
 
 using System.Globalization;
 using System.Text.RegularExpressions;
+using Soulcaster.UnifiedLlm;
+using Soulcaster.UnifiedLlm.Models;
 
 public sealed record CodergenExecutionOptions(
     string? StageClass = null,
@@ -9,6 +11,18 @@ public sealed record CodergenExecutionOptions(
     bool RequireEdits = false,
     bool RequireVerification = false,
     bool AllowContractFallback = true,
+    string ExecutionLane = "agent",
+    bool DisableToolInjection = false,
+    bool RequireVision = false,
+    decimal? MaxInputCostPerMillion = null,
+    decimal? MaxOutputCostPerMillion = null,
+    long? MaxExpectedLatencyMs = null,
+    IReadOnlyList<ResponseModality>? OutputModalities = null,
+    IReadOnlyList<string>? InputImagePaths = null,
+    IReadOnlyList<string>? InputDocumentPaths = null,
+    IReadOnlyList<string>? InputAudioPaths = null,
+    string? PreferredModel = null,
+    IReadOnlyList<string>? FallbackModels = null,
     string? CodergenVersion = null,
     RuntimeValidationPolicy? Validation = null)
 {

@@ -34,6 +34,7 @@ internal static class ProcessRunHarness
     public static async Task<ProcessRunResult> RunRunnerAsync(
         string[] runnerArgs,
         string workingDirectory,
+        IReadOnlyDictionary<string, string?>? environment = null,
         TimeSpan? completionTimeout = null,
         CancellationToken ct = default)
     {
@@ -52,6 +53,17 @@ internal static class ProcessRunHarness
         psi.ArgumentList.Add("--");
         foreach (var arg in runnerArgs)
             psi.ArgumentList.Add(arg);
+
+        if (environment is not null)
+        {
+            foreach (var (key, value) in environment)
+            {
+                if (value is null)
+                    psi.Environment.Remove(key);
+                else
+                    psi.Environment[key] = value;
+            }
+        }
 
         using var process = new Process { StartInfo = psi };
         process.Start();
@@ -124,6 +136,55 @@ internal static class ProcessRunHarness
         }
 
         throw new TimeoutException($"Timed out waiting for '{resultPath}'.");
+    }
+
+    public static async Task<string> WaitForPendingGateAsync(string workingDirectory, TimeSpan timeout, CancellationToken ct)
+    {
+        var pendingPath = Path.Combine(workingDirectory, "gates", "pending");
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (File.Exists(pendingPath))
+            {
+                var gateId = (await File.ReadAllTextAsync(pendingPath, ct)).Trim();
+                if (!string.IsNullOrWhiteSpace(gateId))
+                    return gateId;
+            }
+
+            await Task.Delay(200, ct);
+        }
+
+        throw new TimeoutException($"Timed out waiting for pending gate in '{workingDirectory}'.");
+    }
+
+    public static async Task WaitForResultStatusAsync(string resultPath, string expectedStatus, TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (File.Exists(resultPath))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(await File.ReadAllTextAsync(resultPath, ct));
+                    var status = document.RootElement.TryGetProperty("status", out var statusElement)
+                        ? statusElement.GetString()
+                        : null;
+                    if (string.Equals(status, expectedStatus, StringComparison.OrdinalIgnoreCase))
+                        return;
+                }
+                catch
+                {
+                    // Keep polling until the file is stable.
+                }
+            }
+
+            await Task.Delay(200, ct);
+        }
+
+        throw new TimeoutException($"Timed out waiting for result status '{expectedStatus}' in '{resultPath}'.");
     }
 
     public static Dictionary<string, object?> ReadJsonObject(string path)

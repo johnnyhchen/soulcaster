@@ -1,0 +1,34 @@
+digraph G {
+    goal = "Review a source document, critique it, and iterate through a human approval gate."
+    allow_force_advance = "false"
+    operator_retry_stage_budget = "1"
+    reference_document = ""
+
+    start [shape=Mdiamond, label="Start"]
+    review_document [
+        shape=box,
+        label="Review Document",
+        provider="gemini",
+        model="gemini-2.5-pro",
+        execution_lane="leaf",
+        input_documents="$reference_document",
+        prompt="Read the attached document and return valid stage status JSON with the strongest critique or summary."
+    ]
+    review_gate [shape=hexagon, label="Approve Critique"]
+    revise_document [
+        shape=box,
+        label="Revise Critique",
+        provider="gemini",
+        model="gemini-2.5-pro",
+        execution_lane="leaf",
+        input_documents="$reference_document",
+        prompt="Use the attached document plus steering to revise the critique and return valid stage status JSON."
+    ]
+    done [shape=Msquare, label="Done"]
+
+    start -> review_document
+    review_document -> review_gate
+    review_gate -> done [label="approve"]
+    review_gate -> revise_document [label="revise"]
+    revise_document -> done
+}

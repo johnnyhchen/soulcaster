@@ -104,6 +104,7 @@ public class PipelineEngine
         while (true)
         {
             ct.ThrowIfCancellationRequested();
+            RunControl.ThrowIfCancellationRequested(_config.LogsRoot);
 
             if (!graph.Nodes.TryGetValue(currentNodeId, out var currentNode))
             {
@@ -245,6 +246,10 @@ public class PipelineEngine
             try
             {
                 outcome = await ExecuteWithTimeoutAsync(handler, currentNode, context, graph, ct);
+            }
+            catch (RunCancelledException)
+            {
+                throw;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -743,22 +748,7 @@ public class PipelineEngine
 
     private async Task WriteTelemetryEventAsync(string eventType, string nodeId, Dictionary<string, object?> data, CancellationToken ct)
     {
-        try
-        {
-            var path = Path.Combine(_config.LogsRoot, "events.jsonl");
-            var payload = new Dictionary<string, object?>(data)
-            {
-                ["event_type"] = eventType,
-                ["node_id"] = nodeId,
-                ["timestamp_utc"] = DateTimeOffset.UtcNow.ToString("o")
-            };
-            var line = JsonSerializer.Serialize(payload);
-            await File.AppendAllTextAsync(path, line + Environment.NewLine, ct);
-        }
-        catch
-        {
-            // Non-critical: telemetry must not fail pipeline execution.
-        }
+        await WorkflowEventLog.AppendAsync(_config.LogsRoot, eventType, nodeId, data, ct);
     }
 
     private static void MergeTelemetry(Dictionary<string, object?> target, Dictionary<string, object?>? telemetry)

@@ -17,6 +17,7 @@ public class WaitHumanHandler : INodeHandler
             .Where(e => !string.IsNullOrWhiteSpace(e.Label))
             .Select(e => e.Label)
             .ToList();
+        var defaultChoice = node.RawAttributes.GetValueOrDefault("human.default_choice", "");
 
         string questionText = !string.IsNullOrWhiteSpace(node.Label) ? node.Label : $"Choose next step for '{node.Id}':";
 
@@ -30,12 +31,24 @@ public class WaitHumanHandler : INodeHandler
             question = new InterviewQuestion(questionText, QuestionType.FreeText, new List<string>());
         }
 
+        question = question with
+        {
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["node_id"] = node.Id,
+                ["shape"] = node.Shape,
+                ["graph_name"] = graph.Name
+            }
+        };
+
+        if (!string.IsNullOrWhiteSpace(defaultChoice))
+            question.Metadata["default_choice"] = defaultChoice;
+
         var answer = await _interviewer.AskAsync(question, ct);
 
         // Handle timeout — check for default choice or return retry
         if (answer.Status == AnswerStatus.Timeout)
         {
-            var defaultChoice = node.RawAttributes.GetValueOrDefault("human.default_choice", "");
             if (!string.IsNullOrWhiteSpace(defaultChoice))
             {
                 return new Outcome(

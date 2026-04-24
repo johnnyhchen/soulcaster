@@ -1,0 +1,30 @@
+digraph G {
+    goal = "Generate and refine a visual draft from an optional reference image."
+    reference_image = ""
+    allow_force_advance = "false"
+    operator_retry_stage_budget = "1"
+
+    start [shape=Mdiamond, label="Start"]
+    generate [shape=box, label="Generate Draft",
+        provider="openai", model="gpt-5.4",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        thread_id="multimodal-thread",
+        input_images="$reference_image",
+        prompt="Use the attached reference image when present. Produce a first-pass visual draft and return valid stage status JSON."]
+    review_visual [shape=hexagon, label="Review Visual"]
+    refine [shape=box, label="Refine Visual",
+        provider="openai", model="gpt-5.4",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        thread_id="multimodal-thread",
+        input_images="logs/generate/generated/image-1.png,$reference_image",
+        prompt="Refine the approved visual direction over the shared multimodal thread and return valid stage status JSON."]
+    done [shape=Msquare, label="Done"]
+
+    start -> generate
+    generate -> review_visual
+    review_visual -> refine [label="approve"]
+    review_visual -> generate [label="revise"]
+    refine -> done
+}

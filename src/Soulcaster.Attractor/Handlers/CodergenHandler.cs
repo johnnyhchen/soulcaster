@@ -3,6 +3,9 @@ namespace Soulcaster.Attractor.Handlers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Soulcaster.UnifiedLlm;
+using Soulcaster.UnifiedLlm.Errors;
+using Soulcaster.UnifiedLlm.Models;
 
 public interface ICodergenBackend
 {
@@ -24,7 +27,13 @@ public record CodergenResult(
     StageStatusContract? StageStatus = null,
     string? RawAssistantResponse = null,
     Dictionary<string, object?>? Telemetry = null,
-    Dictionary<string, string>? Artifacts = null);
+    Dictionary<string, string>? Artifacts = null,
+    IReadOnlyList<CodergenBinaryArtifact>? BinaryArtifacts = null);
+
+public sealed record CodergenBinaryArtifact(
+    string RelativePath,
+    byte[] Content,
+    string? MediaType = null);
 
 public class CodergenHandler : INodeHandler
 {
@@ -39,7 +48,7 @@ public class CodergenHandler : INodeHandler
 
     public async Task<Outcome> ExecuteAsync(GraphNode node, PipelineContext context, Graph graph, string logsRoot, CancellationToken ct = default)
     {
-        var executionOptions = BuildExecutionOptions(node, graph);
+        var executionOptions = BuildExecutionOptions(node, graph, context, logsRoot);
 
         // Expand variables before adding runtime contract instructions.
         var expandedPrompt = ExpandVariables(node.Prompt, context, graph);
@@ -49,6 +58,7 @@ public class CodergenHandler : INodeHandler
         // Create stage directory and write prompt.
         var stageDir = RuntimeStageResolver.ResolveStageDir(logsRoot, context, node.Id);
         Directory.CreateDirectory(stageDir);
+        ArchiveCurrentStageArtifacts(stageDir);
         var artifactPaths = BuildArtifactPaths(stageDir);
 
         var outgoingEdges = graph.OutgoingEdges(node.Id);
@@ -69,11 +79,13 @@ public class CodergenHandler : INodeHandler
         await WriteJsonArtifactAsync(artifactPaths.EffectivePolicyPath, BuildEffectivePolicy(executionOptions), ct);
 
         var statusPath = Path.Combine(stageDir, "status.json");
-        ArchivePreviousStatus(statusPath);
 
-        var model = !string.IsNullOrEmpty(node.LlmModel) ? node.LlmModel : null;
-        var provider = !string.IsNullOrEmpty(node.LlmProvider) ? node.LlmProvider : null;
+        var requestedModel = !string.IsNullOrEmpty(node.LlmModel) ? node.LlmModel : null;
+        var requestedProvider = !string.IsNullOrEmpty(node.LlmProvider) ? node.LlmProvider : null;
         var reasoningEffort = !string.IsNullOrEmpty(node.ReasoningEffort) ? node.ReasoningEffort : null;
+        var model = requestedModel;
+        var provider = requestedProvider;
+        Dictionary<string, object?>? routingTelemetry = null;
 
         CodergenResult result = new(
             Response: "No backend result produced.",
@@ -84,79 +96,96 @@ public class CodergenHandler : INodeHandler
         var attemptsUsed = 0;
 
         var attemptPrompt = expandedPrompt;
-        for (var attempt = 1; attempt <= MaxContractAttempts; attempt++)
+        if (!TryResolveCodergenSelection(
+                requestedProvider,
+                requestedModel,
+                reasoningEffort,
+                executionOptions,
+                out provider,
+                out model,
+                out routingTelemetry,
+                out var capabilityFailure))
         {
-            attemptsUsed = attempt;
-            try
-            {
-                result = await _backend.RunAsync(
-                    attemptPrompt,
-                    model,
-                    provider,
-                    reasoningEffort,
-                    ct: ct,
-                    options: executionOptions);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                result = new CodergenResult(
-                    Response: $"Error: {ex.Message}",
-                    Status: OutcomeStatus.Fail,
-                    StageStatus: new StageStatusContract(
-                        Status: OutcomeStatus.Fail,
-                        PreferredNextLabel: string.Empty,
-                        SuggestedNextIds: new List<string>(),
-                        ContextUpdates: new Dictionary<string, string>(),
-                        Notes: "Codergen backend threw an exception.",
-                        FailureReason: ex.Message),
-                    Telemetry: new Dictionary<string, object?>
-                    {
-                        ["provider_state"] = "error",
-                        ["failure_kind"] = "provider_error"
-                    });
-            }
-
-            await PersistAttemptArtifactsAsync(stageDir, attempt, result, ct);
-
+            result = capabilityFailure!;
             stageStatus = result.StageStatus;
-            if (stageStatus is null)
+            await PersistAttemptArtifactsAsync(stageDir, 1, result, ct);
+        }
+        else
+        {
+            for (var attempt = 1; attempt <= MaxContractAttempts; attempt++)
             {
-                stageStatus = await TryReadStageStatusArtifactAsync(statusPath, ct);
-            }
+                attemptsUsed = attempt;
+                try
+                {
+                    result = await _backend.RunAsync(
+                        attemptPrompt,
+                        model,
+                        provider,
+                        reasoningEffort,
+                        ct: ct,
+                        options: executionOptions);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    result = new CodergenResult(
+                        Response: $"Error: {ex.Message}",
+                        Status: OutcomeStatus.Fail,
+                        StageStatus: new StageStatusContract(
+                            Status: OutcomeStatus.Fail,
+                            PreferredNextLabel: string.Empty,
+                            SuggestedNextIds: new List<string>(),
+                            ContextUpdates: new Dictionary<string, string>(),
+                            Notes: "Codergen backend threw an exception.",
+                            FailureReason: ex.Message),
+                        Telemetry: new Dictionary<string, object?>
+                        {
+                            ["provider_state"] = "error",
+                            ["failure_kind"] = "provider_error"
+                        });
+                }
 
-            if (stageStatus is null)
-            {
-                var raw = result.RawAssistantResponse ?? result.Response;
-                if (!StageStatusContract.TryParseAssistantResponse(raw, out stageStatus, out contractError))
+                await PersistAttemptArtifactsAsync(stageDir, attempt, result, ct);
+
+                stageStatus = result.StageStatus;
+                if (stageStatus is null)
+                {
+                    stageStatus = await TryReadStageStatusArtifactAsync(statusPath, ct);
+                }
+
+                if (stageStatus is null)
+                {
+                    var raw = result.RawAssistantResponse ?? result.Response;
+                    if (!StageStatusContract.TryParseAssistantResponse(raw, out stageStatus, out contractError))
+                        stageStatus = null;
+                }
+
+                if (stageStatus is not null &&
+                    !TryValidatePreferredLabel(stageStatus.PreferredNextLabel, outgoingLabels, out contractError))
+                {
                     stageStatus = null;
-            }
+                }
 
-            if (stageStatus is not null &&
-                !TryValidatePreferredLabel(stageStatus.PreferredNextLabel, outgoingLabels, out contractError))
-            {
-                stageStatus = null;
-            }
+                if (stageStatus is not null)
+                    stageStatus = NormalizeRouteOutcome(stageStatus, outgoingEdges);
 
-            if (stageStatus is not null)
-                stageStatus = NormalizeRouteOutcome(stageStatus, outgoingEdges);
+                if (stageStatus is not null)
+                    break;
 
-            if (stageStatus is not null)
-                break;
+                // Preserve legacy retry/fail semantics for backends that haven't
+                // adopted the structured contract yet.
+                if (result.Status != OutcomeStatus.Success)
+                    break;
 
-            // Preserve legacy retry/fail semantics for backends that haven't
-            // adopted the structured contract yet.
-            if (result.Status != OutcomeStatus.Success)
-                break;
-
-            if (attempt < MaxContractAttempts)
-            {
-                var reminder = BuildReminder(contractError, outgoingLabels, outcomeRouteValues);
-                await File.WriteAllTextAsync(Path.Combine(stageDir, $"reminder-{attempt}.md"), reminder, ct);
-                attemptPrompt = expandedPrompt + "\n\n[STAGE CONTRACT REMINDER]\n" + reminder;
+                if (attempt < MaxContractAttempts)
+                {
+                    var reminder = BuildReminder(contractError, outgoingLabels, outcomeRouteValues);
+                    await File.WriteAllTextAsync(Path.Combine(stageDir, $"reminder-{attempt}.md"), reminder, ct);
+                    attemptPrompt = expandedPrompt + "\n\n[STAGE CONTRACT REMINDER]\n" + reminder;
+                }
             }
         }
 
@@ -186,6 +215,9 @@ public class CodergenHandler : INodeHandler
         }
 
         var telemetry = BuildStageTelemetry(result, attemptsUsed, usedFallback);
+        MergeTelemetry(telemetry, routingTelemetry);
+        telemetry["execution_lane"] = executionOptions.ExecutionLane;
+        telemetry["tool_injection_disabled"] = executionOptions.DisableToolInjection;
         var editState = ResolveEditState(telemetry);
         if (executionOptions.RequireEdits &&
             editState == "none" &&
@@ -310,6 +342,105 @@ public class CodergenHandler : INodeHandler
         return outcome;
     }
 
+    private static bool TryResolveCodergenSelection(
+        string? requestedProvider,
+        string? requestedModel,
+        string? reasoningEffort,
+        CodergenExecutionOptions executionOptions,
+        out string? resolvedProvider,
+        out string? resolvedModel,
+        out Dictionary<string, object?>? routingTelemetry,
+        out CodergenResult? failure)
+    {
+        resolvedProvider = requestedProvider;
+        resolvedModel = requestedModel;
+        routingTelemetry = new Dictionary<string, object?>
+        {
+            ["requested_provider"] = requestedProvider,
+            ["requested_model"] = requestedModel,
+            ["max_expected_latency_ms"] = executionOptions.MaxExpectedLatencyMs
+        };
+        failure = null;
+
+        try
+        {
+            var decision = CodergenModelRouter.Resolve(
+                requestedProvider,
+                requestedModel,
+                reasoningEffort,
+                new CodergenCapabilityRequirements(
+                    ExecutionLane: executionOptions.ExecutionLane,
+                    RequireVision: executionOptions.RequireVision,
+                    RequireImageInput: executionOptions.InputImagePaths is { Count: > 0 },
+                    RequireDocumentInput: executionOptions.InputDocumentPaths is { Count: > 0 },
+                    RequireAudioInput: executionOptions.InputAudioPaths is { Count: > 0 },
+                    MaxInputCostPerMillion: executionOptions.MaxInputCostPerMillion,
+                    MaxOutputCostPerMillion: executionOptions.MaxOutputCostPerMillion,
+                    MaxExpectedLatencyMs: executionOptions.MaxExpectedLatencyMs,
+                    OutputModalities: executionOptions.OutputModalities),
+                new CodergenRoutingPolicy(
+                    PreferredModel: executionOptions.PreferredModel,
+                    FallbackModels: executionOptions.FallbackModels));
+
+            resolvedProvider = decision.Provider;
+            resolvedModel = decision.Model;
+            routingTelemetry["routing_source"] = decision.DecisionSource;
+            routingTelemetry["routing_candidates"] = decision.Candidates.Cast<object?>().ToList();
+            routingTelemetry["effective_provider"] = decision.Provider;
+            routingTelemetry["effective_model"] = decision.Model;
+            return true;
+        }
+        catch (CapabilityValidationError ex)
+        {
+            var stageStatus = new StageStatusContract(
+                Status: OutcomeStatus.Fail,
+                PreferredNextLabel: string.Empty,
+                SuggestedNextIds: new List<string>(),
+                ContextUpdates: new Dictionary<string, string>(),
+                Notes: ex.Message,
+                FailureReason: "capability_validation");
+
+            failure = new CodergenResult(
+                Response: $"Error: {ex.Message}",
+                Status: OutcomeStatus.Fail,
+                StageStatus: stageStatus,
+                RawAssistantResponse: $"Error: {ex.Message}",
+                Telemetry: BuildCapabilityFailureTelemetry(
+                    routingTelemetry,
+                    requestedProvider,
+                    requestedModel,
+                    reasoningEffort,
+                    executionOptions.ExecutionLane,
+                    executionOptions.OutputModalities,
+                    ex.Message));
+            return false;
+        }
+    }
+
+    private static Dictionary<string, object?> BuildCapabilityFailureTelemetry(
+        Dictionary<string, object?>? routingTelemetry,
+        string? requestedProvider,
+        string? requestedModel,
+        string? reasoningEffort,
+        string executionLane,
+        IReadOnlyList<ResponseModality>? outputModalities,
+        string errorMessage)
+    {
+        var telemetry = routingTelemetry is null
+            ? new Dictionary<string, object?>()
+            : new Dictionary<string, object?>(routingTelemetry, StringComparer.Ordinal);
+
+        telemetry["provider_state"] = "invalid_capability";
+        telemetry["failure_kind"] = "capability_validation";
+        telemetry["provider_error_message"] = errorMessage;
+        telemetry["requested_provider"] = requestedProvider;
+        telemetry["requested_model"] = requestedModel;
+        telemetry["reasoning_effort"] = reasoningEffort;
+        telemetry["execution_lane"] = executionLane;
+        telemetry["output_modalities"] = outputModalities?.Select(MapOutputModality).Cast<object?>().ToList();
+        return telemetry;
+    }
+
     private static Dictionary<string, object?> BuildStageTelemetry(CodergenResult result, int attemptsUsed, bool usedFallback)
     {
         var telemetry = result.Telemetry is null
@@ -321,13 +452,23 @@ public class CodergenHandler : INodeHandler
         return telemetry;
     }
 
-    private static CodergenExecutionOptions BuildExecutionOptions(GraphNode node, Graph graph)
+    private static CodergenExecutionOptions BuildExecutionOptions(
+        GraphNode node,
+        Graph graph,
+        PipelineContext context,
+        string logsRoot)
     {
         var stageClass = ResolveStageClass(node);
         var requireVerification = ReadBooleanAttribute(node.RawAttributes, "require_verification") ||
                                   ReadGraphBooleanAttribute(graph.Attributes, "require_verification");
+        var executionLane = ResolveExecutionLane(node, graph);
         var codergenVersion = ReadStringAttribute(node.RawAttributes, "codergen_version") ??
                               ReadGraphAttribute(graph.Attributes, "codergen_version");
+        var fallbackModels = ReadListAttribute(node, graph, stageClass, "fallback_models");
+        var outputModalities = ResolveOutputModalities(node, graph, stageClass);
+        var inputImagePaths = ResolveInputImagePaths(node, graph, context, logsRoot);
+        var inputDocumentPaths = ResolveInputDocumentPaths(node, graph, context, logsRoot);
+        var inputAudioPaths = ResolveInputAudioPaths(node, graph, context, logsRoot);
 
         return new CodergenExecutionOptions(
             StageClass: stageClass,
@@ -336,6 +477,24 @@ public class CodergenHandler : INodeHandler
             RequireVerification: requireVerification,
             AllowContractFallback: !node.RawAttributes.TryGetValue("allow_contract_fallback", out var allowFallbackRaw) ||
                                    ParseBoolean(allowFallbackRaw, defaultValue: true),
+            ExecutionLane: executionLane,
+            DisableToolInjection: executionLane != "agent" || ReadBooleanAttribute(node.RawAttributes, "disable_tools"),
+            RequireVision: ReadBooleanAttribute(node.RawAttributes, "require_vision") ||
+                           ReadGraphBooleanAttribute(graph.Attributes, "require_vision"),
+            MaxInputCostPerMillion: ReadDecimalAttribute(node.RawAttributes, "max_input_cost_per_million") ??
+                                    ReadDecimalAttribute(graph.Attributes, "max_input_cost_per_million") ??
+                                    ReadDecimalAttribute(graph.Attributes, "default_max_input_cost_per_million"),
+            MaxOutputCostPerMillion: ReadDecimalAttribute(node.RawAttributes, "max_output_cost_per_million") ??
+                                     ReadDecimalAttribute(graph.Attributes, "max_output_cost_per_million") ??
+                                     ReadDecimalAttribute(graph.Attributes, "default_max_output_cost_per_million"),
+            MaxExpectedLatencyMs: ReadLongAttribute(node, graph, stageClass, "max_expected_latency_ms") ??
+                                  ReadLongAttribute(node, graph, stageClass, "max_latency_ms"),
+            OutputModalities: outputModalities.Count == 0 ? null : outputModalities,
+            InputImagePaths: inputImagePaths.Count == 0 ? null : inputImagePaths,
+            InputDocumentPaths: inputDocumentPaths.Count == 0 ? null : inputDocumentPaths,
+            InputAudioPaths: inputAudioPaths.Count == 0 ? null : inputAudioPaths,
+            PreferredModel: ReadPolicyAttribute(node, graph, stageClass, "preferred_model"),
+            FallbackModels: fallbackModels.Count == 0 ? null : fallbackModels,
             CodergenVersion: codergenVersion,
             Validation: ResolveValidationPolicy(node, graph, stageClass, requireVerification, codergenVersion));
     }
@@ -393,6 +552,181 @@ public class CodergenHandler : INodeHandler
                attributes.TryGetValue($"default_{key}", out var defaultRaw) && ParseBoolean(defaultRaw, defaultValue: false);
     }
 
+    private static string? ReadPolicyAttribute(GraphNode node, Graph graph, string? stageClass, string key)
+    {
+        if (node.RawAttributes.TryGetValue(key, out var nodeValue) && !string.IsNullOrWhiteSpace(nodeValue))
+            return nodeValue;
+
+        if (!string.IsNullOrWhiteSpace(stageClass) &&
+            graph.Attributes.TryGetValue($"{stageClass}_{key}", out var classValue) &&
+            !string.IsNullOrWhiteSpace(classValue))
+        {
+            return classValue;
+        }
+
+        if (graph.Attributes.TryGetValue(key, out var graphValue) && !string.IsNullOrWhiteSpace(graphValue))
+            return graphValue;
+
+        return graph.Attributes.TryGetValue($"default_{key}", out var defaultValue) &&
+               !string.IsNullOrWhiteSpace(defaultValue)
+            ? defaultValue
+            : null;
+    }
+
+    private static long? ReadLongAttribute(GraphNode node, Graph graph, string? stageClass, string key)
+    {
+        var raw = ReadPolicyAttribute(node, graph, stageClass, key);
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        return long.TryParse(raw, out var value) && value >= 0 ? value : null;
+    }
+
+    private static IReadOnlyList<string> ReadListAttribute(GraphNode node, Graph graph, string? stageClass, string key)
+    {
+        var raw = ReadPolicyAttribute(node, graph, stageClass, key);
+        if (string.IsNullOrWhiteSpace(raw))
+            return Array.Empty<string>();
+
+        return raw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static IReadOnlyList<ResponseModality> ResolveOutputModalities(GraphNode node, Graph graph, string? stageClass)
+    {
+        var raw = ReadPolicyAttribute(node, graph, stageClass, "output_modalities");
+        if (string.IsNullOrWhiteSpace(raw))
+            return Array.Empty<ResponseModality>();
+
+        var modalities = new List<ResponseModality>();
+        foreach (var token in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            modalities.Add(ParseOutputModality(token));
+        }
+
+        return modalities
+            .Distinct()
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> ResolveInputImagePaths(
+        GraphNode node,
+        Graph graph,
+        PipelineContext context,
+        string logsRoot) =>
+        ResolveAttachmentPaths(
+            node,
+            graph,
+            context,
+            logsRoot,
+            "input_images",
+            "input_image_paths");
+
+    private static IReadOnlyList<string> ResolveInputDocumentPaths(
+        GraphNode node,
+        Graph graph,
+        PipelineContext context,
+        string logsRoot) =>
+        ResolveAttachmentPaths(
+            node,
+            graph,
+            context,
+            logsRoot,
+            "input_documents",
+            "input_document_paths");
+
+    private static IReadOnlyList<string> ResolveInputAudioPaths(
+        GraphNode node,
+        Graph graph,
+        PipelineContext context,
+        string logsRoot) =>
+        ResolveAttachmentPaths(
+            node,
+            graph,
+            context,
+            logsRoot,
+            "input_audio",
+            "input_audio_paths");
+
+    private static IReadOnlyList<string> ResolveAttachmentPaths(
+        GraphNode node,
+        Graph graph,
+        PipelineContext context,
+        string logsRoot,
+        params string[] attributeKeys)
+    {
+        var stageClass = ResolveStageClass(node);
+        string? raw = null;
+        foreach (var attributeKey in attributeKeys)
+        {
+            raw = ReadPolicyAttribute(node, graph, stageClass, attributeKey);
+            if (!string.IsNullOrWhiteSpace(raw))
+                break;
+        }
+
+        if (string.IsNullOrWhiteSpace(raw))
+            return Array.Empty<string>();
+
+        var projectRoot = ResolveProjectRootFromGraph(graph, logsRoot);
+        var outputRoot = graph.Attributes.TryGetValue("output_root", out var configuredOutputRoot) &&
+                         !string.IsNullOrWhiteSpace(configuredOutputRoot)
+            ? Path.GetFullPath(configuredOutputRoot)
+            : Path.GetFullPath(Path.Combine(logsRoot, ".."));
+        var gatesRoot = Path.Combine(outputRoot, "gates");
+
+        return raw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(path => ResolveAttachmentPath(path, graph, context, logsRoot, gatesRoot, projectRoot, outputRoot))
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string ResolveAttachmentPath(
+        string rawPath,
+        Graph graph,
+        PipelineContext context,
+        string logsRoot,
+        string gatesRoot,
+        string projectRoot,
+        string outputRoot)
+    {
+        var expanded = VariableExpander.Expand(rawPath, graph.Attributes, context.All, graph.Goal);
+        expanded = RewriteArtifactPaths(expanded, logsRoot, gatesRoot);
+        if (Path.IsPathRooted(expanded))
+            return Path.GetFullPath(expanded);
+
+        var projectCandidate = Path.GetFullPath(Path.Combine(projectRoot, expanded));
+        if (File.Exists(projectCandidate))
+            return projectCandidate;
+
+        var outputCandidate = Path.GetFullPath(Path.Combine(outputRoot, expanded));
+        if (File.Exists(outputCandidate))
+            return outputCandidate;
+
+        return projectCandidate;
+    }
+
+    private static ResponseModality ParseOutputModality(string token)
+    {
+        return token.Trim().ToLowerInvariant() switch
+        {
+            "text" => ResponseModality.Text,
+            "image" => ResponseModality.Image,
+            _ => throw new InvalidOperationException($"Unsupported output modality '{token}'.")
+        };
+    }
+
+    private static string MapOutputModality(ResponseModality modality) => modality switch
+    {
+        ResponseModality.Text => "text",
+        ResponseModality.Image => "image",
+        _ => modality.ToString().ToLowerInvariant()
+    };
+
     private static bool ParseBoolean(string? raw, bool defaultValue)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -413,6 +747,24 @@ public class CodergenHandler : INodeHandler
     private static string? ReadGraphAttribute(IReadOnlyDictionary<string, string> attributes, string key)
     {
         return ReadStringAttribute(attributes, key) ?? ReadStringAttribute(attributes, $"default_{key}");
+    }
+
+    private static decimal? ReadDecimalAttribute(IReadOnlyDictionary<string, string> attributes, string key)
+    {
+        if (!attributes.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        return decimal.TryParse(raw.Trim(), out var parsed) ? parsed : null;
+    }
+
+    private static string ResolveExecutionLane(GraphNode node, Graph graph)
+    {
+        var rawLane = ReadStringAttribute(node.RawAttributes, "execution_lane") ??
+                      ReadStringAttribute(node.RawAttributes, "lane") ??
+                      ReadGraphAttribute(graph.Attributes, "execution_lane") ??
+                      "agent";
+
+        return rawLane.Trim().ToLowerInvariant();
     }
 
     private static RuntimeValidationPolicy ResolveValidationPolicy(
@@ -1072,6 +1424,18 @@ public class CodergenHandler : INodeHandler
             ["require_edits"] = options.RequireEdits,
             ["require_verification"] = options.RequireVerification,
             ["allow_contract_fallback"] = options.AllowContractFallback,
+            ["execution_lane"] = options.ExecutionLane,
+            ["disable_tool_injection"] = options.DisableToolInjection,
+            ["require_vision"] = options.RequireVision,
+            ["max_input_cost_per_million"] = options.MaxInputCostPerMillion,
+            ["max_output_cost_per_million"] = options.MaxOutputCostPerMillion,
+            ["max_expected_latency_ms"] = options.MaxExpectedLatencyMs,
+            ["output_modalities"] = options.OutputModalities?.Select(MapOutputModality).ToList(),
+            ["input_image_paths"] = options.InputImagePaths,
+            ["input_document_paths"] = options.InputDocumentPaths,
+            ["input_audio_paths"] = options.InputAudioPaths,
+            ["preferred_model"] = options.PreferredModel,
+            ["fallback_models"] = options.FallbackModels,
             ["codergen_version"] = options.CodergenVersion,
             ["validation_mode"] = validationPolicy.Mode,
             ["validation_profile"] = validationPolicy.Profile,
@@ -1100,6 +1464,18 @@ public class CodergenHandler : INodeHandler
                 })
                 .ToList()
         };
+    }
+
+    private static void MergeTelemetry(Dictionary<string, object?> target, Dictionary<string, object?>? source)
+    {
+        if (source is null || source.Count == 0)
+            return;
+
+        foreach (var (key, value) in source)
+        {
+            if (!target.ContainsKey(key))
+                target[key] = value;
+        }
     }
 
     private static async Task WriteRuntimeArtifactsAsync(
@@ -1298,21 +1674,62 @@ public class CodergenHandler : INodeHandler
         }
     }
 
-    private static void ArchivePreviousStatus(string statusPath)
+    private static void ArchiveCurrentStageArtifacts(string stageDir)
     {
-        if (!File.Exists(statusPath))
+        if (!Directory.Exists(stageDir))
             return;
 
+        var previousAttemptNumber = InferPreviousStageAttemptNumber(stageDir);
+        if (previousAttemptNumber <= 0)
+            return;
+
+        foreach (var filePath in Directory.GetFiles(stageDir))
+        {
+            var fileName = Path.GetFileName(filePath);
+            if (fileName.Contains(".previous.", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                var archived = BuildArchivedStageArtifactPath(filePath, previousAttemptNumber);
+                File.Move(filePath, archived, overwrite: true);
+            }
+            catch
+            {
+                // Non-critical. If archive fails, the current artifact may be overwritten later.
+            }
+        }
+    }
+
+    private static int InferPreviousStageAttemptNumber(string stageDir)
+    {
         try
         {
-            var dir = Path.GetDirectoryName(statusPath)!;
-            var archived = Path.Combine(dir, $"status.previous.{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.json");
-            File.Move(statusPath, archived, overwrite: true);
+            return Directory
+                .GetFiles(stageDir)
+                .Count(path =>
+                {
+                    var fileName = Path.GetFileName(path);
+                    return fileName.Equals("status.json", StringComparison.OrdinalIgnoreCase) ||
+                           fileName.StartsWith("status.previous.", StringComparison.OrdinalIgnoreCase);
+                });
         }
         catch
         {
-            // Non-critical. If archive fails, status.json will be overwritten later.
+            return 0;
         }
+    }
+
+    private static string BuildArchivedStageArtifactPath(string filePath, int previousAttemptNumber)
+    {
+        var directory = Path.GetDirectoryName(filePath)!;
+        var extension = Path.GetExtension(filePath);
+        var fileName = Path.GetFileName(filePath);
+        if (string.IsNullOrEmpty(extension))
+            return Path.Combine(directory, $"{fileName}.previous.attempt-{previousAttemptNumber}");
+
+        var stem = Path.GetFileNameWithoutExtension(filePath);
+        return Path.Combine(directory, $"{stem}.previous.attempt-{previousAttemptNumber}{extension}");
     }
 
     private static async Task PersistAttemptArtifactsAsync(string stageDir, int attempt, CodergenResult result, CancellationToken ct)
@@ -1332,7 +1749,7 @@ public class CodergenHandler : INodeHandler
                 ct);
         }
 
-        await PersistSupplementalArtifactsAsync(stageDir, result.Artifacts, ct);
+        await PersistSupplementalArtifactsAsync(stageDir, result.Artifacts, result.BinaryArtifacts, ct);
     }
 
     private sealed record StageArtifactPaths(
@@ -1515,10 +1932,32 @@ public class CodergenHandler : INodeHandler
             sb.AppendLine($"  Conditional outcome routes: {string.Join(", ", outcomeRouteValues)}");
         if (!string.IsNullOrWhiteSpace(executionOptions.StageClass))
             sb.AppendLine($"  Stage class: {executionOptions.StageClass}");
+        sb.AppendLine($"  Execution lane: {executionOptions.ExecutionLane}");
+        sb.AppendLine($"  Tool injection: {(executionOptions.DisableToolInjection ? "disabled" : "enabled")}");
         if (executionOptions.MaxProviderResponseMs is int timeoutMs)
             sb.AppendLine($"  Provider timeout ms: {timeoutMs}");
         sb.AppendLine($"  Require edits: {executionOptions.RequireEdits}");
         sb.AppendLine($"  Require verification: {executionOptions.RequireVerification}");
+        if (executionOptions.RequireVision)
+            sb.AppendLine("  Require vision: true");
+        if (executionOptions.MaxInputCostPerMillion is decimal maxInputCost)
+            sb.AppendLine($"  Max input cost / 1M: {maxInputCost}");
+        if (executionOptions.MaxOutputCostPerMillion is decimal maxOutputCost)
+            sb.AppendLine($"  Max output cost / 1M: {maxOutputCost}");
+        if (executionOptions.MaxExpectedLatencyMs is long maxExpectedLatencyMs)
+            sb.AppendLine($"  Max expected latency ms: {maxExpectedLatencyMs}");
+        if (executionOptions.OutputModalities is { Count: > 0 })
+            sb.AppendLine($"  Output modalities: {string.Join(", ", executionOptions.OutputModalities.Select(MapOutputModality))}");
+        if (executionOptions.InputImagePaths is { Count: > 0 })
+            sb.AppendLine($"  Attached images: {executionOptions.InputImagePaths.Count}");
+        if (executionOptions.InputDocumentPaths is { Count: > 0 })
+            sb.AppendLine($"  Attached documents: {executionOptions.InputDocumentPaths.Count}");
+        if (executionOptions.InputAudioPaths is { Count: > 0 })
+            sb.AppendLine($"  Attached audio: {executionOptions.InputAudioPaths.Count}");
+        if (!string.IsNullOrWhiteSpace(executionOptions.PreferredModel))
+            sb.AppendLine($"  Preferred model: {executionOptions.PreferredModel}");
+        if (executionOptions.FallbackModels is { Count: > 0 })
+            sb.AppendLine($"  Fallback models: {string.Join(", ", executionOptions.FallbackModels)}");
         sb.AppendLine($"  Validation mode: {executionOptions.EffectiveValidation.Mode}");
         if (!string.IsNullOrWhiteSpace(executionOptions.EffectiveValidation.Profile))
             sb.AppendLine($"  Validation profile: {executionOptions.EffectiveValidation.Profile}");
@@ -1663,12 +2102,10 @@ public class CodergenHandler : INodeHandler
     private static async Task PersistSupplementalArtifactsAsync(
         string stageDir,
         IReadOnlyDictionary<string, string>? artifacts,
+        IReadOnlyList<CodergenBinaryArtifact>? binaryArtifacts,
         CancellationToken ct)
     {
-        if (artifacts is null || artifacts.Count == 0)
-            return;
-
-        foreach (var (relativePath, content) in artifacts)
+        foreach (var (relativePath, content) in artifacts ?? (IReadOnlyDictionary<string, string>)new Dictionary<string, string>())
         {
             if (string.IsNullOrWhiteSpace(relativePath))
                 continue;
@@ -1685,6 +2122,28 @@ public class CodergenHandler : INodeHandler
                 Directory.CreateDirectory(directory);
 
             await File.WriteAllTextAsync(fullPath, content ?? string.Empty, ct);
+        }
+
+        if (binaryArtifacts is null || binaryArtifacts.Count == 0)
+            return;
+
+        foreach (var artifact in binaryArtifacts)
+        {
+            if (string.IsNullOrWhiteSpace(artifact.RelativePath) || artifact.Content.Length == 0)
+                continue;
+
+            var safePath = artifact.RelativePath
+                .Replace('\\', Path.DirectorySeparatorChar)
+                .TrimStart(Path.DirectorySeparatorChar);
+            var fullPath = Path.GetFullPath(Path.Combine(stageDir, safePath));
+            if (!fullPath.StartsWith(stageDir, StringComparison.Ordinal))
+                continue;
+
+            var directory = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+
+            await File.WriteAllBytesAsync(fullPath, artifact.Content, ct);
         }
     }
 }
