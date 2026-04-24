@@ -4,7 +4,8 @@ public record Message(
     Role Role,
     List<ContentPart> Content,
     string? Name = null,
-    string? ToolCallId = null)
+    string? ToolCallId = null,
+    string? ResponseId = null)
 {
     /// <summary>
     /// Concatenates all text parts in the message content.

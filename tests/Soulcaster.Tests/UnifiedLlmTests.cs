@@ -1,5 +1,7 @@
 using Soulcaster.UnifiedLlm;
 using System.Net;
+using System.Net.Http;
+using System.Text.Json;
 
 namespace Soulcaster.Tests;
 
@@ -155,6 +157,24 @@ public class ClientTests
         });
 
         Assert.Equal(["mw1-before", "mw2-before", "mw2-after", "mw1-after"], log);
+    }
+
+    [Fact]
+    public async Task Client_CompleteAsync_NormalizesModelAlias_BeforeCallingProvider()
+    {
+        var capturingProvider = new ModelCapturingProvider();
+        var client = new Client(new Dictionary<string, IProviderAdapter>
+        {
+            ["openai"] = capturingProvider
+        });
+
+        await client.CompleteAsync(new Request
+        {
+            Model = "codex-5.2",
+            Messages = [Message.UserMsg("hi")]
+        });
+
+        Assert.Equal("gpt-5.2-codex", capturingProvider.LastReceivedModel);
     }
 }
 
@@ -435,6 +455,11 @@ public class ToolDefinitionTests
 
 public class ModelCatalogTests
 {
+    private static readonly JsonSerializerOptions SnakeCaseJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+    };
+
     [Fact]
     public void GetModelInfo_FindsByExactId()
     {
@@ -487,6 +512,24 @@ public class ModelCatalogTests
         var model = ModelCatalog.GetLatestModel("anthropic", "reasoning");
         Assert.NotNull(model);
         Assert.True(model.SupportsReasoning);
+    }
+
+    [Fact]
+    public void GetLatestModel_FiltersByAudioInputCapability()
+    {
+        var model = ModelCatalog.GetLatestModel("openai", "audio_input");
+        Assert.NotNull(model);
+        Assert.Equal("gpt-audio", model.Id);
+        Assert.True(model.SupportsAudioInput);
+    }
+
+    [Fact]
+    public void GetLatestModel_FiltersByAnthropicDocumentInputCapability()
+    {
+        var model = ModelCatalog.GetLatestModel("anthropic", "document_input");
+        Assert.NotNull(model);
+        Assert.Equal("anthropic", model.Provider);
+        Assert.True(model.SupportsDocumentInput);
     }
 
     [Fact]
@@ -558,6 +601,141 @@ public class ModelCatalogTests
         Assert.Null(info.SupportsVision);
         Assert.Null(info.InputCostPerMillion);
         Assert.Null(info.OutputCostPerMillion);
+    }
+
+    [Fact]
+    public async Task ModelRegistry_LoadSnapshot_MergesDiscoveryCacheAndOverrides()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"jc_model_registry_{Guid.NewGuid():N}");
+        var paths = new ModelRegistryPaths(
+            RootDirectory: root,
+            DiscoveryDirectory: Path.Combine(root, "discovery"),
+            OverridesPath: Path.Combine(root, "model-registry.overrides.json"));
+        Directory.CreateDirectory(paths.DiscoveryDirectory);
+
+        try
+        {
+            await ModelRegistry.WriteDiscoveryCacheAsync(
+                "openai",
+                [
+                    new ProviderModelDescriptor(
+                        Provider: "openai",
+                        Id: "gpt-5.4-mini",
+                        DisplayName: "GPT-5.4 Mini",
+                        ContextWindow: 200_000,
+                        MaxOutput: 16_384,
+                        SupportsTools: true,
+                        SupportsVision: true,
+                        SupportsReasoning: true)
+                ],
+                TimeSpan.FromHours(12),
+                paths);
+
+            var overrides = new ModelRegistryOverrideFile(
+                [
+                    new ModelInfo(
+                        Id: "gpt-5.4",
+                        Provider: "openai",
+                        DisplayName: "GPT-5.4",
+                        ContextWindow: 200_000,
+                        MaxOutput: 32_768,
+                        SupportsTools: true,
+                        SupportsVision: true,
+                        SupportsReasoning: true,
+                        InputCostPerMillion: null,
+                        OutputCostPerMillion: null,
+                        ExpectedLatencyMs: 333)
+                ]);
+            File.WriteAllText(paths.OverridesPath, JsonSerializer.Serialize(overrides, SnakeCaseJson));
+
+            var snapshot = ModelRegistry.LoadSnapshot(paths);
+
+            var discovered = snapshot.Models.Single(model => model.Id == "gpt-5.4-mini");
+            Assert.Equal("openai", discovered.Provider);
+
+            var overridden = snapshot.Models.Single(model => model.Id == "gpt-5.4");
+            Assert.Equal(333, overridden.ExpectedLatencyMs);
+            Assert.Contains(snapshot.Sources, source => source.SourceType == "discovery_cache" && source.Status == "loaded");
+            Assert.Contains(snapshot.Sources, source => source.SourceType == "override_file" && source.Status == "loaded");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void ModelRegistry_LoadSnapshot_SkipsExpiredDiscoveryCache()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"jc_model_registry_expired_{Guid.NewGuid():N}");
+        var paths = new ModelRegistryPaths(
+            RootDirectory: root,
+            DiscoveryDirectory: Path.Combine(root, "discovery"),
+            OverridesPath: Path.Combine(root, "model-registry.overrides.json"));
+        Directory.CreateDirectory(paths.DiscoveryDirectory);
+
+        try
+        {
+            var expiredCache = new ModelRegistryDiscoveryCache(
+                Provider: "openai",
+                FetchedAtUtc: DateTimeOffset.UtcNow.AddDays(-2).ToString("o"),
+                ExpiresAtUtc: DateTimeOffset.UtcNow.AddDays(-1).ToString("o"),
+                Models:
+                [
+                    new ProviderModelDescriptor(
+                        Provider: "openai",
+                        Id: "gpt-expired-preview",
+                        DisplayName: "Expired Preview")
+                ]);
+            File.WriteAllText(
+                Path.Combine(paths.DiscoveryDirectory, "openai.json"),
+                JsonSerializer.Serialize(expiredCache, SnakeCaseJson));
+
+            var snapshot = ModelRegistry.LoadSnapshot(paths);
+
+            Assert.DoesNotContain(snapshot.Models, model => model.Id == "gpt-expired-preview");
+            Assert.Contains(snapshot.Sources, source => source.SourceType == "discovery_cache" && source.Status == "skipped_stale");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task ModelRegistry_LoadSnapshot_PreservesBuiltInRoutingOrder_AheadOfDiscoveryOnlyModels()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"jc_model_registry_order_{Guid.NewGuid():N}");
+        var paths = new ModelRegistryPaths(
+            RootDirectory: root,
+            DiscoveryDirectory: Path.Combine(root, "discovery"),
+            OverridesPath: Path.Combine(root, "model-registry.overrides.json"));
+        Directory.CreateDirectory(paths.DiscoveryDirectory);
+
+        try
+        {
+            await ModelRegistry.WriteDiscoveryCacheAsync(
+                "openai",
+                [
+                    new ProviderModelDescriptor(
+                        Provider: "openai",
+                        Id: "a-openai-preview",
+                        DisplayName: "A OpenAI Preview")
+                ],
+                TimeSpan.FromHours(12),
+                paths);
+
+            var snapshot = ModelRegistry.LoadSnapshot(paths);
+            var openaiModels = snapshot.Models.Where(model => model.Provider == "openai").ToList();
+
+            Assert.NotEmpty(openaiModels);
+            Assert.Equal("gpt-5.2", openaiModels[0].Id);
+            Assert.Equal("a-openai-preview", openaiModels[^1].Id);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
     }
 }
 
@@ -741,6 +919,40 @@ public class T11_StreamingMiddlewareTests
 
         // The provider should have received the transformed model
         Assert.Equal("transformed-model", capturingProvider.LastReceivedModel);
+    }
+
+    [Fact]
+    public async Task StreamAsync_RunsMiddleware_AroundTheFullStreamLifecycle()
+    {
+        var providerLog = new List<string>();
+        var provider = new LoggingStreamingProvider(providerLog);
+        var middlewareLog = new List<string>();
+        var middleware = new List<Func<Request, Func<Request, Task<Response>>, Task<Response>>>
+        {
+            async (req, next) =>
+            {
+                middlewareLog.Add("mw-before");
+                var response = await next(req);
+                middlewareLog.Add("mw-after");
+                return response;
+            }
+        };
+
+        var client = new Client(
+            new Dictionary<string, IProviderAdapter> { ["test"] = provider },
+            middleware: middleware);
+
+        await foreach (var _ in client.StreamAsync(new Request
+        {
+            Model = "stream-model",
+            Provider = "test",
+            Messages = [Message.UserMsg("hi")]
+        }))
+        {
+        }
+
+        Assert.Equal(["mw-before", "mw-after"], middlewareLog);
+        Assert.Equal(["provider-start", "provider-finish"], providerLog);
     }
 }
 
@@ -1049,8 +1261,75 @@ public class T14_MultimodalAdapterTests
         var response = method!.Invoke(adapter, new object[] { responseBody, "gpt-5.4" }) as Response;
         Assert.NotNull(response);
         Assert.Equal("caption", response!.Text);
-        Assert.Single(response.Images);
-        Assert.NotNull(response.Images[0].Data);
+        var image = Assert.Single(response.Images);
+        Assert.NotNull(image.Data);
+        Assert.NotNull(image.ProviderState);
+        Assert.Equal("openai", image.ProviderState!["provider"]?.GetValue<string>());
+        Assert.Equal("image_generation_call", image.ProviderState["source"]?.GetValue<string>());
+        Assert.StartsWith("data:image/png;base64,", image.ProviderState["image_url"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void OpenAIAdapter_ChainsPreviousResponseId_WhenBuildingFollowUpConversation()
+    {
+        var adapter = new OpenAIAdapter("test-key");
+        var responseBody = $$"""
+            {
+              "id": "resp_123",
+              "model": "gpt-5.4",
+              "status": "completed",
+              "output": [
+                {
+                  "type": "message",
+                  "content": [
+                    { "type": "output_text", "text": "caption" }
+                  ]
+                },
+                {
+                  "id": "ig_123",
+                  "type": "image_generation_call",
+                  "status": "completed",
+                  "result": "{{UnifiedLlmTestAssets.TestImageBase64}}"
+                }
+              ]
+            }
+            """;
+
+        var parseMethod = typeof(OpenAIAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var buildMethod = typeof(OpenAIAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(parseMethod);
+        Assert.NotNull(buildMethod);
+
+        var parsed = parseMethod!.Invoke(adapter, new object[] { responseBody, "gpt-5.4" }) as Response;
+        Assert.NotNull(parsed);
+        var priorImage = Assert.Single(parsed!.Images);
+
+        var request = new Request
+        {
+            Model = "gpt-5.4",
+            Messages =
+            [
+                Message.UserMsg("Create the initial image."),
+                new Message(Role.Assistant,
+                [
+                    ContentPart.TextPart("caption"),
+                    ContentPart.ImagePart(priorImage)
+                ],
+                ResponseId: parsed.Id),
+                Message.UserMsg("Make it look more geometric.")
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        Assert.Equal("resp_123", body!["previous_response_id"]!.GetValue<string>());
+        var input = body["input"]!.AsArray();
+        Assert.Single(input);
+        Assert.Equal("user", input[0]!["role"]!.GetValue<string>());
+        Assert.Equal("Make it look more geometric.", input[0]!["content"]!.GetValue<string>());
     }
 
     [Fact]
@@ -1119,6 +1398,293 @@ public class T14_MultimodalAdapterTests
     }
 
     [Fact]
+    public void GeminiAdapter_ReusesInlineImageProviderState_WhenReplayingConversation()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var responseBody = $$"""
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      {
+                        "inlineData": {
+                          "mimeType": "image/png",
+                          "data": "{{UnifiedLlmTestAssets.TestImageBase64}}"
+                        },
+                        "thoughtSignature": "sig-inline-image"
+                      }
+                    ]
+                  },
+                  "finishReason": "STOP"
+                }
+              ]
+            }
+            """;
+
+        var parseMethod = typeof(GeminiAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var buildMethod = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(parseMethod);
+        Assert.NotNull(buildMethod);
+
+        var parsed = parseMethod!.Invoke(adapter, new object[] { responseBody, "gemini-3.1-flash-image-preview" }) as Response;
+        Assert.NotNull(parsed);
+        var image = Assert.Single(parsed!.Images);
+        Assert.NotNull(image.ProviderState);
+        Assert.Equal("gemini", image.ProviderState!["provider"]?.GetValue<string>());
+        Assert.Equal("sig-inline-image", image.ProviderState["thoughtSignature"]?.GetValue<string>());
+
+        var request = new Request
+        {
+            Model = "gemini-3.1-flash-image-preview",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Use the prior image"),
+                    ContentPart.ImagePart(image))
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var inlineData = body!["contents"]![0]!["parts"]![1]!["inlineData"];
+        Assert.NotNull(inlineData);
+        Assert.Equal(UnifiedLlmTestAssets.TestImageBase64, inlineData!["data"]!.GetValue<string>());
+        Assert.Equal("sig-inline-image", body["contents"]![0]!["parts"]![1]!["thoughtSignature"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void GeminiAdapter_ReusesFileImageProviderState_WhenReplayingConversation()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var responseBody = """
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      {
+                        "fileData": {
+                          "mimeType": "image/png",
+                          "fileUri": "gs://demo/generated.png"
+                        }
+                      }
+                    ]
+                  },
+                  "finishReason": "STOP"
+                }
+              ]
+            }
+            """;
+
+        var parseMethod = typeof(GeminiAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var buildMethod = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(parseMethod);
+        Assert.NotNull(buildMethod);
+
+        var parsed = parseMethod!.Invoke(adapter, new object[] { responseBody, "gemini-3.1-flash-image-preview" }) as Response;
+        Assert.NotNull(parsed);
+        var image = Assert.Single(parsed!.Images);
+        Assert.Equal("gs://demo/generated.png", image.Url);
+        Assert.NotNull(image.ProviderState);
+
+        var request = new Request
+        {
+            Model = "gemini-3.1-flash-image-preview",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Edit the prior file image"),
+                    ContentPart.ImagePart(image))
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var fileData = body!["contents"]![0]!["parts"]![1]!["fileData"];
+        Assert.NotNull(fileData);
+        Assert.Equal("gs://demo/generated.png", fileData!["fileUri"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void GeminiAdapter_ReplaysAssistantTextAndImageThoughtSignatures_WhenReplayingConversation()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var responseBody = $$"""
+            {
+              "candidates": [
+                {
+                  "content": {
+                    "parts": [
+                      {
+                        "text": "caption",
+                        "thoughtSignature": "sig-text"
+                      },
+                      {
+                        "inlineData": {
+                          "mimeType": "image/png",
+                          "data": "{{UnifiedLlmTestAssets.TestImageBase64}}"
+                        },
+                        "thoughtSignature": "sig-image"
+                      }
+                    ]
+                  },
+                  "finishReason": "STOP"
+                }
+              ]
+            }
+            """;
+
+        var parseMethod = typeof(GeminiAdapter).GetMethod("ParseResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var buildMethod = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(parseMethod);
+        Assert.NotNull(buildMethod);
+
+        var parsed = parseMethod!.Invoke(adapter, new object[] { responseBody, "gemini-3.1-flash-image-preview" }) as Response;
+        Assert.NotNull(parsed);
+
+        var request = new Request
+        {
+            Model = "gemini-3.1-flash-image-preview",
+            Messages =
+            [
+                parsed!.Message,
+                Message.UserMsg("Refine the earlier image.")
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var assistantParts = body!["contents"]![0]!["parts"]!.AsArray();
+        Assert.Equal("caption", assistantParts[0]!["text"]!.GetValue<string>());
+        Assert.Equal("sig-text", assistantParts[0]!["thoughtSignature"]!.GetValue<string>());
+        Assert.Equal("sig-image", assistantParts[1]!["thoughtSignature"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void GeminiAdapter_BuildsDocumentAndAudioInlineParts()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var buildMethod = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(buildMethod);
+
+        var request = new Request
+        {
+            Model = "gemini-2.5-pro",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the brief and listen to the note."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes([0x25, 0x50, 0x44, 0x46], "application/pdf", "brief.pdf")),
+                    ContentPart.AudioPart(AudioData.FromBytes([0x49, 0x44, 0x33], "audio/mpeg", "notes.mp3")))
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var parts = body!["contents"]![0]!["parts"]!.AsArray();
+        Assert.Equal("application/pdf", parts[1]!["inlineData"]!["mimeType"]!.GetValue<string>());
+        Assert.Equal("audio/mpeg", parts[2]!["inlineData"]!["mimeType"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void GeminiAdapter_ReusesInlineDocumentProviderState_WhenReplayingConversation()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var buildMethod = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(buildMethod);
+        var providerState = System.Text.Json.Nodes.JsonNode.Parse(
+            """
+            {
+              "provider": "gemini",
+              "inlineData": {
+                "mimeType": "application/pdf",
+                "data": "JVBERg=="
+              }
+            }
+            """)!.AsObject();
+        var document = DocumentData.FromBytes(
+            [0x25, 0x50, 0x44, 0x46],
+            "application/pdf",
+            "brief.pdf",
+            providerState);
+
+        var request = new Request
+        {
+            Model = "gemini-2.5-pro",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Use the prior brief."),
+                    ContentPart.DocumentPart(document))
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var inlineData = body!["contents"]![0]!["parts"]![1]!["inlineData"];
+        Assert.NotNull(inlineData);
+        Assert.Equal("application/pdf", inlineData!["mimeType"]!.GetValue<string>());
+        Assert.Equal("JVBERg==", inlineData["data"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void GeminiAdapter_ReusesFileAudioProviderState_WhenReplayingConversation()
+    {
+        var adapter = new GeminiAdapter("test-key");
+        var buildMethod = typeof(GeminiAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(buildMethod);
+        var providerState = System.Text.Json.Nodes.JsonNode.Parse(
+            """
+            {
+              "provider": "gemini",
+              "fileData": {
+                "mimeType": "audio/mpeg",
+                "fileUri": "gs://demo/notes.mp3"
+              }
+            }
+            """)!.AsObject();
+        var audio = AudioData.FromUrl(
+            "gs://demo/notes.mp3",
+            "audio/mpeg",
+            "notes.mp3",
+            providerState);
+
+        var request = new Request
+        {
+            Model = "gemini-2.5-pro",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Use the prior note."),
+                    ContentPart.AudioPart(audio))
+            ]
+        };
+
+        var body = buildMethod!.Invoke(adapter, new object[] { request }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var fileData = body!["contents"]![0]!["parts"]![1]!["fileData"];
+        Assert.NotNull(fileData);
+        Assert.Equal("audio/mpeg", fileData!["mimeType"]!.GetValue<string>());
+        Assert.Equal("gs://demo/notes.mp3", fileData["fileUri"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void AnthropicAdapter_Throws_WhenImageOutputRequested()
     {
         var adapter = new AnthropicAdapter("test-key");
@@ -1136,6 +1702,282 @@ public class T14_MultimodalAdapterTests
         var ex = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
             method!.Invoke(adapter, new object[] { request, false }));
         Assert.IsType<ConfigurationError>(ex.InnerException);
+    }
+
+    [Fact]
+    public void AnthropicAdapter_AddsDocumentBlock_WhenPdfInputRequested()
+    {
+        var adapter = new AnthropicAdapter("test-key");
+        var request = new Request
+        {
+            Model = "claude-opus-4-6",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the attached PDF."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes([0x25, 0x50, 0x44, 0x46], "application/pdf", "brief.pdf")))
+            ]
+        };
+
+        var method = typeof(AnthropicAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var content = body!["messages"]![0]!["content"]!.AsArray();
+        Assert.Equal("document", content[1]!["type"]!.GetValue<string>());
+        Assert.Equal("base64", content[1]!["source"]!["type"]!.GetValue<string>());
+        Assert.Equal("application/pdf", content[1]!["source"]!["media_type"]!.GetValue<string>());
+        Assert.Equal("brief.pdf", content[1]!["title"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void AnthropicAdapter_AddsPlainTextDocumentBlock_WhenTextDocumentRequested()
+    {
+        var adapter = new AnthropicAdapter("test-key");
+        var request = new Request
+        {
+            Model = "claude-opus-4-6",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the attached notes."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes(System.Text.Encoding.UTF8.GetBytes("alpha\nbeta"), "text/markdown", "brief.md")))
+            ]
+        };
+
+        var method = typeof(AnthropicAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var content = body!["messages"]![0]!["content"]!.AsArray();
+        Assert.Equal("document", content[1]!["type"]!.GetValue<string>());
+        Assert.Equal("text", content[1]!["source"]!["type"]!.GetValue<string>());
+        Assert.Equal("text/plain", content[1]!["source"]!["media_type"]!.GetValue<string>());
+        Assert.Equal("alpha\nbeta", content[1]!["source"]!["data"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void AnthropicAdapter_ReplaysPriorUserDocument_WhenBuildingFollowUpConversation()
+    {
+        var adapter = new AnthropicAdapter("test-key");
+        var request = new Request
+        {
+            Model = "claude-opus-4-6",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the attached brief."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes([0x25, 0x50, 0x44, 0x46], "application/pdf", "brief.pdf"))),
+                new Message(Role.Assistant, [ContentPart.TextPart("I reviewed the brief.")]),
+                Message.UserMsg("What was the main risk in the prior brief?")
+            ]
+        };
+
+        var method = typeof(AnthropicAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var messages = body!["messages"]!.AsArray();
+        Assert.Equal(3, messages.Count);
+        Assert.Equal("user", messages[0]!["role"]!.GetValue<string>());
+        Assert.Equal("assistant", messages[1]!["role"]!.GetValue<string>());
+        Assert.Equal("user", messages[2]!["role"]!.GetValue<string>());
+        Assert.Equal("document", messages[0]!["content"]![1]!["type"]!.GetValue<string>());
+        Assert.Equal("brief.pdf", messages[0]!["content"]![1]!["title"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void OpenAIAdapter_AddsInputFilePart_WhenDocumentInputRequested()
+    {
+        var adapter = new OpenAIAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gpt-5.4",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the attached brief."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes([0x25, 0x50, 0x44, 0x46], "application/pdf", "brief.pdf")))
+            ]
+        };
+
+        var method = typeof(OpenAIAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var body = method!.Invoke(adapter, new object[] { request, false }) as System.Text.Json.Nodes.JsonObject;
+        Assert.NotNull(body);
+
+        var content = body!["input"]![0]!["content"]!.AsArray();
+        Assert.Equal("input_file", content[1]!["type"]!.GetValue<string>());
+        Assert.Equal("brief.pdf", content[1]!["filename"]!.GetValue<string>());
+        Assert.StartsWith("data:application/pdf;base64,", content[1]!["file_data"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task OpenAIAdapter_UsesChatCompletions_ForAudioInputRequests()
+    {
+        var handler = new CapturingHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(
+                """
+                {
+                  "id": "chatcmpl_123",
+                  "model": "gpt-audio",
+                  "choices": [
+                    {
+                      "message": {
+                        "role": "assistant",
+                        "content": "Transcription complete."
+                      },
+                      "finish_reason": "stop"
+                    }
+                  ],
+                  "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14
+                  }
+                }
+                """)
+        });
+        var adapter = new OpenAIAdapter("test-key", httpClient: new HttpClient(handler));
+        var request = new Request
+        {
+            Model = "gpt-audio",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the attached brief and note."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes([0x25, 0x50, 0x44, 0x46], "application/pdf", "brief.pdf")),
+                    ContentPart.AudioPart(AudioData.FromBytes([0x49, 0x44, 0x33], "audio/mpeg", "notes.mp3")))
+            ]
+        };
+
+        var response = await adapter.CompleteAsync(request);
+
+        Assert.Equal("https://api.openai.com/v1/chat/completions", handler.LastRequestUri?.ToString());
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.NotNull(handler.LastRequestBody);
+        Assert.Equal("Transcription complete.", response.Text);
+
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        var content = body.RootElement.GetProperty("messages")[0].GetProperty("content");
+        Assert.Equal("file", content[1].GetProperty("type").GetString());
+        Assert.Equal("brief.pdf", content[1].GetProperty("file").GetProperty("filename").GetString());
+        Assert.Equal("input_audio", content[2].GetProperty("type").GetString());
+        Assert.Equal("mp3", content[2].GetProperty("input_audio").GetProperty("format").GetString());
+    }
+
+    [Fact]
+    public void AnthropicAdapter_Throws_WhenAudioInputRequested()
+    {
+        var adapter = new AnthropicAdapter("test-key");
+        var request = new Request
+        {
+            Model = "claude-opus-4-6",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Review the spoken note."),
+                    ContentPart.AudioPart(AudioData.FromBytes([0x49, 0x44, 0x33], "audio/mpeg", "notes.mp3")))
+            ]
+        };
+
+        var method = typeof(AnthropicAdapter).GetMethod("BuildRequestBody",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var ex = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+            method!.Invoke(adapter, new object[] { request, false }));
+        Assert.IsType<ConfigurationError>(ex.InnerException);
+    }
+
+    [Fact]
+    public void ModelCapabilityValidator_FailsClosed_WhenImageOutputRequestedOnTextOnlyModel()
+    {
+        var ex = Assert.Throws<CapabilityValidationError>(() =>
+            ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+                "openai",
+                "gpt-5.3-codex",
+                reasoningEffort: null,
+                new CodergenCapabilityRequirements(
+                    ExecutionLane: "multimodal_leaf",
+                    OutputModalities: [ResponseModality.Image])));
+
+        Assert.Equal("image_output", ex.Capability);
+        Assert.Equal("gpt-5.3-codex", ex.ModelId);
+    }
+
+    [Fact]
+    public void ModelCapabilityValidator_FailsClosed_WhenDocumentInputRequestedOnUnsupportedModel()
+    {
+        var ex = Assert.Throws<CapabilityValidationError>(() =>
+            ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+                "openai",
+                "gpt-audio",
+                reasoningEffort: null,
+                new CodergenCapabilityRequirements(RequireDocumentInput: true)));
+
+        Assert.Equal("document_input", ex.Capability);
+        Assert.Equal("gpt-audio", ex.ModelId);
+    }
+
+    [Fact]
+    public void ModelCapabilityValidator_FailsClosed_WhenAudioInputRequestedOnUnsupportedModel()
+    {
+        var ex = Assert.Throws<CapabilityValidationError>(() =>
+            ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+                "openai",
+                "gpt-5.4",
+                reasoningEffort: null,
+                new CodergenCapabilityRequirements(RequireAudioInput: true)));
+
+        Assert.Equal("audio_input", ex.Capability);
+        Assert.Equal("gpt-5.4", ex.ModelId);
+    }
+
+    [Fact]
+    public void ModelCapabilityValidator_AllowsDocumentInput_OnAnthropicModel()
+    {
+        ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+            "anthropic",
+            "claude-opus-4-6",
+            reasoningEffort: null,
+            new CodergenCapabilityRequirements(RequireDocumentInput: true));
+    }
+
+    [Fact]
+    public void ModelCapabilityValidator_FailsClosed_WhenAudioInputRequestedOnAnthropicModel()
+    {
+        var ex = Assert.Throws<CapabilityValidationError>(() =>
+            ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+                "anthropic",
+                "claude-opus-4-6",
+                reasoningEffort: null,
+                new CodergenCapabilityRequirements(RequireAudioInput: true)));
+
+        Assert.Equal("audio_input", ex.Capability);
+        Assert.Equal("claude-opus-4-6", ex.ModelId);
+    }
+
+    [Fact]
+    public void ModelCapabilityValidator_AllowsAudioInput_OnGptAudio()
+    {
+        ModelCapabilityValidator.ValidateResolvedCodergenSelection(
+            "openai",
+            "gpt-audio",
+            reasoningEffort: null,
+            new CodergenCapabilityRequirements(RequireAudioInput: true));
     }
 }
 
@@ -1160,6 +2002,57 @@ internal class ModelCapturingProvider : IProviderAdapter
         yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "ok" };
         yield return new StreamEvent { Type = StreamEventType.Finish, FinishReason = FinishReason.Stop };
         await Task.CompletedTask;
+    }
+}
+
+internal sealed class LoggingStreamingProvider : IProviderAdapter
+{
+    private readonly List<string> _log;
+
+    public LoggingStreamingProvider(List<string> log)
+    {
+        _log = log;
+    }
+
+    public string Name => "logging-stream";
+
+    public Task<Response> CompleteAsync(Request request, CancellationToken ct = default) =>
+        Task.FromResult(new Response("id", request.Model, Name, Message.AssistantMsg("ok"), FinishReason.Stop, Usage.Empty));
+
+    public async IAsyncEnumerable<StreamEvent> StreamAsync(
+        Request request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        _log.Add("provider-start");
+        yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = "ok" };
+        await Task.Yield();
+        _log.Add("provider-finish");
+        yield return new StreamEvent { Type = StreamEventType.Finish, FinishReason = FinishReason.Stop };
+    }
+}
+
+internal sealed class CapturingHttpMessageHandler : HttpMessageHandler
+{
+    private readonly Func<HttpRequestMessage, HttpResponseMessage> _responder;
+
+    public CapturingHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> responder)
+    {
+        _responder = responder;
+    }
+
+    public Uri? LastRequestUri { get; private set; }
+    public HttpMethod? LastMethod { get; private set; }
+    public string? LastRequestBody { get; private set; }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        LastRequestUri = request.RequestUri;
+        LastMethod = request.Method;
+        LastRequestBody = request.Content is null
+            ? null
+            : await request.Content.ReadAsStringAsync(cancellationToken);
+
+        return _responder(request);
     }
 }
 

@@ -545,6 +545,15 @@ public sealed class AnthropicAdapter : IProviderAdapter, IProviderDiscoveryAdapt
                     }
                     break;
 
+                case ContentKind.Document when part.Document is not null:
+                    content.Add(BuildDocumentPart(part.Document));
+                    break;
+
+                case ContentKind.Audio when part.Audio is not null:
+                    throw new ConfigurationError(
+                        "Anthropic Messages API does not support audio input parts in Soulcaster. " +
+                        "Audio attachments should fail closed in capability validation before request execution.");
+
                 case ContentKind.Thinking when part.Thinking is not null:
                     if (part.Thinking.Redacted)
                     {
@@ -584,6 +593,109 @@ public sealed class AnthropicAdapter : IProviderAdapter, IProviderDiscoveryAdapt
         }
 
         return content;
+    }
+
+    private static JsonObject BuildDocumentPart(DocumentData document)
+    {
+        if (!string.IsNullOrWhiteSpace(document.Url))
+        {
+            if (!IsPdfDocument(document.MediaType, document.FileName, document.Url))
+            {
+                throw new ConfigurationError(
+                    "Anthropic document URLs are only supported for PDF inputs in Soulcaster. " +
+                    "Convert non-PDF content into inline plain text before sending it to Anthropic.");
+            }
+
+            return BuildDocumentBlock(
+                new JsonObject
+                {
+                    ["type"] = "url",
+                    ["url"] = document.Url
+                },
+                document);
+        }
+
+        if (document.Data is null)
+            throw new ConfigurationError("Anthropic document inputs require raw bytes or a PDF URL.");
+
+        if (IsPdfDocument(document.MediaType, document.FileName))
+        {
+            return BuildDocumentBlock(
+                new JsonObject
+                {
+                    ["type"] = "base64",
+                    ["media_type"] = "application/pdf",
+                    ["data"] = Convert.ToBase64String(document.Data)
+                },
+                document);
+        }
+
+        if (IsPlainTextDocument(document.MediaType, document.FileName))
+        {
+            return BuildDocumentBlock(
+                new JsonObject
+                {
+                    ["type"] = "text",
+                    ["media_type"] = "text/plain",
+                    ["data"] = System.Text.Encoding.UTF8.GetString(document.Data)
+                },
+                document);
+        }
+
+        throw new ConfigurationError(
+            $"Anthropic document inputs only support PDFs or inline plain text in Soulcaster. Unsupported media type: '{document.MediaType ?? "unknown"}'.");
+    }
+
+    private static JsonObject BuildDocumentBlock(JsonObject source, DocumentData document)
+    {
+        var block = new JsonObject
+        {
+            ["type"] = "document",
+            ["source"] = source
+        };
+
+        if (!string.IsNullOrWhiteSpace(document.FileName))
+            block["title"] = document.FileName;
+
+        return block;
+    }
+
+    private static bool IsPdfDocument(string? mediaType, params string?[] hints)
+    {
+        if (string.Equals(mediaType, "application/pdf", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return hints.Any(hint => !string.IsNullOrWhiteSpace(hint) &&
+            hint.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsPlainTextDocument(string? mediaType, params string?[] hints)
+    {
+        if (!string.IsNullOrWhiteSpace(mediaType))
+        {
+            if (mediaType.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(mediaType, "application/xml", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return hints.Any(hint =>
+        {
+            if (string.IsNullOrWhiteSpace(hint))
+                return false;
+
+            var extension = Path.GetExtension(hint);
+            return extension.Equals(".txt", StringComparison.OrdinalIgnoreCase) ||
+                   extension.Equals(".md", StringComparison.OrdinalIgnoreCase) ||
+                   extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                   extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
+                   extension.Equals(".yaml", StringComparison.OrdinalIgnoreCase) ||
+                   extension.Equals(".yml", StringComparison.OrdinalIgnoreCase);
+        });
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────────

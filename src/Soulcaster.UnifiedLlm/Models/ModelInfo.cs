@@ -11,4 +11,14 @@ public record ModelInfo(
     bool? SupportsReasoning,
     decimal? InputCostPerMillion,
     decimal? OutputCostPerMillion,
-    List<string>? Aliases = null);
+    List<string>? Aliases = null,
+    bool? SupportsStreaming = null,
+    bool? SupportsStructuredOutput = null,
+    bool? SupportsImageOutput = null,
+    bool? SupportsAudioOutput = null,
+    bool? SupportsLongContext = null,
+    bool? RequiresContinuityTokens = null,
+    long? ExpectedLatencyMs = null,
+    bool? SupportsImageInput = null,
+    bool? SupportsDocumentInput = null,
+    bool? SupportsAudioInput = null);

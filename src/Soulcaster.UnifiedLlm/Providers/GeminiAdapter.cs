@@ -233,9 +233,15 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     }
 
                     var inlineData = part["inlineData"] ?? part["inline_data"];
-                    var imageData = ParseInlineImage(inlineData);
+                    var partSignature = ParseThoughtSignature(part);
+                    var imageData = ParseInlineImage(inlineData, partSignature);
                     if (imageData is not null)
                         images.Add(imageData);
+
+                    var fileData = part["fileData"] ?? part["file_data"];
+                    var fileImage = ParseFileImage(fileData, partSignature);
+                    if (fileImage is not null)
+                        images.Add(fileImage);
                 }
             }
 
@@ -355,11 +361,18 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     switch (part.Kind)
                     {
                         case ContentKind.Text when part.Text is not null:
-                            parts.Add(new JsonObject { ["text"] = part.Text });
+                            var textPart = new JsonObject { ["text"] = part.Text };
+                            if (!string.IsNullOrWhiteSpace(part.Signature))
+                                textPart["thoughtSignature"] = part.Signature;
+                            parts.Add(textPart);
                             break;
 
                         case ContentKind.Image when part.Image is not null:
-                            if (part.Image.Data is not null)
+                            if (TryBuildProviderMediaPart(part.Image.ProviderState, out var providerImagePart))
+                            {
+                                parts.Add(providerImagePart);
+                            }
+                            else if (part.Image.Data is not null)
                             {
                                 parts.Add(new JsonObject
                                 {
@@ -378,6 +391,64 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                                     {
                                         ["mimeType"] = part.Image.MediaType ?? "image/png",
                                         ["fileUri"] = part.Image.Url
+                                    }
+                                });
+                            }
+                            break;
+
+                        case ContentKind.Document when part.Document is not null:
+                            if (TryBuildProviderMediaPart(part.Document.ProviderState, out var providerDocumentPart))
+                            {
+                                parts.Add(providerDocumentPart);
+                            }
+                            else if (part.Document.Data is not null)
+                            {
+                                parts.Add(new JsonObject
+                                {
+                                    ["inlineData"] = new JsonObject
+                                    {
+                                        ["mimeType"] = part.Document.MediaType ?? "application/octet-stream",
+                                        ["data"] = Convert.ToBase64String(part.Document.Data)
+                                    }
+                                });
+                            }
+                            else if (part.Document.Url is not null)
+                            {
+                                parts.Add(new JsonObject
+                                {
+                                    ["fileData"] = new JsonObject
+                                    {
+                                        ["mimeType"] = part.Document.MediaType ?? "application/octet-stream",
+                                        ["fileUri"] = part.Document.Url
+                                    }
+                                });
+                            }
+                            break;
+
+                        case ContentKind.Audio when part.Audio is not null:
+                            if (TryBuildProviderMediaPart(part.Audio.ProviderState, out var providerAudioPart))
+                            {
+                                parts.Add(providerAudioPart);
+                            }
+                            else if (part.Audio.Data is not null)
+                            {
+                                parts.Add(new JsonObject
+                                {
+                                    ["inlineData"] = new JsonObject
+                                    {
+                                        ["mimeType"] = part.Audio.MediaType ?? "audio/mpeg",
+                                        ["data"] = Convert.ToBase64String(part.Audio.Data)
+                                    }
+                                });
+                            }
+                            else if (part.Audio.Url is not null)
+                            {
+                                parts.Add(new JsonObject
+                                {
+                                    ["fileData"] = new JsonObject
+                                    {
+                                        ["mimeType"] = part.Audio.MediaType ?? "audio/mpeg",
+                                        ["fileUri"] = part.Audio.Url
                                     }
                                 });
                             }
@@ -673,17 +744,17 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             foreach (var part in partsArray)
             {
                 if (part is null) continue;
+                var thoughtSignature = ParseThoughtSignature(part);
 
                 // Text part
                 var text = part["text"]?.GetValue<string>();
                 if (text is not null)
                 {
                     var isThought = part["thought"]?.GetValue<bool>() ?? false;
-                    var signature = ParseThoughtSignature(part);
                     if (isThought)
-                        content.Add(ContentPart.ThinkingPart(new ThinkingData(text, signature, false)));
+                        content.Add(ContentPart.ThinkingPart(new ThinkingData(text, thoughtSignature, false)));
                     else
-                        content.Add(ContentPart.TextPart(text));
+                        content.Add(ContentPart.TextPart(text, thoughtSignature));
                 }
 
                 // Function call part
@@ -693,14 +764,48 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     var funcName = funcCall["name"]?.GetValue<string>() ?? "";
                     var argsJson = funcCall["args"]?.ToJsonString() ?? "{}";
                     var callId = funcCall["id"]?.GetValue<string>() ?? GenerateSyntheticCallId();
-                    var signature = ParseThoughtSignature(part);
-                    content.Add(ContentPart.ToolCallPart(new ToolCallData(callId, funcName, argsJson, Signature: signature)));
+                    content.Add(ContentPart.ToolCallPart(new ToolCallData(callId, funcName, argsJson, Signature: thoughtSignature)));
                     hasToolCalls = true;
                 }
 
-                var imageData = ParseInlineImage(part["inlineData"] ?? part["inline_data"]);
+                var imageData = ParseInlineImage(part["inlineData"] ?? part["inline_data"], thoughtSignature);
                 if (imageData is not null)
+                {
                     content.Add(ContentPart.ImagePart(imageData));
+                    continue;
+                }
+
+                var documentData = ParseInlineDocument(part["inlineData"] ?? part["inline_data"], thoughtSignature);
+                if (documentData is not null)
+                {
+                    content.Add(ContentPart.DocumentPart(documentData));
+                    continue;
+                }
+
+                var audioData = ParseInlineAudio(part["inlineData"] ?? part["inline_data"], thoughtSignature);
+                if (audioData is not null)
+                {
+                    content.Add(ContentPart.AudioPart(audioData));
+                    continue;
+                }
+
+                var fileImage = ParseFileImage(part["fileData"] ?? part["file_data"], thoughtSignature);
+                if (fileImage is not null)
+                {
+                    content.Add(ContentPart.ImagePart(fileImage));
+                    continue;
+                }
+
+                var fileDocument = ParseFileDocument(part["fileData"] ?? part["file_data"], thoughtSignature);
+                if (fileDocument is not null)
+                {
+                    content.Add(ContentPart.DocumentPart(fileDocument));
+                    continue;
+                }
+
+                var fileAudio = ParseFileAudio(part["fileData"] ?? part["file_data"], thoughtSignature);
+                if (fileAudio is not null)
+                    content.Add(ContentPart.AudioPart(fileAudio));
             }
         }
 
@@ -769,7 +874,38 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         _ => "TEXT"
     };
 
-    private static ImageData? ParseInlineImage(JsonNode? inlineData)
+    private static bool TryBuildProviderMediaPart(JsonObject? providerState, out JsonObject part)
+    {
+        part = null!;
+        if (!MediaProviderState.IsProvider(providerState, "gemini"))
+            return false;
+
+        if (MediaProviderState.CloneValue(providerState, "inlineData") is JsonNode inlineData)
+        {
+            part = new JsonObject
+            {
+                ["inlineData"] = inlineData
+            };
+            if (MediaProviderState.CloneValue(providerState, "thoughtSignature") is JsonNode signature)
+                part["thoughtSignature"] = signature;
+            return true;
+        }
+
+        if (MediaProviderState.CloneValue(providerState, "fileData") is JsonNode fileData)
+        {
+            part = new JsonObject
+            {
+                ["fileData"] = fileData
+            };
+            if (MediaProviderState.CloneValue(providerState, "thoughtSignature") is JsonNode signature)
+                part["thoughtSignature"] = signature;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static ImageData? ParseInlineImage(JsonNode? inlineData, string? thoughtSignature)
     {
         var base64 = inlineData?["data"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(base64))
@@ -779,7 +915,115 @@ public sealed class GeminiAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             ?? inlineData?["mime_type"]?.GetValue<string>()
             ?? "image/png";
 
-        return ImageData.FromBytes(Convert.FromBase64String(base64), mimeType);
+        return ImageData.FromBytes(
+            Convert.FromBase64String(base64),
+            mimeType,
+            providerState: BuildProviderState("inlineData", inlineData, thoughtSignature));
+    }
+
+    private static DocumentData? ParseInlineDocument(JsonNode? inlineData, string? thoughtSignature)
+    {
+        var base64 = inlineData?["data"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(base64))
+            return null;
+
+        var mimeType = inlineData?["mimeType"]?.GetValue<string>()
+            ?? inlineData?["mime_type"]?.GetValue<string>()
+            ?? "application/octet-stream";
+        if (mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            mimeType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return DocumentData.FromBytes(
+            Convert.FromBase64String(base64),
+            mimeType,
+            providerState: BuildProviderState("inlineData", inlineData, thoughtSignature));
+    }
+
+    private static AudioData? ParseInlineAudio(JsonNode? inlineData, string? thoughtSignature)
+    {
+        var base64 = inlineData?["data"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(base64))
+            return null;
+
+        var mimeType = inlineData?["mimeType"]?.GetValue<string>()
+            ?? inlineData?["mime_type"]?.GetValue<string>()
+            ?? "audio/mpeg";
+        if (!mimeType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        return AudioData.FromBytes(
+            Convert.FromBase64String(base64),
+            mimeType,
+            providerState: BuildProviderState("inlineData", inlineData, thoughtSignature));
+    }
+
+    private static ImageData? ParseFileImage(JsonNode? fileData, string? thoughtSignature)
+    {
+        var uri = fileData?["fileUri"]?.GetValue<string>()
+            ?? fileData?["file_uri"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(uri))
+            return null;
+
+        var mimeType = fileData?["mimeType"]?.GetValue<string>()
+            ?? fileData?["mime_type"]?.GetValue<string>()
+            ?? "image/png";
+
+        return ImageData.FromUrl(
+            uri,
+            mimeType,
+            providerState: BuildProviderState("fileData", fileData, thoughtSignature));
+    }
+
+    private static DocumentData? ParseFileDocument(JsonNode? fileData, string? thoughtSignature)
+    {
+        var uri = fileData?["fileUri"]?.GetValue<string>()
+            ?? fileData?["file_uri"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(uri))
+            return null;
+
+        var mimeType = fileData?["mimeType"]?.GetValue<string>()
+            ?? fileData?["mime_type"]?.GetValue<string>()
+            ?? "application/octet-stream";
+        if (mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            mimeType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return DocumentData.FromUrl(
+            uri,
+            mimeType,
+            providerState: BuildProviderState("fileData", fileData, thoughtSignature));
+    }
+
+    private static AudioData? ParseFileAudio(JsonNode? fileData, string? thoughtSignature)
+    {
+        var uri = fileData?["fileUri"]?.GetValue<string>()
+            ?? fileData?["file_uri"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(uri))
+            return null;
+
+        var mimeType = fileData?["mimeType"]?.GetValue<string>()
+            ?? fileData?["mime_type"]?.GetValue<string>()
+            ?? "audio/mpeg";
+        if (!mimeType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        return AudioData.FromUrl(
+            uri,
+            mimeType,
+            providerState: BuildProviderState("fileData", fileData, thoughtSignature));
+    }
+
+    private static JsonObject BuildProviderState(string key, JsonNode? payload, string? thoughtSignature)
+    {
+        return MediaProviderState.Create(
+            "gemini",
+            (key, payload),
+            ("thoughtSignature", string.IsNullOrWhiteSpace(thoughtSignature) ? null : JsonValue.Create(thoughtSignature)));
     }
 
     private HttpRequestMessage CreateModelsRequest(string? nextPageToken)

@@ -41,6 +41,44 @@ public class MultimodalIntegrationTests
     }
 
     [SkippableFact]
+    public async Task OpenAI_ImageOutput_FollowUpTurn_RoundTrips()
+    {
+        Skip.If(string.IsNullOrWhiteSpace(OpenAIApiKey), "OPENAI_API_KEY not set.");
+
+        var adapter = new OpenAIAdapter(OpenAIApiKey!);
+        var model = Environment.GetEnvironmentVariable("OPENAI_IMAGE_MODEL") ?? "gpt-5.4";
+        var initialUser = Message.UserMsg("Create a simple badge-style icon and include one image.");
+        var firstResponse = await adapter.CompleteAsync(new Request
+        {
+            Model = model,
+            Messages = [initialUser],
+            OutputModalities = [ResponseModality.Text, ResponseModality.Image],
+            MaxTokens = 512
+        });
+
+        Assert.NotEmpty(firstResponse.Images);
+        Assert.NotNull(firstResponse.Images[0].ProviderState);
+
+        var secondResponse = await adapter.CompleteAsync(new Request
+        {
+            Model = model,
+            Messages =
+            [
+                initialUser,
+                firstResponse.Message,
+                Message.UserMsg("Continue the same conversation and produce a refined variation of the earlier image.")
+            ],
+            OutputModalities = [ResponseModality.Text, ResponseModality.Image],
+            MaxTokens = 512
+        });
+
+        Assert.Equal("openai", secondResponse.Provider);
+        Assert.NotEmpty(secondResponse.Images);
+
+        PersistArtifacts("openai-followup", firstResponse, secondResponse);
+    }
+
+    [SkippableFact]
     public async Task Gemini_ImageInputAndImageOutput_RoundTrips()
     {
         Skip.If(string.IsNullOrWhiteSpace(GeminiApiKey), "GEMINI_API_KEY not set.");
@@ -70,22 +108,65 @@ public class MultimodalIntegrationTests
         PersistArtifacts("gemini", response);
     }
 
-    private static void PersistArtifacts(string provider, Response response)
+    [SkippableFact]
+    public async Task Gemini_ImageOutput_FollowUpTurn_RoundTrips()
+    {
+        Skip.If(string.IsNullOrWhiteSpace(GeminiApiKey), "GEMINI_API_KEY not set.");
+
+        var adapter = new GeminiAdapter(GeminiApiKey!);
+        var model = Environment.GetEnvironmentVariable("GEMINI_IMAGE_MODEL") ?? "gemini-3.1-flash-image-preview";
+        var initialUser = Message.UserMsg("Create a simple badge-style icon and include one image.");
+        var firstResponse = await adapter.CompleteAsync(new Request
+        {
+            Model = model,
+            Messages = [initialUser],
+            OutputModalities = [ResponseModality.Text, ResponseModality.Image],
+            MaxTokens = 1024
+        });
+
+        Assert.NotEmpty(firstResponse.Images);
+        Assert.NotNull(firstResponse.Images[0].ProviderState);
+
+        var secondResponse = await adapter.CompleteAsync(new Request
+        {
+            Model = model,
+            Messages =
+            [
+                initialUser,
+                firstResponse.Message,
+                Message.UserMsg("Continue the same conversation and produce a refined variation of the earlier image.")
+            ],
+            OutputModalities = [ResponseModality.Text, ResponseModality.Image],
+            MaxTokens = 1024
+        });
+
+        Assert.Equal("gemini", secondResponse.Provider);
+        Assert.NotEmpty(secondResponse.Images);
+
+        PersistArtifacts("gemini-followup", firstResponse, secondResponse);
+    }
+
+    private static void PersistArtifacts(string provider, params Response[] responses)
     {
         var providerDir = Path.Combine(ArtifactRoot, provider);
         Directory.CreateDirectory(providerDir);
 
-        File.WriteAllText(Path.Combine(providerDir, "response.txt"), response.Text);
-
-        for (var i = 0; i < response.Images.Count; i++)
+        for (var responseIndex = 0; responseIndex < responses.Length; responseIndex++)
         {
-            var image = response.Images[i];
-            if (image.Data is null || image.Data.Length == 0)
-                continue;
+            var response = responses[responseIndex];
+            var prefix = responses.Length == 1 ? string.Empty : $"response-{responseIndex + 1}-";
+            File.WriteAllText(Path.Combine(providerDir, $"{prefix}response.txt"), response.Text);
 
-            var extension = GetImageExtension(image.MediaType);
-            var path = Path.Combine(providerDir, $"image-{i + 1}{extension}");
-            File.WriteAllBytes(path, image.Data);
+            for (var imageIndex = 0; imageIndex < response.Images.Count; imageIndex++)
+            {
+                var image = response.Images[imageIndex];
+                if (image.Data is null || image.Data.Length == 0)
+                    continue;
+
+                var extension = GetImageExtension(image.MediaType);
+                var path = Path.Combine(providerDir, $"{prefix}image-{imageIndex + 1}{extension}");
+                File.WriteAllBytes(path, image.Data);
+            }
         }
     }
 

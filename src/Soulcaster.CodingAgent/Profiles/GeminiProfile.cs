@@ -7,7 +7,7 @@ namespace Soulcaster.CodingAgent.Profiles;
 public class GeminiProfile : IProviderProfile
 {
     public string Id => "gemini";
-    public string Model { get; set; } = "gemini-2.5-pro";
+    public string Model { get; set; } = "gemini-3.0-pro-preview";
     public ToolRegistry ToolRegistry { get; } = new();
     public bool SupportsReasoning => true;
     public bool SupportsStreaming => true;

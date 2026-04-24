@@ -8,13 +8,20 @@ public record ContentPart(
     DocumentData? Document = null,
     ToolCallData? ToolCall = null,
     ToolResultData? ToolResult = null,
-    ThinkingData? Thinking = null)
+    ThinkingData? Thinking = null,
+    string? Signature = null)
 {
-    public static ContentPart TextPart(string text) =>
-        new(ContentKind.Text, Text: text);
+    public static ContentPart TextPart(string text, string? signature = null) =>
+        new(ContentKind.Text, Text: text, Signature: signature);
 
     public static ContentPart ImagePart(ImageData image) =>
         new(ContentKind.Image, Image: image);
+
+    public static ContentPart AudioPart(AudioData audio) =>
+        new(ContentKind.Audio, Audio: audio);
+
+    public static ContentPart DocumentPart(DocumentData document) =>
+        new(ContentKind.Document, Document: document);
 
     public static ContentPart ToolCallPart(ToolCallData toolCall) =>
         new(ContentKind.ToolCall, ToolCall: toolCall);

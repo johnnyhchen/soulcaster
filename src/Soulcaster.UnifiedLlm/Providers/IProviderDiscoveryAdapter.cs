@@ -23,4 +23,14 @@ public sealed record ProviderModelDescriptor(
     bool? SupportsTools = null,
     bool? SupportsVision = null,
     bool? SupportsReasoning = null,
-    string? RawJson = null);
+    string? RawJson = null,
+    bool? SupportsStreaming = null,
+    bool? SupportsStructuredOutput = null,
+    bool? SupportsImageOutput = null,
+    bool? SupportsAudioOutput = null,
+    bool? SupportsLongContext = null,
+    bool? RequiresContinuityTokens = null,
+    long? ExpectedLatencyMs = null,
+    bool? SupportsImageInput = null,
+    bool? SupportsDocumentInput = null,
+    bool? SupportsAudioInput = null);

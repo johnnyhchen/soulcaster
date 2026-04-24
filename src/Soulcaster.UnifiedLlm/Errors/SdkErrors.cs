@@ -21,6 +21,30 @@ public class ConfigurationError : SdkException
 }
 
 /// <summary>
+/// Thrown when a model selection cannot satisfy the requested runtime capabilities.
+/// </summary>
+public class CapabilityValidationError : ConfigurationError
+{
+    public CapabilityValidationError(
+        string message,
+        string? provider,
+        string? modelId,
+        string capability)
+        : base(message)
+    {
+        Provider = provider;
+        ModelId = modelId;
+        Capability = capability;
+    }
+
+    public string? Provider { get; }
+
+    public string? ModelId { get; }
+
+    public string Capability { get; }
+}
+
+/// <summary>
 /// Thrown when a provider returns an HTTP error.
 /// </summary>
 public class ProviderError : SdkException

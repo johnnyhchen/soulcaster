@@ -7,7 +7,7 @@ namespace Soulcaster.CodingAgent.Profiles;
 public class AnthropicProfile : IProviderProfile
 {
     public string Id => "anthropic";
-    public string Model { get; set; } = "claude-sonnet-4-20250514";
+    public string Model { get; set; } = "claude-sonnet-4-6";
     public ToolRegistry ToolRegistry { get; } = new();
     public bool SupportsReasoning => true;
     public bool SupportsStreaming => true;

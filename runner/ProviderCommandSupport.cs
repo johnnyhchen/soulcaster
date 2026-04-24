@@ -184,7 +184,7 @@ public static class ProviderCommandSupport
         }
 
         var unknown = candidates
-            .Where(model => ModelCatalog.GetModelInfo(model.Id) is null)
+            .Where(model => !ModelCatalog.IsBuiltInModel(model.Id))
             .OrderBy(model => model.Id, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -225,7 +225,7 @@ public static class ProviderCommandSupport
             GeneratedAtUtc: DateTime.UtcNow.ToString("o"),
             DiscoveredModelCount: selection.DiscoveredModels.Count,
             CandidateModelCount: selection.CandidateModels.Count,
-            ExistingCatalogModelIds: ModelCatalog.ListModels(normalizedProvider)
+            ExistingCatalogModelIds: ModelCatalog.ListBuiltInModels(normalizedProvider)
                 .SelectMany(model => new[] { model.Id }.Concat(model.Aliases ?? []))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)

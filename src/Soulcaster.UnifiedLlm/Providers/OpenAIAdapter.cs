@@ -83,8 +83,18 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 
     public async Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
     {
+        if (RequiresChatCompletionsApi(request))
+        {
+            var chatBody = BuildChatCompletionsRequestBody(request, stream: false);
+            using var chatHttpReq = CreateChatCompletionsHttpRequest(chatBody);
+            using var chatHttpRes = await _http.SendAsync(chatHttpReq, ct).ConfigureAwait(false);
+            var chatResponseBody = await chatHttpRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            EnsureSuccess(chatHttpRes, chatResponseBody);
+            return ParseChatCompletionsResponse(chatResponseBody, request.Model);
+        }
+
         var body = BuildRequestBody(request, stream: false);
-        using var httpReq = CreateHttpRequest(body);
+        using var httpReq = CreateResponsesHttpRequest(body);
         using var httpRes = await _http.SendAsync(httpReq, ct).ConfigureAwait(false);
         var responseBody = await httpRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         EnsureSuccess(httpRes, responseBody);
@@ -97,8 +107,29 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         Request request,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (RequiresChatCompletionsApi(request))
+        {
+            var response = await CompleteAsync(request, ct).ConfigureAwait(false);
+            yield return new StreamEvent { Type = StreamEventType.StreamStart };
+            if (!string.IsNullOrEmpty(response.Text))
+            {
+                yield return new StreamEvent { Type = StreamEventType.TextStart };
+                yield return new StreamEvent { Type = StreamEventType.TextDelta, Delta = response.Text };
+                yield return new StreamEvent { Type = StreamEventType.TextEnd };
+            }
+
+            yield return new StreamEvent
+            {
+                Type = StreamEventType.Finish,
+                FinishReason = response.FinishReason,
+                Usage = response.Usage,
+                Response = response
+            };
+            yield break;
+        }
+
         var body = BuildRequestBody(request, stream: true);
-        using var httpReq = CreateHttpRequest(body);
+        using var httpReq = CreateResponsesHttpRequest(body);
         using var httpRes = await _http.SendAsync(httpReq, HttpCompletionOption.ResponseHeadersRead, ct)
             .ConfigureAwait(false);
 
@@ -295,15 +326,18 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 
     private JsonObject BuildRequestBody(Request request, bool stream)
     {
+        var (previousResponseId, inputMessages) = ResolvePreviousResponseContext(request.Messages);
         var body = new JsonObject
         {
             ["model"] = request.Model,
             ["stream"] = stream
         };
+        if (!string.IsNullOrWhiteSpace(previousResponseId))
+            body["previous_response_id"] = previousResponseId;
 
         // Build input (messages array)
         var input = new JsonArray();
-        foreach (var msg in request.Messages)
+        foreach (var msg in inputMessages)
         {
             var role = msg.Role switch
             {
@@ -335,20 +369,23 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 
             if (msg.Role == Role.Assistant)
             {
-                // Assistant messages may contain tool calls
+                var assistantContent = new JsonArray();
+                var assistantToolCalls = new List<JsonObject>();
                 foreach (var part in msg.Content)
                 {
                     if (part.Kind == ContentKind.Text && part.Text is not null)
                     {
-                        input.Add(new JsonObject
-                        {
-                            ["role"] = "assistant",
-                            ["content"] = part.Text
-                        });
+                        assistantContent.Add(BuildResponsesTextPart(part.Text, assistantRole: true));
+                    }
+                    else if (part.Kind is ContentKind.Image or ContentKind.Document or ContentKind.Audio)
+                    {
+                        throw new ConfigurationError(
+                            "OpenAI assistant media history must be replayed via previous_response_id. " +
+                            "Preserve the originating assistant response ID when continuing a multimodal conversation.");
                     }
                     else if (part.Kind == ContentKind.ToolCall && part.ToolCall is not null)
                     {
-                        input.Add(new JsonObject
+                        assistantToolCalls.Add(new JsonObject
                         {
                             ["type"] = "function_call",
                             ["call_id"] = part.ToolCall.Id,
@@ -357,6 +394,19 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                         });
                     }
                 }
+
+                if (assistantContent.Count > 0)
+                {
+                    input.Add(new JsonObject
+                    {
+                        ["role"] = "assistant",
+                        ["content"] = assistantContent
+                    });
+                }
+
+                foreach (var toolCall in assistantToolCalls)
+                    input.Add(toolCall);
+
                 continue;
             }
 
@@ -378,33 +428,21 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                     switch (part.Kind)
                     {
                         case ContentKind.Text when part.Text is not null:
-                            contentArray.Add(new JsonObject
-                            {
-                                ["type"] = "input_text",
-                                ["text"] = part.Text
-                            });
+                            contentArray.Add(BuildResponsesTextPart(part.Text, assistantRole: false));
                             break;
 
                         case ContentKind.Image when part.Image is not null:
-                            if (part.Image.Url is not null)
-                            {
-                                contentArray.Add(new JsonObject
-                                {
-                                    ["type"] = "input_image",
-                                    ["image_url"] = part.Image.Url
-                                });
-                            }
-                            else if (part.Image.Data is not null)
-                            {
-                                var mimeType = part.Image.MediaType ?? "image/png";
-                                var b64 = Convert.ToBase64String(part.Image.Data);
-                                contentArray.Add(new JsonObject
-                                {
-                                    ["type"] = "input_image",
-                                    ["image_url"] = $"data:{mimeType};base64,{b64}"
-                                });
-                            }
+                            contentArray.Add(BuildResponsesImagePart(part.Image));
                             break;
+
+                        case ContentKind.Document when part.Document is not null:
+                            contentArray.Add(BuildResponsesDocumentPart(part.Document));
+                            break;
+
+                        case ContentKind.Audio when part.Audio is not null:
+                            throw new ConfigurationError(
+                                "OpenAI Responses API does not yet support audio input parts in Soulcaster. " +
+                                "Audio input requests must use the Chat Completions audio path.");
                     }
                 }
                 input.Add(new JsonObject
@@ -548,6 +586,32 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         return body;
     }
 
+    private static (string? PreviousResponseId, IReadOnlyList<Message> Messages) ResolvePreviousResponseContext(
+        IReadOnlyList<Message> messages)
+    {
+        var assistantIndex = -1;
+        for (var i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i].Role == Role.Assistant && !string.IsNullOrWhiteSpace(messages[i].ResponseId))
+            {
+                assistantIndex = i;
+                break;
+            }
+        }
+
+        if (assistantIndex < 0)
+            return (null, messages);
+
+        var chainedMessages = new List<Message>();
+        chainedMessages.AddRange(messages.Where(message => message.Role is Role.System or Role.Developer));
+        chainedMessages.AddRange(messages.Skip(assistantIndex + 1).Where(message => message.Role is not (Role.System or Role.Developer)));
+
+        if (chainedMessages.Count == 0)
+            return (null, messages);
+
+        return (messages[assistantIndex].ResponseId, chainedMessages);
+    }
+
     // ── HTTP helpers ───────────────────────────────────────────────────
 
     private HttpRequestMessage CreateModelsRequest()
@@ -557,9 +621,24 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         return httpReq;
     }
 
-    private HttpRequestMessage CreateHttpRequest(JsonObject body)
+    private HttpRequestMessage CreateResponsesHttpRequest(JsonObject body)
     {
         var httpReq = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/responses")
+        {
+            Content = new StringContent(
+                body.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+                System.Text.Encoding.UTF8,
+                "application/json")
+        };
+
+        httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+
+        return httpReq;
+    }
+
+    private HttpRequestMessage CreateChatCompletionsHttpRequest(JsonObject body)
+    {
+        var httpReq = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/chat/completions")
         {
             Content = new StringContent(
                 body.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
@@ -675,7 +754,10 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
                         {
                             var mimeType = item["mime_type"]?.GetValue<string>() ?? "image/png";
                             var imageBytes = Convert.FromBase64String(imageBase64);
-                            content.Add(ContentPart.ImagePart(ImageData.FromBytes(imageBytes, mimeType)));
+                            content.Add(ContentPart.ImagePart(ImageData.FromBytes(
+                                imageBytes,
+                                mimeType,
+                                providerState: BuildImageProviderState(item, mimeType, imageBytes))));
                         }
                         break;
                 }
@@ -686,9 +768,65 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         var finishReason = MapFinishReason(status, hasToolCalls);
         var usage = ParseUsage(node["usage"]);
 
-        var msg = new Message(Role.Assistant, content.Count > 0 ? content : [ContentPart.TextPart("")]);
+        var msg = new Message(Role.Assistant, content.Count > 0 ? content : [ContentPart.TextPart("")], ResponseId: id);
 
         return new Response(id, model, Name, msg, finishReason, usage);
+    }
+
+    private Response ParseChatCompletionsResponse(string responseBody, string requestModel)
+    {
+        var node = JsonNode.Parse(responseBody)
+            ?? throw new ProviderError("Empty response from OpenAI", HttpStatusCode.InternalServerError, providerName: Name);
+
+        var id = node["id"]?.GetValue<string>() ?? "";
+        var model = node["model"]?.GetValue<string>() ?? requestModel;
+        var choice = node["choices"]?[0];
+        var finishReason = MapChatCompletionsFinishReason(choice?["finish_reason"]?.GetValue<string>());
+        var messageNode = choice?["message"];
+
+        var content = new List<ContentPart>();
+        var messageContent = messageNode?["content"];
+        if (messageContent is JsonArray blocks)
+        {
+            foreach (var block in blocks)
+            {
+                if (block is null)
+                    continue;
+
+                var type = block["type"]?.GetValue<string>();
+                if (type == "text")
+                    content.Add(ContentPart.TextPart(block["text"]?.GetValue<string>() ?? string.Empty));
+            }
+        }
+        else if (messageContent is not null)
+        {
+            var text = messageContent.GetValue<string?>();
+            if (!string.IsNullOrEmpty(text))
+                content.Add(ContentPart.TextPart(text));
+        }
+
+        var toolCalls = messageNode?["tool_calls"]?.AsArray();
+        if (toolCalls is not null)
+        {
+            foreach (var toolCall in toolCalls)
+            {
+                if (toolCall is null)
+                    continue;
+
+                var idValue = toolCall["id"]?.GetValue<string>() ?? string.Empty;
+                var function = toolCall["function"];
+                if (function is null)
+                    continue;
+
+                content.Add(ContentPart.ToolCallPart(new ToolCallData(
+                    idValue,
+                    function["name"]?.GetValue<string>() ?? string.Empty,
+                    function["arguments"]?.GetValue<string>() ?? "{}")));
+            }
+        }
+
+        var msg = new Message(Role.Assistant, content.Count > 0 ? content : [ContentPart.TextPart(string.Empty)], ResponseId: id);
+        return new Response(id, model, Name, msg, finishReason, ParseChatCompletionsUsage(node["usage"]));
     }
 
     private static FinishReason MapFinishReason(string? status, bool hasToolCalls)
@@ -703,6 +841,15 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             _ => FinishReason.Stop
         };
     }
+
+    private static FinishReason MapChatCompletionsFinishReason(string? finishReason) => finishReason switch
+    {
+        "tool_calls" => FinishReason.ToolCalls,
+        "length" => FinishReason.Length,
+        "content_filter" => FinishReason.ContentFilter,
+        "stop" or null or "" => FinishReason.Stop,
+        _ => FinishReason.Stop
+    };
 
     private static Usage ParseUsage(JsonNode? usage)
     {
@@ -731,6 +878,378 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             TotalTokens: input + output,
             ReasoningTokens: reasoningTokens is > 0 ? reasoningTokens : null,
             CacheReadTokens: cacheRead is > 0 ? cacheRead : null);
+    }
+
+    private static Usage ParseChatCompletionsUsage(JsonNode? usage)
+    {
+        if (usage is null) return Usage.Empty;
+
+        var input = usage["prompt_tokens"]?.GetValue<int>() ?? 0;
+        var output = usage["completion_tokens"]?.GetValue<int>() ?? 0;
+        var total = usage["total_tokens"]?.GetValue<int>() ?? (input + output);
+
+        int? reasoningTokens = null;
+        var completionDetails = usage["completion_tokens_details"];
+        if (completionDetails is not null)
+            reasoningTokens = completionDetails["reasoning_tokens"]?.GetValue<int>();
+
+        int? cacheRead = null;
+        var promptDetails = usage["prompt_tokens_details"];
+        if (promptDetails is not null)
+            cacheRead = promptDetails["cached_tokens"]?.GetValue<int>();
+
+        return new Usage(
+            InputTokens: input,
+            OutputTokens: output,
+            TotalTokens: total,
+            ReasoningTokens: reasoningTokens is > 0 ? reasoningTokens : null,
+            CacheReadTokens: cacheRead is > 0 ? cacheRead : null);
+    }
+
+    private JsonObject BuildChatCompletionsRequestBody(Request request, bool stream)
+    {
+        if (request.Tools is { Count: > 0 })
+        {
+            throw new ConfigurationError(
+                "OpenAI audio-input requests do not yet support tool calling in Soulcaster's Chat Completions path.");
+        }
+
+        if (WantsOutputModality(request, ResponseModality.Image))
+        {
+            throw new ConfigurationError(
+                "OpenAI audio-input requests do not support image output in Soulcaster's Chat Completions path.");
+        }
+
+        if (request.ResponseFormat is not null)
+        {
+            throw new ConfigurationError(
+                "OpenAI audio-input requests do not yet support response_format in Soulcaster's Chat Completions path.");
+        }
+
+        var body = new JsonObject
+        {
+            ["model"] = request.Model,
+            ["stream"] = stream
+        };
+
+        var messages = new JsonArray();
+        foreach (var msg in request.Messages)
+        {
+            var role = msg.Role switch
+            {
+                Role.System => "system",
+                Role.User => "user",
+                Role.Assistant => "assistant",
+                Role.Developer => "developer",
+                Role.Tool => "tool",
+                _ => "user"
+            };
+
+            if (msg.Content.Count == 1 && msg.Content[0].Kind == ContentKind.Text)
+            {
+                messages.Add(new JsonObject
+                {
+                    ["role"] = role,
+                    ["content"] = msg.Content[0].Text
+                });
+                continue;
+            }
+
+            var content = new JsonArray();
+            foreach (var part in msg.Content)
+            {
+                switch (part.Kind)
+                {
+                    case ContentKind.Text when part.Text is not null:
+                        content.Add(new JsonObject
+                        {
+                            ["type"] = "text",
+                            ["text"] = part.Text
+                        });
+                        break;
+
+                    case ContentKind.Image when part.Image is not null:
+                        content.Add(BuildChatImagePart(part.Image));
+                        break;
+
+                    case ContentKind.Document when part.Document is not null:
+                        content.Add(BuildChatDocumentPart(part.Document));
+                        break;
+
+                    case ContentKind.Audio when part.Audio is not null:
+                        content.Add(BuildChatAudioPart(part.Audio));
+                        break;
+
+                    case ContentKind.ToolCall:
+                    case ContentKind.ToolResult:
+                        throw new ConfigurationError(
+                            "OpenAI audio-input requests do not yet support tool-call transcript replay in Soulcaster's Chat Completions path.");
+                }
+            }
+
+            messages.Add(new JsonObject
+            {
+                ["role"] = role,
+                ["content"] = content
+            });
+        }
+
+        body["messages"] = messages;
+
+        if (request.MaxTokens is not null)
+            body["max_completion_tokens"] = request.MaxTokens.Value;
+
+        if (request.Temperature is not null)
+            body["temperature"] = request.Temperature.Value;
+
+        if (request.TopP is not null)
+            body["top_p"] = request.TopP.Value;
+
+        if (request.StopSequences is { Count: > 0 })
+        {
+            var stops = new JsonArray();
+            foreach (var stop in request.StopSequences)
+                stops.Add(stop);
+            body["stop"] = stops;
+        }
+
+        if (request.Metadata is not null && request.Metadata.Count > 0)
+        {
+            var meta = new JsonObject();
+            foreach (var (key, value) in request.Metadata)
+                meta[key] = value;
+            body["metadata"] = meta;
+        }
+
+        if (request.ProviderOptions is not null)
+        {
+            foreach (var (key, value) in request.ProviderOptions)
+            {
+                if (body.ContainsKey(key))
+                    continue;
+
+                body[key] = JsonSerializer.SerializeToNode(value);
+            }
+        }
+
+        return body;
+    }
+
+    private static JsonObject BuildResponsesTextPart(string text, bool assistantRole)
+    {
+        return new JsonObject
+        {
+            ["type"] = assistantRole ? "output_text" : "input_text",
+            ["text"] = text
+        };
+    }
+
+    private static JsonObject BuildResponsesImagePart(ImageData image)
+    {
+        if (TryGetOpenAiImageUrl(image, out var imageUrl))
+        {
+            return BuildResponsesImagePart(imageUrl, image.Detail);
+        }
+
+        if (!string.IsNullOrWhiteSpace(image.Url))
+        {
+            return BuildResponsesImagePart(image.Url!, image.Detail);
+        }
+
+        if (image.Data is null)
+            throw new ConfigurationError("OpenAI image inputs require either raw bytes or a URL.");
+
+        return BuildResponsesImagePart(
+            BuildDataUrl(image.MediaType ?? "image/png", image.Data),
+            image.Detail);
+    }
+
+    private static JsonObject BuildResponsesImagePart(string imageUrl, string? detail)
+    {
+        var part = new JsonObject
+        {
+            ["type"] = "input_image",
+            ["image_url"] = imageUrl
+        };
+
+        if (!string.IsNullOrWhiteSpace(detail))
+            part["detail"] = detail;
+
+        return part;
+    }
+
+    private static JsonObject BuildResponsesDocumentPart(DocumentData document)
+    {
+        if (!string.IsNullOrWhiteSpace(document.Url))
+        {
+            return new JsonObject
+            {
+                ["type"] = "input_file",
+                ["file_url"] = document.Url
+            };
+        }
+
+        if (document.Data is null)
+        {
+            throw new ConfigurationError("OpenAI document inputs require either raw file bytes or a file URL.");
+        }
+
+        return new JsonObject
+        {
+            ["type"] = "input_file",
+            ["filename"] = document.FileName ?? "attachment",
+            ["file_data"] = BuildDataUrl(document.MediaType ?? "application/octet-stream", document.Data)
+        };
+    }
+
+    private static JsonObject BuildChatImagePart(ImageData image)
+    {
+        if (TryGetOpenAiImageUrl(image, out var providerImageUrl))
+        {
+            return BuildChatImagePart(providerImageUrl, image.Detail);
+        }
+
+        if (!string.IsNullOrWhiteSpace(image.Url))
+        {
+            return BuildChatImagePart(image.Url!, image.Detail);
+        }
+
+        if (image.Data is null)
+            throw new ConfigurationError("OpenAI image inputs require either raw bytes or a URL.");
+
+        return BuildChatImagePart(
+            BuildDataUrl(image.MediaType ?? "image/png", image.Data),
+            image.Detail);
+    }
+
+    private static JsonObject BuildChatImagePart(string imageUrl, string? detail)
+    {
+        var imageUrlObject = new JsonObject
+        {
+            ["url"] = imageUrl
+        };
+
+        if (!string.IsNullOrWhiteSpace(detail))
+            imageUrlObject["detail"] = detail;
+
+        return new JsonObject
+        {
+            ["type"] = "image_url",
+            ["image_url"] = imageUrlObject
+        };
+    }
+
+    private static bool TryGetOpenAiImageUrl(ImageData image, out string imageUrl)
+    {
+        imageUrl = string.Empty;
+        if (!MediaProviderState.IsProvider(image.ProviderState, "openai"))
+            return false;
+
+        var storedUrl = MediaProviderState.GetString(image.ProviderState, "image_url");
+        if (string.IsNullOrWhiteSpace(storedUrl))
+            return false;
+
+        imageUrl = storedUrl;
+        return true;
+    }
+
+    private static JsonObject BuildImageProviderState(JsonNode item, string mimeType, byte[] imageBytes)
+    {
+        var itemId = item["id"]?.GetValue<string>();
+        var revisedPrompt = item["revised_prompt"]?.GetValue<string>();
+
+        return MediaProviderState.Create(
+            "openai",
+            ("kind", JsonValue.Create("image")),
+            ("source", JsonValue.Create("image_generation_call")),
+            ("image_url", JsonValue.Create(BuildDataUrl(mimeType, imageBytes))),
+            ("output_item_id", string.IsNullOrWhiteSpace(itemId) ? null : JsonValue.Create(itemId)),
+            ("revised_prompt", string.IsNullOrWhiteSpace(revisedPrompt) ? null : JsonValue.Create(revisedPrompt)));
+    }
+
+    private static JsonObject BuildChatDocumentPart(DocumentData document)
+    {
+        if (!string.IsNullOrWhiteSpace(document.Url))
+        {
+            throw new ConfigurationError(
+                "OpenAI Chat Completions file inputs do not support external document URLs in Soulcaster. Use raw bytes or a file ID.");
+        }
+
+        if (document.Data is null)
+            throw new ConfigurationError("OpenAI document inputs require raw file bytes in Soulcaster's Chat Completions path.");
+
+        return new JsonObject
+        {
+            ["type"] = "file",
+            ["file"] = new JsonObject
+            {
+                ["filename"] = document.FileName ?? "attachment",
+                ["file_data"] = BuildDataUrl(document.MediaType ?? "application/octet-stream", document.Data)
+            }
+        };
+    }
+
+    private static JsonObject BuildChatAudioPart(AudioData audio)
+    {
+        if (!string.IsNullOrWhiteSpace(audio.Url))
+        {
+            throw new ConfigurationError(
+                "OpenAI Chat Completions audio inputs do not support external audio URLs in Soulcaster. Use raw audio bytes instead.");
+        }
+
+        if (audio.Data is null)
+            throw new ConfigurationError("OpenAI audio inputs require raw audio bytes in Soulcaster's Chat Completions path.");
+
+        return new JsonObject
+        {
+            ["type"] = "input_audio",
+            ["input_audio"] = new JsonObject
+            {
+                ["data"] = Convert.ToBase64String(audio.Data),
+                ["format"] = ResolveAudioFormat(audio)
+            }
+        };
+    }
+
+    private static bool RequiresChatCompletionsApi(Request request) =>
+        request.Messages
+            .SelectMany(message => message.Content)
+            .Any(part => part.Kind == ContentKind.Audio && part.Audio is not null);
+
+    private static string BuildDataUrl(string mediaType, byte[] data) =>
+        $"data:{mediaType};base64,{Convert.ToBase64String(data)}";
+
+    private static string ResolveAudioFormat(AudioData audio)
+    {
+        var mediaType = audio.MediaType?.ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(mediaType))
+        {
+            return mediaType switch
+            {
+                "audio/wav" or "audio/x-wav" => "wav",
+                "audio/mpeg" => "mp3",
+                "audio/mp4" or "audio/x-m4a" => "m4a",
+                "audio/ogg" => "ogg",
+                "audio/flac" => "flac",
+                _ => ResolveAudioFormatFromFileName(audio.FileName)
+            };
+        }
+
+        return ResolveAudioFormatFromFileName(audio.FileName);
+    }
+
+    private static string ResolveAudioFormatFromFileName(string? fileName)
+    {
+        return Path.GetExtension(fileName ?? string.Empty).ToLowerInvariant() switch
+        {
+            ".wav" => "wav",
+            ".mp3" => "mp3",
+            ".m4a" => "m4a",
+            ".ogg" => "ogg",
+            ".flac" => "flac",
+            _ => throw new ConfigurationError(
+                "OpenAI audio inputs require a recognized audio format (wav, mp3, m4a, ogg, or flac).")
+        };
     }
 
     private static bool WantsOutputModality(Request request, ResponseModality modality) =>

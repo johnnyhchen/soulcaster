@@ -7,7 +7,7 @@ namespace Soulcaster.CodingAgent.Profiles;
 public class OpenAIProfile : IProviderProfile
 {
     public string Id => "openai";
-    public string Model { get; set; } = "o3";
+    public string Model { get; set; } = "gpt-5.3-codex";
     public ToolRegistry ToolRegistry { get; } = new();
     public bool SupportsReasoning => true;
     public bool SupportsStreaming => true;
