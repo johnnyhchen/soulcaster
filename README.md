@@ -1,8 +1,8 @@
 # Soulcaster
 
-A C# implementation of the [strongDM Attractor](https://github.com/strongdm/attractor) spec — a DOT-based pipeline runner that orchestrates multi-stage AI workflows using directed graphs.
+A C# implementation of the [strongDM Attractor](https://github.com/strongdm/attractor) spec for long-running, multi-stage AI workflows.
 
-You define your workflow as a Graphviz DOT file: nodes are AI tasks (LLM calls, human review gates, parallel fan-outs), edges are transitions with conditions. The engine walks the graph, dispatching each node to the appropriate LLM, and routes between nodes based on outcomes.
+Soulcaster is now more than a file-only DOT runner. The current runtime supports durable run state, policy-constrained control-plane mutations, versioned artifacts, replay, lane-aware multimodal execution, and capability-aware model routing while keeping the local-first DOT workflow intact.
 
 ## Architecture
 
@@ -24,6 +24,36 @@ attractor_specs/                # Original spec documents and run learnings
 2. **Coding Agent** — agentic loop that gives an LLM tools (file read/write, bash, grep, glob) and runs multi-turn sessions until the task is complete.
 3. **Attractor** — pipeline engine that parses DOT files, resolves handlers by node shape, manages state/checkpoints, and traverses the graph.
 
+## Current Runtime Status
+
+- Durable run state under `store/`, including `store/workflow.sqlite`
+- Authoritative SQLite lease ownership and direct `operator_mutations` journaling
+- Audited operator mutations: `cancel`, `retry-stage`, `resume`, `force-advance`
+- Workflow policy enforcement for retry budgets and force-advance allow-lists
+- Versioned artifact registry with lineage, promotion, and rollback
+- Nested generated artifacts, including multimodal image outputs, projected into JSON and SQLite
+- Replayable run history from stored events
+- Real asynchronous subagents with non-blocking `spawn_agent`
+- Capability-aware model validation, registry refresh, latency-aware routing, and per-model scorecards
+- Dedicated `agent`, `leaf`, and `multimodal_leaf` lanes with continuity-preserving multimodal follow-up turns
+- Leaf attachment authoring for images, documents, and audio where the selected provider supports them
+- OpenAI leaf document ingestion on `gpt-5.4` and audio ingestion on `gpt-audio`, both behind fail-closed capability validation
+- OpenAI follow-up image continuity through `previous_response_id`, Gemini replayable media continuity through preserved provider-state plus `thoughtSignature` payloads, and Anthropic document follow-up continuity through persisted raw history
+- Anthropic leaf document ingestion on Claude models, with Anthropic audio left as explicit fail-closed no-support
+- Saved durable query views over `workflow.sqlite` from both CLI and web: `overview`, `attempts`, `failures`, `gates`, `artifacts`, `operators`, `providers`, `events`, `scorecards`, `hotspots`, `lineage`, `leases`, and `mutations`
+- Operational Views in the web dashboard for failures, operators, hotspots, scorecards, leases, and mutations
+- `run --dry-run --json`, builder templates, reference-image and reference-document authoring, and preview output for workflow authoring
+- Built-in crash-injection and scripted-provider drills for restart and degradation testing
+
+## Remaining Roadmap Items
+
+The core reliability work is done. The remaining roadmap is productization and breadth work on top of the shipped runner:
+
+- Richer operator surfaces: better dashboards, saved filters, and easier drill launch/review flows.
+- Broader provider coverage: extend the shipped attachment and continuity discipline to more adapters and modalities beyond the current OpenAI/Gemini/Anthropic set.
+- Historical analytics: cross-run trends, retention/pruning policy, and rollups for flaky stages, slow nodes, and expensive models.
+- Authoring polish: more guided builder flows, more reference workflows, and better large-graph editing ergonomics.
+
 ## Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
@@ -44,26 +74,116 @@ dotnet build
 ## Test
 
 ```bash
-dotnet test
+dotnet test tests/Soulcaster.Tests/Soulcaster.Tests.csproj --no-restore --filter "FullyQualifiedName!~MultimodalIntegrationTests"
 ```
+
+That non-live suite is the stable local validation path and currently passes `477/477`. The live-provider `MultimodalIntegrationTests` still depend on external provider behavior.
 
 ## Run a Pipeline
 
 ```bash
-dotnet run --project runner -- <path-to-dotfile>
+dotnet run --project runner -- run <path-to-dotfile>
 ```
 
-For example, to run the reference pipeline:
+The shorthand form still works:
 
 ```bash
 dotnet run --project runner -- dotfiles/reference-run.dot
 ```
 
-The runner will:
-1. Parse the DOT file
-2. Create an `output/` directory next to the dotfile for artifacts
-3. Walk the graph from `start` to `exit`, executing each node
-4. Print progress and outcomes to the console
+For example, to start the reference pipeline explicitly:
+
+```bash
+dotnet run --project runner -- run dotfiles/reference-run.dot
+```
+
+Each run writes:
+
+- `logs/` for human-readable stage artifacts
+- `store/` for run events, gate answers, and SQLite projections
+- `result.json` and `run-manifest.json` for summarized run state
+
+To resume from an existing run directory:
+
+```bash
+dotnet run --project runner -- run dotfiles/reference-run.dot --resume-from dotfiles/output/reference-run
+```
+
+To preview a workflow without spending provider calls:
+
+```bash
+dotnet run --project runner -- run dotfiles/reference-run.dot --dry-run --json
+```
+
+For restart drills or QA fault injection:
+
+```bash
+dotnet run --project runner -- run dotfiles/qa-autoresume-crash.dot --backend scripted --backend-script crash-plan.json --autoresume-policy always --crash-after-stage crash_point --crash-after-stage-count 2
+```
+
+## Preview and Author Workflows
+
+The runner now has first-class preview and builder commands on top of raw DOT editing.
+
+```bash
+# Preview lint, node policy, and control policy without execution
+dotnet run --project runner -- run dotfiles/reference-run.dot --dry-run --json
+dotnet run --project runner -- builder preview dotfiles/reference-run.dot
+
+# Scaffold a workflow template
+dotnet run --project runner -- builder template coding-loop my-workflow.dot --goal "Ship the requested change"
+dotnet run --project runner -- builder template multimodal-edit-loop visual.dot --reference-image assets/reference.png
+dotnet run --project runner -- builder template document-critique-loop review.dot --reference-document docs/brief.md
+
+# Inspect or edit an existing graph
+dotnet run --project runner -- builder inspect dotfiles/reference-run.dot
+dotnet run --project runner -- builder node review.dot review_document --input-documents docs/brief.md --input-audio recordings/note.mp3
+```
+
+`builder preview` now resolves image, document, and audio inputs, distinguishes source files from deferred `logs/...` runtime artifacts, and lint-checks lane compatibility before execution.
+
+## Inspect and Steer a Run
+
+The runner is not just fire-and-forget anymore. You can inspect, answer gates, replay history, mutate run state, and inspect artifact lineage from the CLI.
+
+```bash
+# Run status and artifacts
+dotnet run --project runner -- status --dir dotfiles/output/reference-run
+dotnet run --project runner -- logs --dir dotfiles/output/reference-run
+dotnet run --project runner -- replay --dir dotfiles/output/reference-run
+dotnet run --project runner -- query list
+dotnet run --project runner -- query overview --dir dotfiles/output/reference-run --json
+dotnet run --project runner -- query operators --dir dotfiles/output/reference-run --json
+dotnet run --project runner -- query hotspots --dir dotfiles/output/reference-run --json
+dotnet run --project runner -- query lineage --dir dotfiles/output/reference-run --artifact plan --json
+dotnet run --project runner -- query mutations --dir dotfiles/output/reference-run --actor johnny --json
+
+# Human gate inspection and answer
+dotnet run --project runner -- gate --dir dotfiles/output/reference-run
+dotnet run --project runner -- gate answer <choice> --dir dotfiles/output/reference-run --actor johnny --reason "Looks good" --source cli
+
+# Audited control-plane mutations
+dotnet run --project runner -- control cancel --dir dotfiles/output/reference-run --reason "Operator stop" --actor johnny
+dotnet run --project runner -- control retry-stage --dir dotfiles/output/reference-run --node validate --reason "Rerun after fix" --actor johnny --expected-version 12
+dotnet run --project runner -- control resume --dir dotfiles/output/reference-run --reason "Continue run" --actor johnny --expected-version 13
+dotnet run --project runner -- control force-advance --dir dotfiles/output/reference-run --to-node done --reason "Manual override" --actor johnny --expected-version 14
+
+# Artifact lineage and promotion
+dotnet run --project runner -- artifact list --dir dotfiles/output/reference-run
+dotnet run --project runner -- artifact lineage --dir dotfiles/output/reference-run plan
+dotnet run --project runner -- artifact promote --dir dotfiles/output/reference-run plan artifact-version-id --reason "Approved plan" --actor johnny
+dotnet run --project runner -- artifact rollback --dir dotfiles/output/reference-run plan --reason "Revert promotion" --actor johnny
+
+# Provider registry and scorecards
+dotnet run --project runner -- providers registry refresh --provider openai --json
+dotnet run --project runner -- providers registry show --json
+dotnet run --project runner -- scorecard --dir dotfiles/output/reference-run --json
+
+# Web dashboard
+dotnet run --project runner -- web --dir dotfiles/output/reference-run --port 5051
+```
+
+The query surface supports shared filters such as `--node`, `--status`, `--event-type`, `--provider`, `--model`, `--actor`, `--artifact`, `--approval-state`, and `--search`. The web dashboard consumes the same saved query views and renders an Operational Views section over the durable SQLite state.
 
 ## Writing a Dotfile
 
@@ -77,7 +197,7 @@ The reference pipeline at [`dotfiles/reference-run.dot`](dotfiles/reference-run.
 
 ### Artifact Trail and Resumability
 
-Every phase writes numbered markdown artifacts to `output/logs/`. This serves two purposes: (1) the pipeline can resume from any point if interrupted, and (2) loop iterations (validate→plan, critique→plan) build on prior work rather than starting over.
+Every phase writes numbered markdown artifacts to `output/logs/`. The runtime also records operational state under `output/store/`, which is what enables replay, audited mutations, and SQLite-backed inspection in addition to the human-readable files.
 
 ```
 output/logs/
@@ -183,27 +303,35 @@ The `model_stylesheet` graph attribute assigns LLM providers and models to nodes
 
 ```dot
 model_stylesheet = "
-    * { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
-    .opus  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
-    .codex { provider = \"openai\";    model = \"codex-5.2\" }
-    .gpt   { provider = \"openai\";    model = \"gpt-5.2\" }
+    *       { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+    .opus   { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+    .review { provider = \"openai\";    model = \"gpt-5.4\" }
+    .code   { provider = \"openai\";    model = \"gpt-5.3-codex\" }
+    .fast   { provider = \"openai\";    model = \"gpt-5.2-mini\" }
 "
 ```
 
 Then assign classes to nodes: `my_node [class="opus", prompt="..."]`
 
-### Available Models
+The runtime can also discover provider models dynamically through the registry cache, so built-in catalog entries are not the only models you can route to.
+
+### Available Built-In Models
 
 | ID | Provider | Use Case |
 |----|----------|----------|
 | `claude-opus-4-6` | Anthropic | Planning, architecture, complex reasoning |
 | `claude-sonnet-4-6` | Anthropic | General purpose (default) |
 | `claude-haiku-4-5` | Anthropic | Fast, lightweight tasks |
-| `gpt-5.2` | OpenAI | General reasoning, critique |
-| `gpt-5.2-codex` / `codex-5.2` | OpenAI | Agentic coding, implementation |
-| `codex-5.3` / `gpt-5.3-codex` | OpenAI | Latest agentic coding model |
+| `gpt-5.4` | OpenAI | General reasoning, critique |
+| `gpt-audio` | OpenAI | Audio-input leaf review and transcription-style flows |
+| `gpt-5.2-codex` / `codex-5.2` | OpenAI | Compatibility alias for coding flows |
+| `gpt-5.3-codex` / `codex-5.3` | OpenAI | Primary coding model |
 | `gpt-5.2-mini` | OpenAI | Fast, lightweight tasks |
-| `gemini-3.0-pro-preview` | Google | Large context (1M tokens) |
+| `gemini-3.0-pro-preview` | Google | Large-context reasoning |
+| `gemini-3.0-flash-preview` | Google | Faster lower-latency tasks |
+| `gemini-2.5-pro` | Google | Capability validation regression target and compatibility path |
+
+Discovered models such as `gpt-5.4-mini` can also appear at runtime after `providers registry refresh`, even when they are not hard-coded into the built-in catalog.
 
 ### Visualizing a Dotfile
 
@@ -225,5 +353,9 @@ open dotfiles/reference-run.svg
 ## Learn More
 
 - [Attractor Spec](https://github.com/strongdm/attractor) — the upstream spec this implements
-- [`attractor_specs/`](attractor_specs/) — local copies of the spec, coding agent loop spec, unified LLM spec, and run learnings
+- [`attractor_specs/`](attractor_specs/) — local copies of the upstream specs and run learnings
 - [`dotfiles/reference-run.dot`](dotfiles/reference-run.dot) — annotated reference pipeline
+- [`RELIABILITY-GAP-CLOSURE-PLAN.md`](RELIABILITY-GAP-CLOSURE-PLAN.md) — shipped reliability status and proof baseline
+- [`PRODUCT-ROADMAP.md`](PRODUCT-ROADMAP.md) — active follow-up roadmap from the current baseline
+- [`PROVIDER-COVERAGE-PLAN.md`](PROVIDER-COVERAGE-PLAN.md) — ranked implementation plan for broader provider support
+- [`VALIDATION.md`](VALIDATION.md) — validation agent contract used by the reference workflow
