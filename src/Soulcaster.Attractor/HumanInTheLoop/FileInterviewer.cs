@@ -27,54 +27,62 @@ public class FileInterviewer : IInterviewer
 
     public async Task<InterviewAnswer> AskAsync(InterviewQuestion question, CancellationToken ct = default)
     {
-        // Create a gate directory for this question using a timestamp to avoid collisions
-        var gateId = $"gate-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}-{Guid.NewGuid().ToString("N")[..6]}";
-        var gateDir = Path.Combine(_gatesDir, gateId);
-        Directory.CreateDirectory(gateDir);
         var logsRoot = WorkflowEventLog.TryResolveLogsRootFromGatesDir(_gatesDir);
 
         // Also maintain a "pending" symlink/file so watchers can find the active gate easily
         var pendingFile = Path.Combine(_gatesDir, "pending");
+        var reusedPendingGate = TryReusePendingGate(question, pendingFile, out var gateId, out var gateDir);
+
+        if (!reusedPendingGate)
+        {
+            // Create a gate directory for this question using a timestamp to avoid collisions
+            gateId = $"gate-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}-{Guid.NewGuid().ToString("N")[..6]}";
+            gateDir = Path.Combine(_gatesDir, gateId);
+            Directory.CreateDirectory(gateDir);
+        }
 
         var createdAt = DateTime.UtcNow.ToString("o");
-
-        // Write the question
-        var questionPayload = new
-        {
-            text = question.Text,
-            type = question.Type.ToString(),
-            options = question.Options,
-            metadata = question.Metadata,
-            gate_id = gateId,
-            status = "pending",
-            timestamp = createdAt,
-            created_at = createdAt
-        };
 
         var questionPath = Path.Combine(gateDir, "question.json");
         var answerPath = Path.Combine(gateDir, "answer.json");
 
-        var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
-        await File.WriteAllTextAsync(questionPath, JsonSerializer.Serialize(questionPayload, jsonOptions), ct);
-        await File.WriteAllTextAsync(pendingFile, gateId, ct);
-        if (!string.IsNullOrWhiteSpace(logsRoot))
+        if (!reusedPendingGate)
         {
-            await WorkflowEventLog.AppendAsync(
-                logsRoot,
-                eventType: "gate_created",
-                nodeId: question.Metadata.GetValueOrDefault("node_id"),
-                data: new Dictionary<string, object?>
-                {
-                    ["gate_id"] = gateId,
-                    ["question"] = question.Text,
-                    ["question_type"] = question.Type.ToString(),
-                    ["options"] = question.Options,
-                    ["default_choice"] = question.Metadata.GetValueOrDefault("default_choice"),
-                    ["metadata"] = question.Metadata
-                },
-                ct: ct);
+            // Write the question
+            var questionPayload = new
+            {
+                text = question.Text,
+                type = question.Type.ToString(),
+                options = question.Options,
+                metadata = question.Metadata,
+                gate_id = gateId,
+                status = "pending",
+                timestamp = createdAt,
+                created_at = createdAt
+            };
+
+            var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+            await File.WriteAllTextAsync(questionPath, JsonSerializer.Serialize(questionPayload, jsonOptions), ct);
+            await File.WriteAllTextAsync(pendingFile, gateId, ct);
+            if (!string.IsNullOrWhiteSpace(logsRoot))
+            {
+                await WorkflowEventLog.AppendAsync(
+                    logsRoot,
+                    eventType: "gate_created",
+                    nodeId: question.Metadata.GetValueOrDefault("node_id"),
+                    data: new Dictionary<string, object?>
+                    {
+                        ["gate_id"] = gateId,
+                        ["question"] = question.Text,
+                        ["question_type"] = question.Type.ToString(),
+                        ["options"] = question.Options,
+                        ["default_choice"] = question.Metadata.GetValueOrDefault("default_choice"),
+                        ["metadata"] = question.Metadata
+                    },
+                    ct: ct);
+            }
+            await NotifyMutationAsync(ct);
         }
-        await NotifyMutationAsync(ct);
 
         // Print to console so background watchers can see it
         Console.WriteLine();
@@ -168,6 +176,67 @@ public class FileInterviewer : IInterviewer
         }
 
         throw new OperationCanceledException("FileInterviewer was cancelled while waiting for answer", ct);
+    }
+
+    private bool TryReusePendingGate(
+        InterviewQuestion question,
+        string pendingFile,
+        out string gateId,
+        out string gateDir)
+    {
+        gateId = string.Empty;
+        gateDir = string.Empty;
+
+        try
+        {
+            if (!File.Exists(pendingFile))
+                return false;
+
+            var candidateGateId = File.ReadAllText(pendingFile).Trim();
+            if (string.IsNullOrWhiteSpace(candidateGateId))
+                return false;
+
+            var candidateGateDir = Path.Combine(_gatesDir, candidateGateId);
+            var candidateQuestionPath = Path.Combine(candidateGateDir, "question.json");
+            if (!File.Exists(candidateQuestionPath))
+                return false;
+
+            using var questionDoc = JsonDocument.Parse(File.ReadAllText(candidateQuestionPath));
+            var root = questionDoc.RootElement;
+
+            var existingQuestion = root.TryGetProperty("text", out var textEl) ? textEl.GetString() : null;
+            if (!string.Equals(existingQuestion, question.Text, StringComparison.Ordinal))
+                return false;
+
+            var existingOptions = new List<string>();
+            if (root.TryGetProperty("options", out var optionsEl) && optionsEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var option in optionsEl.EnumerateArray())
+                    existingOptions.Add(option.GetString() ?? string.Empty);
+            }
+            if (!existingOptions.SequenceEqual(question.Options))
+                return false;
+
+            string? existingNodeId = null;
+            if (root.TryGetProperty("metadata", out var metadataEl) && metadataEl.ValueKind == JsonValueKind.Object)
+            {
+                if (metadataEl.TryGetProperty("node_id", out var nodeIdEl))
+                    existingNodeId = nodeIdEl.GetString();
+            }
+
+            question.Metadata.TryGetValue("node_id", out var expectedNodeId);
+            if (!string.IsNullOrWhiteSpace(expectedNodeId) &&
+                !string.Equals(existingNodeId, expectedNodeId, StringComparison.Ordinal))
+                return false;
+
+            gateId = candidateGateId;
+            gateDir = candidateGateDir;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static AnswerStatus ParseAnswerStatus(string? status)
