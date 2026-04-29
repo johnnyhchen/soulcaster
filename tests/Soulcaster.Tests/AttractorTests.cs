@@ -3205,6 +3205,35 @@ public class FanInHandlerTests
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
     }
+
+    [Fact]
+    public async Task FanInHandler_TreatsPartialSuccessTokenWithoutUnderscore_AsPartialSuccess()
+    {
+        var handler = new FanInHandler();
+        var context = new PipelineContext();
+        var graph = new Graph();
+        var node = new GraphNode { Id = "fan_in", Shape = "tripleoctagon" };
+        var tempDir = Path.Combine(Path.GetTempPath(), $"jc_test_{Guid.NewGuid():N}");
+
+        var results = new List<Dictionary<string, object?>>
+        {
+            new() { ["node_id"] = "visual_qa", ["status"] = "partialsuccess", ["notes"] = "coverage gaps logged" },
+            new() { ["node_id"] = "editorial_art_review", ["status"] = "partialsuccess", ["notes"] = "needs targeted revisions" },
+            new() { ["node_id"] = "continuity_art_review", ["status"] = "partialsuccess", ["notes"] = "unverified continuity areas" }
+        };
+        context.Set("parallel.results", System.Text.Json.JsonSerializer.Serialize(results));
+
+        try
+        {
+            var outcome = await handler.ExecuteAsync(node, context, graph, tempDir);
+            Assert.Equal(OutcomeStatus.PartialSuccess, outcome.Status);
+            Assert.Contains("merged 3 branches", outcome.Notes, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
 }
 
 public class ManagerLoopHandlerTests

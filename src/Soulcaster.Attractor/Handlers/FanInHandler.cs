@@ -60,12 +60,12 @@ public class FanInHandler : INodeHandler
             .ToList();
 
         var bestResult = ranked.FirstOrDefault();
-        var bestStatus = bestResult?.GetValueOrDefault("status")?.ToString() ?? "success";
+        var bestStatus = NormalizeStatus(bestResult?.GetValueOrDefault("status")?.ToString());
 
         var combinedStatus = bestStatus switch
         {
             "success" => OutcomeStatus.Success,
-            "partial_success" => OutcomeStatus.PartialSuccess,
+            "partialsuccess" => OutcomeStatus.PartialSuccess,
             _ => OutcomeStatus.Fail
         };
 
@@ -77,9 +77,9 @@ public class FanInHandler : INodeHandler
             var queueSummary = new Dictionary<string, object?>
             {
                 ["total_items"] = branchResults.Count,
-                ["success_count"] = branchResults.Count(result => string.Equals(result.GetValueOrDefault("status")?.ToString(), "success", StringComparison.OrdinalIgnoreCase)),
-                ["partial_success_count"] = branchResults.Count(result => string.Equals(result.GetValueOrDefault("status")?.ToString(), "partial_success", StringComparison.OrdinalIgnoreCase)),
-                ["fail_count"] = branchResults.Count(result => string.Equals(result.GetValueOrDefault("status")?.ToString(), "fail", StringComparison.OrdinalIgnoreCase)),
+                ["success_count"] = branchResults.Count(result => NormalizeStatus(result.GetValueOrDefault("status")?.ToString()) == "success"),
+                ["partial_success_count"] = branchResults.Count(result => NormalizeStatus(result.GetValueOrDefault("status")?.ToString()) == "partialsuccess"),
+                ["fail_count"] = branchResults.Count(result => NormalizeStatus(result.GetValueOrDefault("status")?.ToString()) == "fail"),
                 ["best_item"] = bestResult?.GetValueOrDefault("node_id")
             };
             context.Set("fan_in.queue_summary", JsonSerializer.Serialize(queueSummary));
@@ -91,12 +91,20 @@ public class FanInHandler : INodeHandler
         );
     }
 
-    private static int OutcomeRank(string? status) => status switch
+    private static int OutcomeRank(string? status) => NormalizeStatus(status) switch
     {
         "success" => 0,
-        "partial_success" => 1,
+        "partialsuccess" => 1,
         "retry" => 2,
         "fail" => 3,
         _ => 4
     };
+
+    private static string NormalizeStatus(string? status)
+    {
+        if (string.IsNullOrWhiteSpace(status))
+            return string.Empty;
+
+        return status.Trim().Replace("_", string.Empty, StringComparison.Ordinal).ToLowerInvariant();
+    }
 }
