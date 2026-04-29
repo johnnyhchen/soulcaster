@@ -7,6 +7,9 @@ obj/
 *.svg
 qa-results/
 logs/
+.env.local
+.envrc
+.DS_Store
 .claude/ralph-loop.local.md
 .claude/plans/
 .playwright-mcp/
