@@ -83,6 +83,18 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
 
     public async Task<Response> CompleteAsync(Request request, CancellationToken ct = default)
     {
+        if (UsesImagesApi(request))
+        {
+            var imageRequest = BuildImagesApiRequest(request);
+            using var imageHttpReq = imageRequest.InputImages.Count == 0
+                ? CreateImagesGenerationsHttpRequest(imageRequest.JsonBody!)
+                : CreateImagesEditsHttpRequest(imageRequest.MultipartBody!);
+            using var imageHttpRes = await _http.SendAsync(imageHttpReq, ct).ConfigureAwait(false);
+            var imageResponseBody = await imageHttpRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            EnsureSuccess(imageHttpRes, imageResponseBody);
+            return ParseImagesResponse(imageResponseBody, request.Model);
+        }
+
         if (RequiresChatCompletionsApi(request))
         {
             var chatBody = BuildChatCompletionsRequestBody(request, stream: false);
@@ -107,7 +119,7 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         Request request,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        if (RequiresChatCompletionsApi(request))
+        if (UsesImagesApi(request) || RequiresChatCompletionsApi(request))
         {
             var response = await CompleteAsync(request, ct).ConfigureAwait(false);
             yield return new StreamEvent { Type = StreamEventType.StreamStart };
@@ -323,6 +335,176 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
     }
 
     // ── Request building ───────────────────────────────────────────────
+
+    private sealed record ImagesApiRequest(
+        JsonObject? JsonBody,
+        MultipartFormDataContent? MultipartBody,
+        IReadOnlyList<ImageData> InputImages);
+
+    private ImagesApiRequest BuildImagesApiRequest(Request request)
+    {
+        var prompt = BuildImagesPrompt(request);
+        var inputImages = ExtractInputImages(request.Messages);
+        if (inputImages.Count == 0)
+        {
+            return new ImagesApiRequest(
+                JsonBody: BuildImagesGenerationsBody(request, prompt),
+                MultipartBody: null,
+                InputImages: inputImages);
+        }
+
+        return new ImagesApiRequest(
+            JsonBody: null,
+            MultipartBody: BuildImagesEditsBody(request, prompt, inputImages),
+            InputImages: inputImages);
+    }
+
+    private JsonObject BuildImagesGenerationsBody(Request request, string prompt)
+    {
+        var body = new JsonObject
+        {
+            ["model"] = request.Model,
+            ["prompt"] = prompt
+        };
+        AddImageApiOptions(body, request);
+        return body;
+    }
+
+    private MultipartFormDataContent BuildImagesEditsBody(
+        Request request,
+        string prompt,
+        IReadOnlyList<ImageData> inputImages)
+    {
+        var content = new MultipartFormDataContent
+        {
+            { new StringContent(request.Model), "model" },
+            { new StringContent(prompt), "prompt" }
+        };
+
+        AddImageApiOptions(content, request);
+
+        for (var i = 0; i < inputImages.Count; i++)
+        {
+            var image = inputImages[i];
+            var data = ResolveImageBytes(image);
+            if (data is null || data.Length == 0)
+                throw new ConfigurationError("OpenAI Images API input images must be local bytes or data URLs.");
+
+            var mediaType = image.MediaType ?? "image/png";
+            var imageContent = new ByteArrayContent(data);
+            imageContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
+            var extension = GetImageExtension(mediaType);
+            var fieldName = inputImages.Count == 1 ? "image" : "image[]";
+            content.Add(imageContent, fieldName, $"input-{i + 1}{extension}");
+        }
+
+        return content;
+    }
+
+    private static void AddImageApiOptions(JsonObject body, Request request)
+    {
+        foreach (var key in SupportedImageApiOptionKeys())
+        {
+            if (request.ProviderOptions?.TryGetValue(key, out var value) == true)
+                body[key] = JsonSerializer.SerializeToNode(value);
+        }
+    }
+
+    private static void AddImageApiOptions(MultipartFormDataContent content, Request request)
+    {
+        foreach (var key in SupportedImageApiOptionKeys())
+        {
+            if (request.ProviderOptions?.TryGetValue(key, out var value) == true && value is not null)
+                content.Add(new StringContent(value.ToString() ?? string.Empty), key);
+        }
+    }
+
+    private static IReadOnlyList<string> SupportedImageApiOptionKeys() =>
+    [
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "output_compression",
+        "moderation",
+        "n"
+    ];
+
+    private static string BuildImagesPrompt(Request request)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var message in request.Messages)
+        {
+            foreach (var part in message.Content)
+            {
+                switch (part.Kind)
+                {
+                    case ContentKind.Text when !string.IsNullOrWhiteSpace(part.Text):
+                        sb.AppendLine(part.Text);
+                        break;
+
+                    case ContentKind.Document when part.Document is not null:
+                        var documentText = TryDecodeTextDocument(part.Document);
+                        if (!string.IsNullOrWhiteSpace(documentText))
+                        {
+                            sb.AppendLine();
+                            sb.AppendLine($"[Attached document: {part.Document.FileName ?? "document"}]");
+                            sb.AppendLine(documentText);
+                            sb.AppendLine("[/Attached document]");
+                        }
+                        break;
+                }
+            }
+        }
+
+        return sb.ToString().Trim();
+    }
+
+    private static IReadOnlyList<ImageData> ExtractInputImages(IReadOnlyList<Message> messages)
+    {
+        var images = new List<ImageData>();
+        foreach (var message in messages)
+        {
+            foreach (var part in message.Content)
+            {
+                if (part.Kind == ContentKind.Image && part.Image is not null)
+                    images.Add(part.Image);
+            }
+        }
+
+        return images;
+    }
+
+    private static string? TryDecodeTextDocument(DocumentData document)
+    {
+        if (document.Data is null || document.Data.Length == 0)
+            return null;
+
+        var mediaType = document.MediaType?.Split(';', 2)[0].Trim().ToLowerInvariant();
+        var extension = Path.GetExtension(document.FileName ?? string.Empty).ToLowerInvariant();
+        var isText =
+            mediaType is "text/plain" or "text/markdown" or "application/json" or "text/csv" ||
+            extension is ".txt" or ".md" or ".json" or ".csv";
+        if (!isText)
+            return null;
+
+        return System.Text.Encoding.UTF8.GetString(document.Data);
+    }
+
+    private static byte[]? ResolveImageBytes(ImageData image)
+    {
+        if (image.Data is { Length: > 0 })
+            return image.Data;
+
+        if (image.Url is not null && image.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            var commaIndex = image.Url.IndexOf(',');
+            if (commaIndex >= 0)
+                return Convert.FromBase64String(image.Url[(commaIndex + 1)..]);
+        }
+
+        return null;
+    }
 
     private JsonObject BuildRequestBody(Request request, bool stream)
     {
@@ -636,6 +818,33 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         return httpReq;
     }
 
+    private HttpRequestMessage CreateImagesGenerationsHttpRequest(JsonObject body)
+    {
+        var httpReq = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/images/generations")
+        {
+            Content = new StringContent(
+                body.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+                System.Text.Encoding.UTF8,
+                "application/json")
+        };
+
+        httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+
+        return httpReq;
+    }
+
+    private HttpRequestMessage CreateImagesEditsHttpRequest(MultipartFormDataContent body)
+    {
+        var httpReq = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/images/edits")
+        {
+            Content = body
+        };
+
+        httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+
+        return httpReq;
+    }
+
     private HttpRequestMessage CreateChatCompletionsHttpRequest(JsonObject body)
     {
         var httpReq = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/chat/completions")
@@ -829,6 +1038,52 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         return new Response(id, model, Name, msg, finishReason, ParseChatCompletionsUsage(node["usage"]));
     }
 
+    private Response ParseImagesResponse(string responseBody, string requestModel)
+    {
+        var node = JsonNode.Parse(responseBody)
+            ?? throw new ProviderError("Empty response from OpenAI Images API", HttpStatusCode.InternalServerError, providerName: Name);
+
+        var content = new List<ContentPart>();
+        var dataArray = node["data"]?.AsArray();
+        if (dataArray is not null)
+        {
+            foreach (var item in dataArray)
+            {
+                if (item is null)
+                    continue;
+
+                var revisedPrompt = item["revised_prompt"]?.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(revisedPrompt))
+                    content.Add(ContentPart.TextPart(revisedPrompt));
+
+                var imageBase64 = item["b64_json"]?.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(imageBase64))
+                {
+                    var imageBytes = Convert.FromBase64String(imageBase64);
+                    var mimeType = ResolveImageMimeType(item["mime_type"]?.GetValue<string>());
+                    content.Add(ContentPart.ImagePart(ImageData.FromBytes(
+                        imageBytes,
+                        mimeType,
+                        providerState: BuildImagesApiProviderState(item, mimeType, imageBytes))));
+                }
+            }
+        }
+
+        var id = node["id"]?.GetValue<string>() ?? string.Empty;
+        var msg = new Message(
+            Role.Assistant,
+            content.Count > 0 ? content : [ContentPart.TextPart(string.Empty)],
+            ResponseId: string.IsNullOrWhiteSpace(id) ? null : id);
+
+        return new Response(
+            id,
+            requestModel,
+            Name,
+            msg,
+            FinishReason.Stop,
+            ParseUsage(node["usage"]));
+    }
+
     private static FinishReason MapFinishReason(string? status, bool hasToolCalls)
     {
         if (hasToolCalls) return FinishReason.ToolCalls;
@@ -849,6 +1104,29 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
         "content_filter" => FinishReason.ContentFilter,
         "stop" or null or "" => FinishReason.Stop,
         _ => FinishReason.Stop
+    };
+
+    private static bool UsesImagesApi(Request request) =>
+        IsOpenAiImageModel(request.Model) &&
+        (request.OutputModalities?.Contains(ResponseModality.Image) == true || !HasNonImageTooling(request));
+
+    private static bool IsOpenAiImageModel(string model) =>
+        model.StartsWith("gpt-image-", StringComparison.OrdinalIgnoreCase) ||
+        model.StartsWith("dall-e-", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasNonImageTooling(Request request) =>
+        request.Tools is { Count: > 0 } || request.ToolChoice is not null || request.ResponseFormat is not null;
+
+    private static string ResolveImageMimeType(string? declaredMimeType) =>
+        string.IsNullOrWhiteSpace(declaredMimeType) ? "image/png" : declaredMimeType;
+
+    private static string GetImageExtension(string? mediaType) => mediaType?.ToLowerInvariant() switch
+    {
+        "image/jpeg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        "image/bmp" => ".bmp",
+        _ => ".png"
     };
 
     private static Usage ParseUsage(JsonNode? usage)
@@ -1164,6 +1442,18 @@ public sealed class OpenAIAdapter : IProviderAdapter, IProviderDiscoveryAdapter
             ("source", JsonValue.Create("image_generation_call")),
             ("image_url", JsonValue.Create(BuildDataUrl(mimeType, imageBytes))),
             ("output_item_id", string.IsNullOrWhiteSpace(itemId) ? null : JsonValue.Create(itemId)),
+            ("revised_prompt", string.IsNullOrWhiteSpace(revisedPrompt) ? null : JsonValue.Create(revisedPrompt)));
+    }
+
+    private static JsonObject BuildImagesApiProviderState(JsonNode item, string mimeType, byte[] imageBytes)
+    {
+        var revisedPrompt = item["revised_prompt"]?.GetValue<string>();
+
+        return MediaProviderState.Create(
+            "openai",
+            ("kind", JsonValue.Create("image")),
+            ("source", JsonValue.Create("images_api")),
+            ("image_url", JsonValue.Create(BuildDataUrl(mimeType, imageBytes))),
             ("revised_prompt", string.IsNullOrWhiteSpace(revisedPrompt) ? null : JsonValue.Create(revisedPrompt)));
     }
 

@@ -323,12 +323,13 @@ The runtime can also discover provider models dynamically through the registry c
 | `claude-sonnet-4-6` | Anthropic | General purpose (default) |
 | `claude-haiku-4-5` | Anthropic | Fast, lightweight tasks |
 | `gpt-5.4` | OpenAI | General reasoning, critique |
+| `gpt-image-2` | OpenAI | Image generation and editing |
 | `gpt-audio` | OpenAI | Audio-input leaf review and transcription-style flows |
 | `gpt-5.2-codex` / `codex-5.2` | OpenAI | Compatibility alias for coding flows |
 | `gpt-5.3-codex` / `codex-5.3` | OpenAI | Primary coding model |
 | `gpt-5.2-mini` | OpenAI | Fast, lightweight tasks |
 | `gemini-3.0-pro-preview` | Google | Large-context reasoning |
-| `gemini-3.0-flash-preview` | Google | Faster lower-latency tasks |
+| `gemini-3-flash-preview` | Google | Faster lower-latency tasks |
 | `gemini-2.5-pro` | Google | Capability validation regression target and compatibility path |
 
 Discovered models such as `gpt-5.4-mini` can also appear at runtime after `providers registry refresh`, even when they are not hard-coded into the built-in catalog.

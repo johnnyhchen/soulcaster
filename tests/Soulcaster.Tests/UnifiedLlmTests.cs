@@ -580,6 +580,39 @@ public class ModelCatalogTests
     }
 
     [Fact]
+    public void GetModelInfo_FindsGptImage2_ById()
+    {
+        var info = ModelCatalog.GetModelInfo("gpt-image-2");
+        Assert.NotNull(info);
+        Assert.Equal("openai", info.Provider);
+        Assert.Equal("gpt-image-2", info.Id);
+        Assert.Equal("GPT Image 2", info.DisplayName);
+        Assert.True(info.SupportsImageOutput);
+        Assert.True(info.SupportsImageInput);
+        Assert.False(info.SupportsTools);
+    }
+
+    [Fact]
+    public void GetModelInfo_FindsGemini3Flash_ByExactPreviewId()
+    {
+        var info = ModelCatalog.GetModelInfo("gemini-3-flash-preview");
+        Assert.NotNull(info);
+        Assert.Equal("gemini", info.Provider);
+        Assert.Equal("gemini-3-flash-preview", info.Id);
+        Assert.True(info.SupportsVision);
+        Assert.True(info.SupportsTools);
+        Assert.False(info.SupportsImageOutput);
+    }
+
+    [Fact]
+    public void GetModelInfo_FindsGemini3Flash_ByLegacyAlias()
+    {
+        var info = ModelCatalog.GetModelInfo("gemini-3.0-flash-preview");
+        Assert.NotNull(info);
+        Assert.Equal("gemini-3-flash-preview", info.Id);
+    }
+
+    [Fact]
     public void GetModelInfo_FindsGemini25Pro_ById()
     {
         var info = ModelCatalog.GetModelInfo("gemini-2.5-pro");
@@ -1225,6 +1258,42 @@ public class T14_MultimodalAdapterTests
     }
 
     [Fact]
+    public void OpenAIAdapter_UsesImagesApiBody_ForGptImage2Generation()
+    {
+        var adapter = new OpenAIAdapter("test-key");
+        var request = new Request
+        {
+            Model = "gpt-image-2",
+            Messages =
+            [
+                Message.UserMsg(
+                    ContentPart.TextPart("Draw a character reference sheet."),
+                    ContentPart.DocumentPart(DocumentData.FromBytes(
+                        System.Text.Encoding.UTF8.GetBytes("# Style\nInk-heavy manga linework."),
+                        "text/markdown",
+                        "style.md")))
+            ],
+            OutputModalities = new List<ResponseModality> { ResponseModality.Text, ResponseModality.Image }
+        };
+
+        var method = typeof(OpenAIAdapter).GetMethod("BuildImagesApiRequest",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var imageRequest = method!.Invoke(adapter, new object[] { request });
+        Assert.NotNull(imageRequest);
+        var jsonBody = imageRequest!.GetType().GetProperty("JsonBody")!.GetValue(imageRequest) as System.Text.Json.Nodes.JsonObject;
+        var inputImages = imageRequest.GetType().GetProperty("InputImages")!.GetValue(imageRequest) as System.Collections.ICollection;
+
+        Assert.NotNull(jsonBody);
+        Assert.NotNull(inputImages);
+        Assert.Empty(inputImages!);
+        Assert.Equal("gpt-image-2", jsonBody!["model"]!.GetValue<string>());
+        Assert.Contains("Draw a character reference sheet.", jsonBody["prompt"]!.GetValue<string>());
+        Assert.Contains("Ink-heavy manga linework.", jsonBody["prompt"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void OpenAIAdapter_ParsesImageGenerationCall_Output()
     {
         var adapter = new OpenAIAdapter("test-key");
@@ -1267,6 +1336,42 @@ public class T14_MultimodalAdapterTests
         Assert.Equal("openai", image.ProviderState!["provider"]?.GetValue<string>());
         Assert.Equal("image_generation_call", image.ProviderState["source"]?.GetValue<string>());
         Assert.StartsWith("data:image/png;base64,", image.ProviderState["image_url"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void OpenAIAdapter_ParsesImagesApi_Output()
+    {
+        var adapter = new OpenAIAdapter("test-key");
+        var responseBody = $$"""
+            {
+              "created": 1776399795,
+              "data": [
+                {
+                  "b64_json": "{{UnifiedLlmTestAssets.TestImageBase64}}",
+                  "revised_prompt": "Revised manga prompt"
+                }
+              ],
+              "usage": {
+                "input_tokens": 11,
+                "output_tokens": 22
+              }
+            }
+            """;
+
+        var method = typeof(OpenAIAdapter).GetMethod("ParseImagesResponse",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var response = method!.Invoke(adapter, new object[] { responseBody, "gpt-image-2" }) as Response;
+        Assert.NotNull(response);
+        Assert.Equal("Revised manga prompt", response!.Text);
+        var image = Assert.Single(response.Images);
+        Assert.NotNull(image.Data);
+        Assert.NotNull(image.ProviderState);
+        Assert.Equal("openai", image.ProviderState!["provider"]?.GetValue<string>());
+        Assert.Equal("images_api", image.ProviderState["source"]?.GetValue<string>());
+        Assert.StartsWith("data:image/png;base64,", image.ProviderState["image_url"]?.GetValue<string>());
+        Assert.Equal(33, response.Usage.TotalTokens);
     }
 
     [Fact]

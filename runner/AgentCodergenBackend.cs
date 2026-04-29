@@ -376,6 +376,12 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
                 if (StageStatusContract.TryParseAssistantResponse(finalResponse, out parsedStatus, out parseError))
                     break;
 
+                if (options?.OutputModalities?.Contains(ResponseModality.Image) == true &&
+                    finalTurn.Images.Count > 0)
+                {
+                    break;
+                }
+
                 if (attemptsUsed < MaxStatusParseAttempts)
                     pendingPrompt = BuildStageStatusReminder(parseError);
             }
