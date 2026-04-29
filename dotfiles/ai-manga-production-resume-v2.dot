@@ -1,0 +1,72 @@
+digraph ai_manga_production_resume_v2 {
+    goal = "Reuse approved manga production artifacts and generate all chapter pages."
+    target_page_count = "20"
+    chapter_number = "1"
+    source_run_dir = "dotfiles/output/ai-manga-pipeline-example"
+
+    model_stylesheet = "
+        *           { provider = \"openai\"; model = \"gpt-5.4\" }
+        .imagegen   { provider = \"openai\"; model = \"gpt-image-2\" }
+    "
+
+    node [shape=box, timeout="1200s"]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    hydrate_latest_artifacts [
+        shape=parallelogram,
+        label="Hydrate Latest Stage 7 Artifacts",
+        tool_command="cd \"${graph.output_root}\" && src=\"$source_run_dir/logs/manga/latest/page-prompt-queue.md\" && test \"$source_run_dir\" != \"none\" && test -f \"$src\" && mkdir -p logs/manga/latest && cp \"$src\" logs/manga/latest/page-prompt-queue.md"
+    ]
+
+    build_page_prompt_files [
+        shape=parallelogram,
+        label="Build Per-Page Prompt Files",
+        tool_command="cd \"${graph.output_root}\" && mkdir -p logs/manga/latest/page-prompts && rm -f logs/manga/latest/page-prompts/*.md && awk 'BEGIN { file=\"\" } /^##+ .*Page [0-9][0-9]*/ { if (file != \"\") close(file); if (match($0, /Page [0-9][0-9]*/)) { page=substr($0, RSTART+5, RLENGTH-5); file=sprintf(\"logs/manga/latest/page-prompts/page-%02d.md\", page+0); print $0 > file; next } } file != \"\" { print $0 >> file }' logs/manga/latest/page-prompt-queue.md && count=$(find logs/manga/latest/page-prompts -maxdepth 1 -type f -name 'page-*.md' | wc -l | tr -d '[:space:]') && test \"$count\" -eq $target_page_count"
+    ]
+
+    draft_pages [
+        shape=component,
+        label="Generate Draft Pages (All Queue Items)",
+        queue_source="logs/manga/latest/page-prompts",
+        timeout="10800s",
+        max_parallel="3"
+    ]
+
+    draft_page_worker [
+        class="imagegen",
+        label="Generate Draft Page",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="${context.queue.item.path}",
+        thread_id="manga-visual-thread",
+        fidelity="full",
+        prompt="Read ${context.queue.item.path} and treat it as the authoritative prompt for exactly one page. Generate exactly one manga page image for chapter $chapter_number. Preserve panel readability and character consistency. Return valid stage status JSON and include page identifier ${context.queue.item.name} in notes."
+    ]
+
+    draft_pages_merge [
+        shape=tripleoctagon,
+        label="Merge Draft Page Workers"
+    ]
+
+    verify_draft_page_count [
+        shape=parallelogram,
+        label="Verify 20 Draft Pages Generated",
+        tool_command="cd \"${graph.output_root}\" && count=$(find logs -type f -path '*/draft_page_worker*generated/image-1.png' | wc -l | tr -d '[:space:]') && echo \"generated_count=$count\" && test \"$count\" -eq $target_page_count"
+    ]
+
+    production_index [
+        label="Index Generated Page Artifacts",
+        prompt="List files under logs where path matches draft_page_worker[...]/generated/image-1.png. Build a page artifact manifest mapping page prompt file name to generated image path. Return status fail if fewer than $target_page_count page images are present; otherwise return success."
+    ]
+
+    start -> hydrate_latest_artifacts
+    hydrate_latest_artifacts -> build_page_prompt_files
+    build_page_prompt_files -> draft_pages
+    draft_pages -> draft_page_worker
+    draft_page_worker -> draft_pages_merge
+    draft_pages_merge -> verify_draft_page_count
+    verify_draft_page_count -> production_index
+    production_index -> exit
+}

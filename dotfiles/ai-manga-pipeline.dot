@@ -1,0 +1,1420 @@
+digraph ai_manga_pipeline {
+    goal = "Turn a manga premise into a gated series foundation and produce one chapter package while preserving canon and visual memory."
+    label = "AI Manga Production Pipeline"
+    default_max_retry = 1
+    allow_force_advance = "false"
+    operator_retry_stage_budget = "1"
+
+    requirements_document = "ai_manga_pipeline_requirements.md"
+    premise = ""
+    optional_constraints = ""
+    chapter_number = "1"
+    target_page_count = "20"
+    prior_run_dir = "none"
+
+    model_stylesheet = "
+        *           { provider = \"anthropic\"; model = \"claude-sonnet-4-6\" }
+        .director   { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .architect  { provider = \"anthropic\"; model = \"claude-opus-4-6\" }
+        .review     { provider = \"openai\";    model = \"gpt-5.4\" }
+        .visual     { provider = \"openai\";    model = \"gpt-5.4\" }
+        .visualqa   { provider = \"gemini\";    model = \"gemini-3-flash-preview\" }
+        .imagegen   { provider = \"openai\";    model = \"gpt-image-2\" }
+        .fast       { provider = \"openai\";    model = \"gpt-5.2-mini\" }
+    "
+
+    node [shape=box, timeout="1200s"]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    ingest_premise [
+        class="director",
+        label="Stage 0: Premise Ingestion",
+        prompt="Read $requirements_document and treat it as the controlling requirements document.
+
+Input premise:
+$premise
+
+Optional constraints:
+$optional_constraints
+
+If $prior_run_dir is not none, read approved memory from $prior_run_dir/logs/manga/memory before writing anything.
+
+Act as Creative Director. Produce Stage 0 artifacts for a serialized manga:
+- premise brief
+- series intent brief
+- tonal guardrails
+- audience promise
+- initial concept options
+- selected direction
+
+Include a self-critique using Red, Yellow, Green severity. Hard-stop any weak conflict engine, weak visual potential, or insufficient serialization runway.
+
+Write numbered artifacts under logs/manga/00-premise/ using the next N:
+- PREMISE-BRIEF-{N}.md
+- SERIES-INTENT-{N}.md
+- CONCEPT-OPTIONS-{N}.md
+- STAGE-0-REVIEW-{N}.md
+
+Also update stable review copies:
+- logs/manga/latest/premise-brief.md
+- logs/manga/latest/series-intent.md
+- logs/manga/latest/stage-0-review.md
+
+Return stage status JSON with status success if the premise is viable, or fail if it has a blocking flaw."
+    ]
+
+    gate_0 [
+        shape=hexagon,
+        label="Gate 0: premise approval"
+    ]
+
+    foundation_split [
+        shape=component,
+        label="Stage 1: foundation specialists"
+    ]
+
+    story_architect [
+        class="architect",
+        label="Story Architect",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/premise-brief.md
+- logs/manga/latest/series-intent.md
+- gates/gate_0/answer.json if it exists
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Act as Story Architect. Build the macro narrative structure:
+- story spine
+- central dramatic question
+- long-arc concept
+- reveal and payoff map
+- high-level chapter roadmap
+- escalation plan
+
+Include a self-critique with Red, Yellow, Green issues and identify any structural issue that should route upstream.
+
+Write numbered artifacts under logs/manga/01-foundation/story/ using the next N:
+- STORY-SPINE-{N}.md
+- ARC-CONCEPT-{N}.md
+- REVEAL-MAP-{N}.md
+- CHAPTER-ROADMAP-SEED-{N}.md
+
+Also update:
+- logs/manga/latest/story-spine.md
+- logs/manga/latest/arc-concept.md
+- logs/manga/latest/reveal-map.md
+- logs/manga/latest/chapter-roadmap-seed.md
+
+Return stage status JSON."
+    ]
+
+    cast_foundation [
+        class="architect",
+        label="Character Foundation",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/premise-brief.md
+- logs/manga/latest/series-intent.md
+- gates/gate_0/answer.json if it exists
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Act as Character Development Agent. Build the cast as dramatic engines:
+- protagonist, foil, antagonist, and support cast seeds
+- goals, flaws, contradictions, and arc hooks
+- interpersonal dynamics
+- voice and role guide
+- visual-design implications for each character
+
+Include self-critique with Red, Yellow, Green issues and flag weak motivation as a blocking defect.
+
+Write numbered artifacts under logs/manga/01-foundation/cast/ using the next N:
+- CAST-FOUNDATION-{N}.md
+- RELATIONSHIP-MAP-SEED-{N}.md
+- VOICE-GUIDE-SEED-{N}.md
+
+Also update:
+- logs/manga/latest/cast-foundation.md
+- logs/manga/latest/relationship-map-seed.md
+- logs/manga/latest/voice-guide-seed.md
+
+Return stage status JSON."
+    ]
+
+    world_foundation [
+        class="architect",
+        label="World Foundation",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/premise-brief.md
+- logs/manga/latest/series-intent.md
+- gates/gate_0/answer.json if it exists
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Act as Worldbuilding Agent. Define:
+- high-level world rules
+- institutions, factions, and locations
+- power or supernatural system logic if relevant
+- limitations, costs, consequences, and stakes
+- setting hooks that support repeated chapters
+
+Include self-critique with Red, Yellow, Green issues and hard-stop contradictions in world rules.
+
+Write numbered artifacts under logs/manga/01-foundation/world/ using the next N:
+- WORLD-FOUNDATION-{N}.md
+- FACTION-SEEDS-{N}.md
+- LOCATION-SEEDS-{N}.md
+- POWER-SYSTEM-SEED-{N}.md
+
+Also update:
+- logs/manga/latest/world-foundation.md
+- logs/manga/latest/faction-seeds.md
+- logs/manga/latest/location-seeds.md
+- logs/manga/latest/power-system-seed.md
+
+Return stage status JSON."
+    ]
+
+    visual_foundation [
+        class="visual",
+        label="Visual Foundation",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/premise-brief.md
+- logs/manga/latest/series-intent.md
+- logs/manga/latest/cast-foundation.md if it exists
+- logs/manga/latest/world-foundation.md if it exists
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Act as Visual Development Agent, but write text design foundations in this agent lane. Define:
+- visual style rules
+- character silhouette principles
+- environment language
+- effects language
+- reproducibility rules for chapter-to-chapter consistency
+- image-generation prompt anchors for later multimodal stages
+
+Include self-critique with Red, Yellow, Green issues and hard-stop severe visual identity drift risks.
+
+Write numbered artifacts under logs/manga/01-foundation/visual/ using the next N:
+- VISUAL-FOUNDATION-{N}.md
+- STYLE-RULES-SEED-{N}.md
+- IMAGE-PROMPT-ANCHORS-{N}.md
+
+Also update:
+- logs/manga/latest/visual-foundation.md
+- logs/manga/latest/style-rules-seed.md
+- logs/manga/latest/image-prompt-anchors.md
+
+Return stage status JSON."
+    ]
+
+    foundation_merge [
+        shape=tripleoctagon,
+        label="Merge Foundation Specialists"
+    ]
+
+    synthesize_foundation [
+        class="director",
+        label="Executive Synthesis: Series Foundation",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/premise-brief.md
+- logs/manga/latest/series-intent.md
+- logs/manga/latest/story-spine.md
+- logs/manga/latest/cast-foundation.md
+- logs/manga/latest/world-foundation.md
+- logs/manga/latest/visual-foundation.md
+- gates/gate_1/answer.json if it exists
+
+Act as Creative Director and executive editor. Resolve conflicts across story, cast, world, and visual foundations. Produce a coherent Series Foundation v1.
+
+Required outputs:
+- series bible v1
+- cast foundation v1
+- world foundation v1
+- visual foundation v1
+- long-arc concept v1
+- Stage 1 gate report against serialization strength, natural character conflict, thematic fit, and escalation potential
+
+Do not admit material into canon memory yet. This is an approval candidate.
+
+Write numbered artifacts under logs/manga/01-foundation/synthesis/ using the next N:
+- SERIES-BIBLE-V1-{N}.md
+- FOUNDATION-GATE-REPORT-{N}.md
+- REVISION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/foundation-gate-report.md
+- logs/manga/latest/foundation-revision-tickets.md
+
+Return stage status JSON."
+    ]
+
+    gate_1 [
+        shape=hexagon,
+        label="Gate 1: series foundation"
+    ]
+
+    design_split [
+        shape=component,
+        timeout="3600s",
+        label="Stage 2: character/world/visual detail"
+    ]
+
+    character_detail [
+        class="architect",
+        timeout="2400s",
+        label="Character Dossiers",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/cast-foundation.md
+- logs/manga/latest/foundation-revision-tickets.md
+- gates/gate_1/answer.json if it exists
+
+Act as Character Development Agent. Produce detailed character artifacts:
+- character dossiers
+- relationship map
+- character arc notes
+- voice guide
+- visual identity notes connected to dramatic function
+
+Each dossier must include goals, flaws, contradictions, secrets, relationships, voice, arc movement, and design notes.
+Include self-critique with Red, Yellow, Green issues.
+
+Write numbered artifacts under logs/manga/02-design/characters/ using the next N:
+- CHARACTER-DOSSIERS-{N}.md
+- RELATIONSHIP-MAP-{N}.md
+- CHARACTER-ARC-NOTES-{N}.md
+- VOICE-GUIDE-{N}.md
+
+Also update:
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/relationship-map.md
+- logs/manga/latest/character-arc-notes.md
+- logs/manga/latest/voice-guide.md
+
+Return stage status JSON."
+    ]
+
+    world_detail [
+        class="architect",
+        label="Worldbuilding Bible",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/world-foundation.md
+- logs/manga/latest/foundation-revision-tickets.md
+- gates/gate_1/answer.json if it exists
+
+Act as Worldbuilding Agent. Produce detailed setting artifacts:
+- world rules document
+- setting bible
+- faction sheets
+- location sheets
+- power taxonomy with constraints, costs, and consequences
+
+Include self-critique with Red, Yellow, Green issues and contradiction alerts.
+
+Write numbered artifacts under logs/manga/02-design/world/ using the next N:
+- WORLD-RULES-{N}.md
+- SETTING-BIBLE-{N}.md
+- FACTION-SHEETS-{N}.md
+- LOCATION-SHEETS-{N}.md
+- POWER-TAXONOMY-{N}.md
+
+Also update:
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/setting-bible.md
+- logs/manga/latest/faction-sheets.md
+- logs/manga/latest/location-sheets.md
+- logs/manga/latest/power-taxonomy.md
+
+Return stage status JSON."
+    ]
+
+    visual_detail_text [
+        class="visual",
+        label="Visual Style Guide",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/character-dossiers.md if it exists
+- logs/manga/latest/world-rules.md if it exists
+- logs/manga/latest/image-prompt-anchors.md
+- gates/gate_1/answer.json if it exists
+
+Act as Visual Development Agent. Produce text artifacts for image-capable stages:
+- visual style guide
+- character reference sheet briefs
+- costume references
+- environment reference briefs
+- effects language guide
+- locked visual prompt anchors and negative prompts
+
+The artifacts must be reproducible and concrete enough for repeated image generation.
+Include self-critique with Red, Yellow, Green issues.
+
+Write numbered artifacts under logs/manga/02-design/visual/ using the next N:
+- VISUAL-STYLE-GUIDE-{N}.md
+- CHARACTER-REFERENCE-BRIEFS-{N}.md
+- COSTUME-REFERENCES-{N}.md
+- ENVIRONMENT-REFERENCE-BRIEFS-{N}.md
+- EFFECTS-LANGUAGE-GUIDE-{N}.md
+
+Also update:
+- logs/manga/latest/visual-style-guide.md
+- logs/manga/latest/character-reference-briefs.md
+- logs/manga/latest/costume-references.md
+- logs/manga/latest/environment-reference-briefs.md
+- logs/manga/latest/effects-language-guide.md
+
+Return stage status JSON."
+    ]
+
+    design_merge [
+        shape=tripleoctagon,
+        label="Merge Stage 2 Detail"
+    ]
+
+    visual_reference_images [
+        class="imagegen",
+        label="Generate Visual References",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/manga/latest/visual-style-guide.md",
+        thread_id="manga-visual-thread",
+        fidelity="full",
+        prompt="Use the attached visual design documents. Generate a compact reference-sheet image for the manga series: primary cast silhouettes, costume anchors, key environment motif, and effects language. Return valid stage status JSON with notes describing the generated image and any limitations."
+    ]
+
+    visual_reference_index [
+        class="visual",
+        label="Index Visual References",
+        prompt="Read:
+- logs/manga/latest/visual-style-guide.md
+- logs/manga/latest/character-reference-briefs.md
+- logs/visual_reference_images/response.md if it exists
+- list files under logs/visual_reference_images/generated if that directory exists
+
+Write a visual reference manifest that names each generated reference image, what it anchors, and what future stages must preserve.
+
+Write numbered artifacts under logs/manga/02-design/visual/ using the next N:
+- VISUAL-REFERENCE-MANIFEST-{N}.md
+- DESIGN-GATE-REPORT-{N}.md
+
+Also update:
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/design-gate-report.md
+
+Return stage status JSON."
+    ]
+
+    gate_2 [
+        shape=hexagon,
+        label="Gate 2: character and visual design"
+    ]
+
+    arc_roadmap [
+        class="architect",
+        label="Stage 3: Long-Arc Roadmap",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/visual-reference-manifest.md
+- gates/gate_2/answer.json if it exists
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Act as Story Architect. Structure arcs and sub-arcs:
+- arc roadmap
+- chapter roadmap
+- reveal and payoff map
+- escalation plan
+- character progression map
+
+The roadmap must support chapter-by-chapter production without losing the long-form promise.
+Include self-critique with Red, Yellow, Green issues.
+
+Write numbered artifacts under logs/manga/03-roadmap/ using the next N:
+- ARC-ROADMAP-{N}.md
+- CHAPTER-ROADMAP-{N}.md
+- REVEAL-PAYOFF-MAP-{N}.md
+- ESCALATION-PLAN-{N}.md
+- ROADMAP-GATE-REPORT-{N}.md
+
+Also update:
+- logs/manga/latest/arc-roadmap.md
+- logs/manga/latest/chapter-roadmap.md
+- logs/manga/latest/reveal-payoff-map.md
+- logs/manga/latest/escalation-plan.md
+- logs/manga/latest/roadmap-gate-report.md
+
+Return stage status JSON."
+    ]
+
+    gate_3 [
+        shape=hexagon,
+        label="Gate 3: long-arc roadmap"
+    ]
+
+    chapter_planning [
+        class="architect",
+        label="Stage 4: Chapter Planning",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/chapter-roadmap.md
+- logs/manga/latest/reveal-payoff-map.md
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/visual-reference-manifest.md
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+- gates/gate_3/answer.json if it exists
+
+Plan chapter $chapter_number for a target of $target_page_count pages.
+
+Act as Chapter Planner. Produce:
+- chapter brief
+- beat sheet
+- page allocation plan
+- emotional and tension curve
+- cliffhanger plan
+- continuity inputs consumed
+
+Include self-critique with Red, Yellow, Green issues and hard-stop any chapter that does not advance plot, character, and world.
+
+Write numbered artifacts under logs/manga/04-chapter-plan/chapter-$chapter_number/ using the next N:
+- CHAPTER-BRIEF-{N}.md
+- BEAT-SHEET-{N}.md
+- PAGE-ALLOCATION-{N}.md
+- TENSION-CURVE-{N}.md
+- CHAPTER-PLAN-GATE-REPORT-{N}.md
+
+Also update:
+- logs/manga/latest/chapter-brief.md
+- logs/manga/latest/beat-sheet.md
+- logs/manga/latest/page-allocation.md
+- logs/manga/latest/tension-curve.md
+- logs/manga/latest/chapter-plan-gate-report.md
+
+Return stage status JSON."
+    ]
+
+    chapter_plan_editor [
+        class="review",
+        label="Editorial Review: Chapter Plan",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/chapter-brief.md
+- logs/manga/latest/beat-sheet.md
+- logs/manga/latest/page-allocation.md
+- logs/manga/latest/tension-curve.md
+- logs/manga/latest/series-bible.md
+
+Act as Editor and Creative Director reviewer. Evaluate the chapter plan for clarity, pacing, emotional impact, serialization strength, memorable visual moments, and fit with manga storytelling.
+
+Write numbered artifacts under logs/manga/04-chapter-plan/review/ using the next N:
+- CHAPTER-PLAN-EDITORIAL-REPORT-{N}.md
+- CHAPTER-PLAN-REVISION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/chapter-plan-editorial-report.md
+- logs/manga/latest/chapter-plan-revision-tickets.md
+
+Return stage status JSON."
+    ]
+
+    gate_4 [
+        shape=hexagon,
+        label="Gate 4: chapter plan"
+    ]
+
+    scriptwriting [
+        class="architect",
+        label="Stage 5: Scriptwriting",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/chapter-brief.md
+- logs/manga/latest/beat-sheet.md
+- logs/manga/latest/page-allocation.md
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/voice-guide.md
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/chapter-plan-revision-tickets.md
+- gates/gate_4/answer.json if it exists
+
+Act as Scriptwriter. Convert the approved beats into a manga-ready script:
+- page-by-page script
+- panel-by-panel script
+- dialogue draft
+- SFX and lettering notes
+- page-turn and reveal notes
+
+Control exposition density. Dialogue must match the voice guide. The chapter must be readable visually, not only verbally.
+Include self-critique with Red, Yellow, Green issues.
+
+Write numbered artifacts under logs/manga/05-script/chapter-$chapter_number/ using the next N:
+- PAGE-SCRIPT-{N}.md
+- PANEL-SCRIPT-{N}.md
+- DIALOGUE-DRAFT-{N}.md
+- LETTERING-SFX-NOTES-{N}.md
+- SCRIPT-SELF-CRITIQUE-{N}.md
+
+Also update:
+- logs/manga/latest/page-script.md
+- logs/manga/latest/panel-script.md
+- logs/manga/latest/dialogue-draft.md
+- logs/manga/latest/lettering-sfx-notes.md
+- logs/manga/latest/script-self-critique.md
+
+Return stage status JSON."
+    ]
+
+    script_review_split [
+        shape=component,
+        label="Stage 5 Cross-Reviews"
+    ]
+
+    continuity_script_review [
+        class="review",
+        label="Continuity Review: Script",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/page-script.md
+- logs/manga/latest/panel-script.md
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/chapter-roadmap.md
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Act as Continuity Agent. Check the script for canon contradictions, timeline problems, power-system violations, unresolved thread misuse, injury or status mismatches, and relationship-state drift.
+
+Write numbered artifacts under logs/manga/05-script/review/ using the next N:
+- SCRIPT-CONTINUITY-REPORT-{N}.md
+- SCRIPT-CONTRADICTION-ALERTS-{N}.md
+
+Also update:
+- logs/manga/latest/script-continuity-report.md
+- logs/manga/latest/script-contradiction-alerts.md
+
+Return stage status JSON. Use fail for any hard-stop canon contradiction."
+    ]
+
+    character_voice_review [
+        class="review",
+        label="Character Voice Review",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/dialogue-draft.md
+- logs/manga/latest/page-script.md
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/voice-guide.md
+
+Act as Character Development Agent reviewing another agent's work. Check dialogue, motivation, behavior, and interpersonal dynamics for voice drift or weak motivation.
+
+Write numbered artifacts under logs/manga/05-script/review/ using the next N:
+- CHARACTER-VOICE-REPORT-{N}.md
+- DIALOGUE-REVISION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/character-voice-report.md
+- logs/manga/latest/dialogue-revision-tickets.md
+
+Return stage status JSON."
+    ]
+
+    editorial_script_review [
+        class="review",
+        label="Editorial Review: Script",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/page-script.md
+- logs/manga/latest/panel-script.md
+- logs/manga/latest/dialogue-draft.md
+- logs/manga/latest/beat-sheet.md
+
+Act as Editor and Critic Agent. Evaluate clarity, pacing, emotional impact, page turns, scene purpose, exposition control, and manga readability.
+
+Write numbered artifacts under logs/manga/05-script/review/ using the next N:
+- SCRIPT-EDITORIAL-REPORT-{N}.md
+- SCRIPT-REVISION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/script-editorial-report.md
+- logs/manga/latest/script-revision-tickets.md
+
+Return stage status JSON."
+    ]
+
+    script_review_merge [
+        shape=tripleoctagon,
+        label="Merge Script Reviews"
+    ]
+
+    script_review_synthesis [
+        class="director",
+        label="Executive Synthesis: Script",
+        prompt="Read:
+- logs/manga/latest/script-self-critique.md
+- logs/manga/latest/script-continuity-report.md
+- logs/manga/latest/script-contradiction-alerts.md
+- logs/manga/latest/character-voice-report.md
+- logs/manga/latest/dialogue-revision-tickets.md
+- logs/manga/latest/script-editorial-report.md
+- logs/manga/latest/script-revision-tickets.md
+
+Act as Creative Director. Resolve reviewer conflicts and decide whether defects belong in chapter planning, scriptwriting, or later layout.
+
+Write numbered artifacts under logs/manga/05-script/review/ using the next N:
+- SCRIPT-GATE-SYNTHESIS-{N}.md
+- TARGETED-REVISION-PLAN-{N}.md
+
+Also update:
+- logs/manga/latest/script-gate-synthesis.md
+- logs/manga/latest/script-targeted-revision-plan.md
+
+Return stage status JSON."
+    ]
+
+    gate_5 [
+        shape=hexagon,
+        label="Gate 5: script"
+    ]
+
+    storyboard_layout [
+        class="visual",
+        label="Stage 6: Storyboard Layout",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/page-script.md
+- logs/manga/latest/panel-script.md
+- logs/manga/latest/lettering-sfx-notes.md
+- logs/manga/latest/visual-style-guide.md
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/effects-language-guide.md
+- gates/gate_5/answer.json if it exists
+
+Act as Storyboard and Layout Agent. Produce:
+- thumbnail page plan in text form
+- layout notes
+- shot and composition plan
+- eye-flow notes
+- difficult-page list
+- image prompts for storyboard thumbnails
+
+Include self-critique with Red, Yellow, Green issues and hard-stop unreadable visual storytelling.
+
+Write numbered artifacts under logs/manga/06-storyboard/chapter-$chapter_number/ using the next N:
+- THUMBNAIL-PLAN-{N}.md
+- LAYOUT-NOTES-{N}.md
+- SHOT-COMPOSITION-PLAN-{N}.md
+- STORYBOARD-IMAGE-PROMPTS-{N}.md
+- STORYBOARD-SELF-CRITIQUE-{N}.md
+
+Also update:
+- logs/manga/latest/thumbnail-plan.md
+- logs/manga/latest/layout-notes.md
+- logs/manga/latest/shot-composition-plan.md
+- logs/manga/latest/storyboard-image-prompts.md
+- logs/manga/latest/storyboard-self-critique.md
+
+Return stage status JSON."
+    ]
+
+    storyboard_images [
+        class="imagegen",
+        label="Generate Storyboard Thumbnails",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/manga/latest/storyboard-image-prompts.md",
+        thread_id="manga-visual-thread",
+        fidelity="full",
+        prompt="Use the attached storyboard prompt document, script, visual style guide, and reference image. Generate a readable thumbnail contact sheet for chapter $chapter_number. Favor layout clarity over polish. Return valid stage status JSON with notes on generated thumbnails."
+    ]
+
+    storyboard_review [
+        class="review",
+        label="Editorial Review: Storyboard",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/thumbnail-plan.md
+- logs/manga/latest/layout-notes.md
+- logs/manga/latest/shot-composition-plan.md
+- logs/storyboard_images/response.md if it exists
+- list files under logs/storyboard_images/generated if that directory exists
+
+Act as Editor and Visual QA. Review eye flow, action readability, emotional emphasis, page turns, reveal clarity, and whether splash pages are justified.
+
+Write numbered artifacts under logs/manga/06-storyboard/review/ using the next N:
+- STORYBOARD-REVIEW-{N}.md
+- STORYBOARD-REVISION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/storyboard-review.md
+- logs/manga/latest/storyboard-revision-tickets.md
+
+Return stage status JSON."
+    ]
+
+    gate_6 [
+        shape=hexagon,
+        label="Gate 6: storyboard"
+    ]
+
+    production_plan [
+        class="visual",
+        label="Stage 7: Production Plan",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/page-script.md
+- logs/manga/latest/panel-script.md
+- logs/manga/latest/thumbnail-plan.md
+- logs/manga/latest/layout-notes.md
+- logs/manga/latest/visual-style-guide.md
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/storyboard-revision-tickets.md
+- gates/gate_6/answer.json if it exists
+
+Act as Chapter Production Agent. Prepare structured chapter production:
+- draft page production plan
+- page-by-page image prompt queue
+        - locked reference checklist
+        - correction and harmonization strategy
+        - production feasibility notes
+
+The queue must define all $target_page_count pages with one explicit per-page prompt each. Do not emit a representative subset.
+Every per-page prompt must contain an \"Identity Lock\" block copied from locked references with immutable anchors for each recurring character (hair shape, eye shape, face proportions, signature clothing markers, and distinguishing props/scars). Keep these anchors stable across every page.
+
+Write numbered artifacts under logs/manga/07-production/chapter-$chapter_number/ using the next N:
+- DRAFT-PAGE-PRODUCTION-PLAN-{N}.md
+- PAGE-PROMPT-QUEUE-{N}.md
+- LOCKED-REFERENCE-CHECKLIST-{N}.md
+- HARMONIZATION-STRATEGY-{N}.md
+
+Also update:
+- logs/manga/latest/draft-page-production-plan.md
+- logs/manga/latest/page-prompt-queue.md
+- logs/manga/latest/locked-reference-checklist.md
+- logs/manga/latest/harmonization-strategy.md
+
+Return stage status JSON."
+    ]
+
+    build_page_prompt_files [
+        shape=parallelogram,
+        label="Build Page Prompt Files",
+        tool_command="cd \"${graph.output_root}\" && mkdir -p logs/manga/latest/page-prompts && rm -f logs/manga/latest/page-prompts/*.md && awk 'BEGIN { file=\"\" } /^##+ .*Page [0-9][0-9]*/ { if (file != \"\") close(file); if (match($0, /Page [0-9][0-9]*/)) { page=substr($0, RSTART+5, RLENGTH-5); file=sprintf(\"logs/manga/latest/page-prompts/page-%02d.md\", page+0); print $0 > file; next } } file != \"\" { print $0 >> file }' logs/manga/latest/page-prompt-queue.md && count=$(find logs/manga/latest/page-prompts -maxdepth 1 -type f -name 'page-*.md' | wc -l | tr -d '[:space:]') && test \"$count\" -eq $target_page_count"
+    ]
+
+    draft_pages [
+        shape=component,
+        label="Generate Draft Pages (All Queue Items)",
+        queue_source="logs/manga/latest/page-prompts",
+        timeout="10800s",
+        error_policy="ignore",
+        max_parallel="1"
+    ]
+
+    draft_page_worker [
+        class="imagegen",
+        label="Generate Draft Page",
+        max_retry="2",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="${context.queue.item.path}",
+        thread_id="manga-visual-thread",
+        fidelity="full",
+        prompt="Read ${context.queue.item.path} and treat it as the authoritative prompt for exactly one page. Generate exactly one manga page image for chapter $chapter_number using locked references and visual rules. Preserve continuity and panel readability. Do not redesign recurring characters; keep face proportions, hairstyle silhouette, and signature outfit markers consistent with prior approved pages in this thread. Return valid stage status JSON and include page identifier ${context.queue.item.name} in notes."
+    ]
+
+    draft_pages_merge [
+        shape=tripleoctagon,
+        label="Merge Draft Page Workers"
+    ]
+
+    verify_draft_pages_count [
+        shape=parallelogram,
+        label="Measure Draft Page Image Coverage",
+        tool_command="cd \"${graph.output_root}\" && expected=$(find logs/manga/latest/page-prompts -maxdepth 1 -type f -name 'page-*.md' | wc -l | tr -d '[:space:]') && actual=$(find logs -maxdepth 3 -type f -name 'image-1.png' | grep -F '/draft_page_worker[' | wc -l | tr -d '[:space:]') && mkdir -p logs/manga/latest && coverage_file=logs/manga/latest/draft-pages-coverage.env && printf 'expected=%s\nactual=%s\n' \"$expected\" \"$actual\" > \"$coverage_file\" && if [ \"$expected\" -gt 0 ] && [ \"$actual\" -ge \"$expected\" ]; then echo 'ok=true' >> \"$coverage_file\"; else echo 'ok=false' >> \"$coverage_file\"; fi"
+    ]
+
+    decide_draft_pages_coverage [
+        class="fast",
+        label="Decide Draft Coverage Route",
+        prompt="Read logs/manga/latest/draft-pages-coverage.env.
+
+Set context_updates:
+- draft.coverage_ok = \"true\" when ok=true in that file, otherwise \"false\"
+
+Return stage status JSON with status=success."
+    ]
+
+    draft_drift_audit [
+        class="visualqa",
+        label="Anti-Drift Audit (Primary)",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/locked-reference-checklist.md
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/visual-style-guide.md
+- logs/manga/latest/page-script.md
+- logs/draft_pages/status.json if it exists
+- logs/manga/latest/draft-drift-audit.md if it exists
+- list files under logs/draft_page_worker*/generated if those directories exist
+
+Act as an Anti-Drift Continuity Auditor. Compare all generated draft pages in page order and detect severe identity drift (character face/hair/body redesign), costume anchor drift, or style collapse that breaks chapter-level consistency.
+Mandatory checks:
+- Build identity anchors from earliest stable appearances (starting from pages 01-05).
+- Explicitly compare those anchors against pages 06-08, 12, 16, and 20.
+- Treat abrupt recurring-character hair-color category shifts (for example dark to blonde), face-structure changes, or body-type swaps without script justification as severe drift.
+- Do not pass if any key recurring character cannot be confidently tracked across the chapter.
+
+Write numbered artifacts under logs/manga/07-production/review/ using the next N:
+- DRAFT-DRIFT-AUDIT-{N}.md
+- DRAFT-DRIFT-REDO-PLAN-{N}.md
+
+Also update:
+- logs/manga/latest/draft-drift-audit.md
+- logs/manga/latest/draft-drift-redo-plan.md
+
+Return stage status JSON with status=success unless no draft images are available.
+Required context_updates:
+- drift.regen_needed: \"true\" when severe drift exists, otherwise \"false\"
+- drift.first_page: two-digit page where severe drift starts (for example \"06\"); use \"00\" when no severe drift
+- drift.reason: short reason phrase
+- drift.redo_scope: \"from-first-drift-to-end\" when regen is needed, otherwise \"none\"."
+    ]
+
+    draft_drift_audit_secondary [
+        class="review",
+        label="Anti-Drift Audit (Secondary)",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/locked-reference-checklist.md
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/visual-style-guide.md
+- logs/manga/latest/page-script.md
+- logs/draft_pages/status.json if it exists
+- logs/manga/latest/draft-drift-audit.md if it exists
+- list files under logs/draft_page_worker*/generated if those directories exist
+
+Act as an independent anti-drift reviewer. You must attempt to track each recurring character from earliest clear appearances and verify continuity through all later pages.
+Hard-fail conditions:
+- recurring character identity replacement (face/hair/body redesign),
+- unjustified hair-color category shift for the same recurring character,
+- recurring-character wardrobe anchor loss without script reason,
+- abrupt style collapse that makes the same character look like a different person.
+
+Write numbered artifacts under logs/manga/07-production/review/ using the next N:
+- DRAFT-DRIFT-AUDIT-SECONDARY-{N}.md
+
+Also update:
+- logs/manga/latest/draft-drift-audit-secondary.md
+
+Return stage status JSON with status=success unless no draft images exist.
+Required context_updates:
+- drift2.regen_needed: \"true\" or \"false\"
+- drift2.first_page: two-digit first severe-drift page, else \"00\"
+- drift2.reason: short reason phrase"
+    ]
+
+    drift_audit_split [
+        shape=component,
+        label="Run Dual Drift Audits"
+    ]
+
+    drift_audit_merge [
+        shape=tripleoctagon,
+        label="Merge Drift Audits"
+    ]
+
+    drift_audit_decision [
+        class="director",
+        label="Decide Drift Regen Route",
+        prompt="Read:
+- logs/manga/latest/draft-drift-audit.md
+- logs/manga/latest/draft-drift-audit-secondary.md if it exists
+
+Synthesize primary and secondary anti-drift audits.
+Decision rule:
+- If either audit flags severe drift, set drift.regen_needed=true.
+- drift.first_page must be the earliest non-00 page flagged by either audit.
+- drift.reason should summarize both views.
+- drift.redo_scope is \"from-first-drift-to-end\" when regen is needed, else \"none\".
+
+Return stage status JSON with these context_updates:
+- drift.regen_needed
+- drift.first_page
+- drift.reason
+- drift.redo_scope"
+    ]
+
+    build_drift_regen_manifest [
+        shape=parallelogram,
+        label="Build Drift Regen Prompt Queue",
+        tool_command="cd \"${graph.output_root}\" && start=\"${context.drift.first_page}\" && case \"$start\" in ''|*[!0-9]*) start=0 ;; esac && mkdir -p logs/manga/latest/page-prompts-redo && rm -f logs/manga/latest/page-prompts-redo/*.md && for f in logs/manga/latest/page-prompts/page-*.md; do [ -f \"$f\" ] || continue; base=$(basename \"$f\"); num=$(printf '%s' \"$base\" | sed -E 's/^page-([0-9]+)\\.md$/\\1/'); [ \"$num\" = \"$base\" ] && continue; if [ \"$num\" -ge \"$start\" ]; then cp \"$f\" \"logs/manga/latest/page-prompts-redo/$base\"; fi; done && count=$(find logs/manga/latest/page-prompts-redo -maxdepth 1 -type f -name 'page-*.md' | wc -l | tr -d '[:space:]') && test \"$count\" -gt 0"
+    ]
+
+    draft_pages_redo [
+        shape=component,
+        label="Regenerate Draft Pages (From Drift Point)",
+        queue_source="logs/manga/latest/page-prompts-redo",
+        timeout="10800s",
+        error_policy="ignore",
+        max_parallel="1"
+    ]
+
+    draft_page_redo_worker [
+        class="imagegen",
+        label="Regenerate Draft Page",
+        max_retry="2",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/manga/latest/draft-drift-redo-plan.md,${context.queue.item.path}",
+        thread_id="manga-visual-thread",
+        fidelity="full",
+        prompt="Read logs/manga/latest/draft-drift-redo-plan.md and ${context.queue.item.path}. Regenerate exactly one manga page image for chapter $chapter_number while preserving recurring-character identity anchors from prior stable pages. Keep the same characters, costumes, and visual language unless the page prompt explicitly requires a story-driven change. Return valid stage status JSON and include page identifier ${context.queue.item.name} in notes."
+    ]
+
+    draft_pages_redo_merge [
+        shape=tripleoctagon,
+        label="Merge Drift Regen Workers"
+    ]
+
+    verify_draft_pages_redo_count [
+        shape=parallelogram,
+        label="Measure Drift Regen Coverage",
+        tool_command="cd \"${graph.output_root}\" && expected=$(find logs/manga/latest/page-prompts-redo -maxdepth 1 -type f -name 'page-*.md' | wc -l | tr -d '[:space:]') && actual=$(find logs -maxdepth 3 -type f -name 'image-1.png' | grep -F '/draft_page_redo_worker[' | wc -l | tr -d '[:space:]') && mkdir -p logs/manga/latest && coverage_file=logs/manga/latest/draft-pages-redo-coverage.env && printf 'expected=%s\nactual=%s\n' \"$expected\" \"$actual\" > \"$coverage_file\" && if [ \"$expected\" -gt 0 ] && [ \"$actual\" -ge \"$expected\" ]; then echo 'ok=true' >> \"$coverage_file\"; else echo 'ok=false' >> \"$coverage_file\"; fi"
+    ]
+
+    decide_draft_pages_redo_coverage [
+        class="fast",
+        label="Decide Drift Regen Coverage Route",
+        prompt="Read logs/manga/latest/draft-pages-redo-coverage.env.
+
+Set context_updates:
+- drift.redo_coverage_ok = \"true\" when ok=true in that file, otherwise \"false\"
+
+Return stage status JSON with status=success."
+    ]
+
+    mark_drift_regen_done [
+        class="director",
+        label="Mark Drift Regen Pass Complete",
+        prompt="Return stage status JSON with status=success and context_updates setting drift.regen_done=true. Include a short note."
+    ]
+
+    production_review_split [
+        shape=component,
+        label="Stage 7 Reviews"
+    ]
+
+    visual_qa [
+        class="visualqa",
+        label="Visual QA",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/locked-reference-checklist.md
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/visual-style-guide.md
+- logs/draft_pages/status.json if it exists
+- list files under logs/draft_page_worker*/generated if those directories exist
+
+Act as Visual QA Agent. Check character likeness, costume and prop continuity, effects consistency, action clarity, panel readability, and text placement feasibility.
+
+Write numbered artifacts under logs/manga/07-production/review/ using the next N:
+- VISUAL-QA-REPORT-{N}.md
+- VISUAL-CORRECTION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/visual-qa-report.md
+- logs/manga/latest/visual-correction-tickets.md
+
+Return stage status JSON. For representative or incomplete draft batches, evaluate only available pages and return success with explicit coverage gaps and tickets; reserve fail only for severe visual identity drift or unreadable storytelling in the available output."
+    ]
+
+    editorial_art_review [
+        class="review",
+        label="Editorial Review: Draft Pages",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/page-script.md
+- logs/manga/latest/thumbnail-plan.md
+- logs/manga/latest/draft-page-production-plan.md
+- logs/draft_pages/status.json if it exists
+- list files under logs/draft_page_worker*/generated if those directories exist
+
+Act as Editor and Critic Agent. Check whether draft pages match script intent, preserve pacing, make page turns clear, and produce a satisfying chapter experience.
+
+Write numbered artifacts under logs/manga/07-production/review/ using the next N:
+- DRAFT-PAGE-EDITORIAL-REPORT-{N}.md
+- DRAFT-PAGE-REVISION-TICKETS-{N}.md
+
+Also update:
+- logs/manga/latest/draft-page-editorial-report.md
+- logs/manga/latest/draft-page-revision-tickets.md
+
+Return stage status JSON. For representative or incomplete batches, return success with explicit coverage limits and revision tickets; reserve fail for severe script mismatch or unreadable page storytelling."
+    ]
+
+    continuity_art_review [
+        class="review",
+        label="Continuity Review: Draft Pages",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/page-script.md
+- logs/manga/latest/locked-reference-checklist.md
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/character-dossiers.md
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+- logs/draft_pages/status.json if it exists
+- list files under logs/draft_page_worker*/generated if those directories exist
+
+Act as Continuity Agent. Check whether generated pages introduce canon contradictions, costume or injury mistakes, world-rule violations, timeline errors, or status drift.
+
+Write numbered artifacts under logs/manga/07-production/review/ using the next N:
+- DRAFT-PAGE-CONTINUITY-REPORT-{N}.md
+- ART-CANON-CONTRADICTION-ALERTS-{N}.md
+
+Also update:
+- logs/manga/latest/draft-page-continuity-report.md
+- logs/manga/latest/art-canon-contradiction-alerts.md
+
+Return stage status JSON. If coverage is partial, return success with unverified continuity items and required follow-up checks; use fail only for confirmed hard-stop canon contradiction."
+    ]
+
+    production_review_merge [
+        shape=tripleoctagon,
+        label="Merge Production Reviews"
+    ]
+
+    correction_plan [
+        class="director",
+        label="Correction Plan",
+        prompt="Read:
+- logs/manga/latest/visual-qa-report.md
+- logs/manga/latest/visual-correction-tickets.md
+- logs/manga/latest/draft-page-editorial-report.md
+- logs/manga/latest/draft-page-revision-tickets.md
+- logs/manga/latest/draft-page-continuity-report.md
+- logs/manga/latest/art-canon-contradiction-alerts.md
+- logs/manga/latest/harmonization-strategy.md
+
+Act as executive synthesis. Classify issues as Red, Yellow, or Green. Route each issue to the earliest responsible stage: design references, chapter plan, script, storyboard, or targeted art correction.
+
+Write numbered artifacts under logs/manga/07-production/review/ using the next N:
+- PRODUCTION-REVIEW-SYNTHESIS-{N}.md
+- CORRECTION-PLAN-{N}.md
+- UPSTREAM-ROUTING-RECOMMENDATION-{N}.md
+
+Also update:
+- logs/manga/latest/production-review-synthesis.md
+- logs/manga/latest/correction-plan.md
+- logs/manga/latest/upstream-routing-recommendation.md
+
+Return stage status JSON."
+    ]
+
+    corrected_pages [
+        shape=component,
+        label="Generate Corrected Pages (All Queue Items)",
+        queue_source="logs/manga/latest/page-prompts",
+        timeout="10800s",
+        error_policy="ignore",
+        max_parallel="1"
+    ]
+
+    verify_corrected_pages_count [
+        shape=parallelogram,
+        label="Measure Corrected Page Coverage",
+        tool_command="cd \"${graph.output_root}\" && expected=$(find logs/manga/latest/page-prompts -maxdepth 1 -type f -name 'page-*.md' | wc -l | tr -d '[:space:]') && actual=$(find logs -maxdepth 3 -type f -name 'image-1.png' | grep -F '/corrected_page_worker[' | wc -l | tr -d '[:space:]') && mkdir -p logs/manga/latest && coverage_file=logs/manga/latest/corrected-pages-coverage.env && printf 'expected=%s\nactual=%s\n' \"$expected\" \"$actual\" > \"$coverage_file\" && if [ \"$expected\" -gt 0 ] && [ \"$actual\" -ge \"$expected\" ]; then echo 'ok=true' >> \"$coverage_file\"; else echo 'ok=false' >> \"$coverage_file\"; fi"
+    ]
+
+    decide_corrected_pages_coverage [
+        class="fast",
+        label="Decide Corrected Coverage Route",
+        prompt="Read logs/manga/latest/corrected-pages-coverage.env.
+
+Set context_updates:
+- corrected.coverage_ok = \"true\" when ok=true in that file, otherwise \"false\"
+
+Return stage status JSON with status=success."
+    ]
+
+    corrected_page_worker [
+        class="imagegen",
+        label="Generate Corrected Page",
+        max_retry="2",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/manga/latest/correction-plan.md,${context.queue.item.path}",
+        thread_id="manga-visual-thread",
+        fidelity="full",
+        prompt="Read ${context.queue.item.path} and the correction plan. Generate exactly one corrected final-candidate manga page for chapter $chapter_number with targeted fixes while preserving approved choices. Keep recurring-character facial structure, hairstyle silhouette, and signature costume markers consistent with earlier approved pages unless explicitly overridden by the script. Return valid stage status JSON and include page identifier ${context.queue.item.name} in notes."
+    ]
+
+    corrected_pages_merge [
+        shape=tripleoctagon,
+        label="Merge Corrected Page Workers"
+    ]
+
+    production_index [
+        class="visual",
+        label="Index Production Artifacts",
+        prompt="Read:
+- logs/manga/latest/draft-page-production-plan.md
+- logs/manga/latest/page-prompt-queue.md
+- logs/manga/latest/correction-plan.md
+- logs/draft_pages/status.json if it exists
+- logs/corrected_pages/status.json if it exists
+- list files under logs/draft_page_worker*/generated and logs/corrected_page_worker*/generated if those directories exist
+
+Write a manifest of draft, corrected, and final-candidate pages. Identify missing pages as queued work, not as silently complete.
+
+Write numbered artifacts under logs/manga/07-production/chapter-$chapter_number/ using the next N:
+- PRODUCTION-ARTIFACT-MANIFEST-{N}.md
+- FINAL-CANDIDATE-PAGES-{N}.md
+
+Also update:
+- logs/manga/latest/production-artifact-manifest.md
+- logs/manga/latest/final-candidate-pages.md
+
+Return stage status JSON."
+    ]
+
+    gate_7 [
+        shape=hexagon,
+        label="Gate 7: chapter production"
+    ]
+
+    post_chapter_review [
+        class="review",
+        label="Stage 8: Post-Chapter Review",
+        prompt="Read:
+- $requirements_document
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/chapter-roadmap.md
+- logs/manga/latest/page-script.md
+- logs/manga/latest/production-artifact-manifest.md
+- logs/manga/latest/final-candidate-pages.md
+- logs/manga/latest/production-review-synthesis.md
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+- gates/gate_7/answer.json if it exists
+
+Act as Editor, Continuity Agent, and Creative Director. Evaluate the finished chapter as a standalone reading experience and as part of the series.
+
+Produce:
+- chapter scorecard
+- review summary
+- issue list
+- canon update candidate
+- production memory update candidate
+- lessons learned
+- recommended Gate 8 decision
+
+Write numbered artifacts under logs/manga/08-post-review/chapter-$chapter_number/ using the next N:
+- CHAPTER-SCORECARD-{N}.md
+- POST-CHAPTER-REVIEW-{N}.md
+- POST-CHAPTER-ISSUE-LIST-{N}.md
+- CANON-UPDATE-CANDIDATE-{N}.md
+- PRODUCTION-MEMORY-CANDIDATE-{N}.md
+- LESSONS-LEARNED-{N}.md
+
+Also update:
+- logs/manga/latest/chapter-scorecard.md
+- logs/manga/latest/post-chapter-review.md
+- logs/manga/latest/post-chapter-issue-list.md
+- logs/manga/latest/canon-update-candidate.md
+- logs/manga/latest/production-memory-candidate.md
+- logs/manga/latest/lessons-learned.md
+
+Return stage status JSON."
+    ]
+
+    gate_8 [
+        shape=hexagon,
+        label="Gate 8: final chapter approval"
+    ]
+
+    update_memory [
+        class="director",
+        label="Update Approved Memory",
+        prompt="Read:
+- gates/gate_8/answer.json
+- logs/manga/latest/series-bible.md
+- logs/manga/latest/character-dossiers.md
+- logs/manga/latest/world-rules.md
+- logs/manga/latest/visual-reference-manifest.md
+- logs/manga/latest/chapter-scorecard.md
+- logs/manga/latest/canon-update-candidate.md
+- logs/manga/latest/production-memory-candidate.md
+- logs/manga/latest/final-candidate-pages.md
+- $prior_run_dir/logs/manga/memory if $prior_run_dir is not none
+
+Only approved artifacts may enter memory. If Gate 8 did not approve or approve with minor notes, return fail and do not update memory.
+
+Act as Continuity Agent and production archivist. Merge approved updates into durable memory:
+- canon memory
+- visual memory
+- narrative memory
+- production memory
+- unresolved plot thread tracker
+- design change log
+- chapter-by-chapter canon update
+
+Write numbered artifacts under logs/manga/memory/chapter-$chapter_number/ using the next N:
+- CONTINUITY-LEDGER-{N}.md
+- STATUS-TRACKER-{N}.md
+- UNRESOLVED-PLOT-THREADS-{N}.md
+- DESIGN-CHANGE-LOG-{N}.md
+- CHAPTER-CANON-UPDATE-{N}.md
+- PRODUCTION-MEMORY-{N}.md
+
+Also update stable approved memory files:
+- logs/manga/memory/continuity-ledger.md
+- logs/manga/memory/status-tracker.md
+- logs/manga/memory/unresolved-plot-threads.md
+- logs/manga/memory/design-change-log.md
+- logs/manga/memory/chapter-canon-update-$chapter_number.md
+- logs/manga/memory/production-memory.md
+- logs/manga/memory/approved-artifact-index.md
+
+Return stage status JSON."
+    ]
+
+    start -> ingest_premise
+    ingest_premise -> gate_0
+    gate_0 -> foundation_split [label="approve"]
+    gate_0 -> ingest_premise [label="revise"]
+    gate_0 -> exit [label="stop"]
+
+    foundation_split -> story_architect
+    foundation_split -> cast_foundation
+    foundation_split -> world_foundation
+    foundation_split -> visual_foundation
+    story_architect -> foundation_merge
+    cast_foundation -> foundation_merge
+    world_foundation -> foundation_merge
+    visual_foundation -> foundation_merge
+    foundation_merge -> synthesize_foundation
+    synthesize_foundation -> gate_1
+    gate_1 -> design_split [label="approve"]
+    gate_1 -> story_architect [label="revise story"]
+    gate_1 -> cast_foundation [label="revise cast"]
+    gate_1 -> world_foundation [label="revise world"]
+    gate_1 -> visual_foundation [label="revise visual"]
+    gate_1 -> exit [label="stop"]
+
+    design_split -> character_detail
+    design_split -> world_detail
+    design_split -> visual_detail_text
+    character_detail -> design_merge
+    world_detail -> design_merge
+    visual_detail_text -> design_merge
+    design_merge -> visual_reference_images
+    visual_reference_images -> visual_reference_index
+    visual_reference_index -> gate_2
+    gate_2 -> arc_roadmap [label="approve"]
+    gate_2 -> character_detail [label="revise characters"]
+    gate_2 -> world_detail [label="revise world"]
+    gate_2 -> visual_detail_text [label="revise visual text"]
+    gate_2 -> visual_reference_images [label="regenerate visuals"]
+    gate_2 -> exit [label="stop"]
+
+    arc_roadmap -> gate_3
+    gate_3 -> chapter_planning [label="approve"]
+    gate_3 -> arc_roadmap [label="revise"]
+    gate_3 -> exit [label="stop"]
+
+    chapter_planning -> chapter_plan_editor
+    chapter_plan_editor -> gate_4
+    gate_4 -> scriptwriting [label="approve"]
+    gate_4 -> chapter_planning [label="revise"]
+    gate_4 -> arc_roadmap [label="revise roadmap"]
+    gate_4 -> exit [label="stop"]
+
+    scriptwriting -> script_review_split
+    script_review_split -> continuity_script_review
+    script_review_split -> character_voice_review
+    script_review_split -> editorial_script_review
+    continuity_script_review -> script_review_merge
+    character_voice_review -> script_review_merge
+    editorial_script_review -> script_review_merge
+    script_review_merge -> script_review_synthesis
+    script_review_synthesis -> gate_5
+    gate_5 -> storyboard_layout [label="approve"]
+    gate_5 -> scriptwriting [label="revise script"]
+    gate_5 -> chapter_planning [label="revise plan"]
+    gate_5 -> character_detail [label="revise characters"]
+    gate_5 -> exit [label="stop"]
+
+    storyboard_layout -> storyboard_images
+    storyboard_images -> storyboard_review
+    storyboard_review -> gate_6
+    gate_6 -> production_plan [label="approve"]
+    gate_6 -> storyboard_layout [label="revise storyboard"]
+    gate_6 -> scriptwriting [label="revise script"]
+    gate_6 -> visual_detail_text [label="revise visual rules"]
+    gate_6 -> exit [label="stop"]
+
+    production_plan -> build_page_prompt_files
+    build_page_prompt_files -> draft_pages
+    draft_pages -> draft_page_worker
+    draft_page_worker -> draft_pages_merge
+    draft_pages_merge -> verify_draft_pages_count
+    verify_draft_pages_count -> decide_draft_pages_coverage
+    decide_draft_pages_coverage -> drift_audit_split [condition="context.draft.coverage_ok=true"]
+    decide_draft_pages_coverage -> draft_pages [condition="context.draft.coverage_ok!=true", label="retry draft generation queue"]
+    drift_audit_split -> draft_drift_audit
+    drift_audit_split -> draft_drift_audit_secondary
+    draft_drift_audit -> drift_audit_merge
+    draft_drift_audit_secondary -> drift_audit_merge
+    drift_audit_merge -> drift_audit_decision
+    drift_audit_decision -> build_drift_regen_manifest [condition="context.drift.regen_needed=true && context.drift.regen_done!=true"]
+    build_drift_regen_manifest -> draft_pages_redo
+    draft_pages_redo -> draft_page_redo_worker
+    draft_page_redo_worker -> draft_pages_redo_merge
+    draft_pages_redo_merge -> verify_draft_pages_redo_count
+    verify_draft_pages_redo_count -> decide_draft_pages_redo_coverage
+    decide_draft_pages_redo_coverage -> mark_drift_regen_done [condition="context.drift.redo_coverage_ok=true"]
+    decide_draft_pages_redo_coverage -> build_drift_regen_manifest [condition="context.drift.redo_coverage_ok!=true", label="retry drift regen queue"]
+    mark_drift_regen_done -> drift_audit_split
+    drift_audit_decision -> production_review_split [condition="context.drift.regen_needed!=true"]
+    drift_audit_decision -> production_review_split [condition="context.drift.regen_needed=true && context.drift.regen_done=true", label="escalate unresolved drift"]
+    production_review_split -> visual_qa
+    production_review_split -> editorial_art_review
+    production_review_split -> continuity_art_review
+    visual_qa -> production_review_merge
+    editorial_art_review -> production_review_merge
+    continuity_art_review -> production_review_merge
+    production_review_merge -> correction_plan
+    correction_plan -> corrected_pages
+    corrected_pages -> corrected_page_worker
+    corrected_page_worker -> corrected_pages_merge
+    corrected_pages_merge -> verify_corrected_pages_count
+    verify_corrected_pages_count -> decide_corrected_pages_coverage
+    decide_corrected_pages_coverage -> production_index [condition="context.corrected.coverage_ok=true"]
+    decide_corrected_pages_coverage -> corrected_pages [condition="context.corrected.coverage_ok!=true", label="retry corrected page queue"]
+    production_index -> gate_7
+    gate_7 -> post_chapter_review [label="approve"]
+    gate_7 -> correction_plan [label="correct visuals"]
+    gate_7 -> storyboard_layout [label="revise storyboard"]
+    gate_7 -> scriptwriting [label="revise script"]
+    gate_7 -> visual_detail_text [label="revise visual rules"]
+    gate_7 -> exit [label="stop"]
+
+    post_chapter_review -> gate_8
+    gate_8 -> update_memory [label="approve"]
+    gate_8 -> update_memory [label="approve with minor notes"]
+    gate_8 -> correction_plan [label="minor revision"]
+    gate_8 -> chapter_planning [label="major revision"]
+    gate_8 -> scriptwriting [label="rollback to script"]
+    gate_8 -> exit [label="stop"]
+
+    update_memory -> exit
+}
