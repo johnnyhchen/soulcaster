@@ -20,6 +20,14 @@ public static class AutoResumeSupport
         if (options.Resume)
             return new ResumeDecision(ShouldResume: checkpointExists, ResumeSource: "manual", ExistingManifest: manifest);
 
+        if (!string.IsNullOrWhiteSpace(options.StartAt) && checkpointExists)
+        {
+            return new ResumeDecision(
+                ShouldResume: true,
+                ResumeSource: "start-at",
+                ExistingManifest: manifest);
+        }
+
         if (options.AutoResumePolicy == AutoResumePolicy.Off || !checkpointExists)
             return new ResumeDecision(ShouldResume: false, ResumeSource: "fresh", ExistingManifest: manifest);
 

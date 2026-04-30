@@ -147,8 +147,6 @@ public static class ModelCatalog
             SupportsDocumentInput: true,
             SupportsAudioInput: false),
 
-        // GPT-5.4 is accepted explicitly for routing and selection in this runtime.
-        // Cost metadata is intentionally left unset until OpenAI publishes a model card.
         new ModelInfo(
             Id: "gpt-5.4",
             Provider: "openai",
@@ -158,8 +156,8 @@ public static class ModelCatalog
             SupportsTools: true,
             SupportsVision: true,
             SupportsReasoning: true,
-            InputCostPerMillion: null,
-            OutputCostPerMillion: null,
+            InputCostPerMillion: 2.50m,
+            OutputCostPerMillion: 15.00m,
             SupportsStreaming: true,
             SupportsStructuredOutput: true,
             SupportsImageOutput: true,
@@ -249,8 +247,11 @@ public static class ModelCatalog
             SupportsTools: false,
             SupportsVision: true,
             SupportsReasoning: false,
+            // OpenAI publishes separate text-input and image-input rates for GPT Image 2.
+            // Soulcaster currently tracks the output side exactly and reports overall pricing
+            // coverage as partial for runs that include GPT Image 2 requests.
             InputCostPerMillion: null,
-            OutputCostPerMillion: null,
+            OutputCostPerMillion: 30.00m,
             Aliases: ["gpt-image-2-2026-04-21"],
             SupportsStreaming: false,
             SupportsStructuredOutput: false,

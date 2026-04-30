@@ -352,6 +352,106 @@ static bool TryReadLong(JsonElement root, string property, out long value)
     return false;
 }
 
+static bool TryReadRowLong(IDictionary<string, object?> row, string key, out long value)
+{
+    value = 0;
+    if (!row.TryGetValue(key, out var raw) || raw is null)
+        return false;
+
+    switch (raw)
+    {
+        case long l:
+            value = l;
+            return true;
+        case int i:
+            value = i;
+            return true;
+        case double d:
+            value = (long)Math.Round(d, MidpointRounding.AwayFromZero);
+            return true;
+        case decimal m:
+            value = (long)Math.Round(m, MidpointRounding.AwayFromZero);
+            return true;
+        case string text when long.TryParse(text, out var parsed):
+            value = parsed;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool TryReadRowDecimal(IDictionary<string, object?> row, string key, out decimal value)
+{
+    value = 0m;
+    if (!row.TryGetValue(key, out var raw) || raw is null)
+        return false;
+
+    switch (raw)
+    {
+        case decimal m:
+            value = m;
+            return true;
+        case double d:
+            value = (decimal)d;
+            return true;
+        case float f:
+            value = (decimal)f;
+            return true;
+        case long l:
+            value = l;
+            return true;
+        case int i:
+            value = i;
+            return true;
+        case string text when decimal.TryParse(text, out var parsed):
+            value = parsed;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static string FormatDurationMs(long? durationMs)
+{
+    if (durationMs is null || durationMs <= 0)
+        return "0s";
+
+    var span = TimeSpan.FromMilliseconds(durationMs.Value);
+    if (span.TotalHours >= 1)
+        return $"{(int)span.TotalHours}h {span.Minutes}m {span.Seconds}s";
+    if (span.TotalMinutes >= 1)
+        return $"{span.Minutes}m {span.Seconds}s";
+    if (span.TotalSeconds >= 1)
+        return $"{span.TotalSeconds:F1}s";
+    return $"{durationMs.Value}ms";
+}
+
+static string FormatUsd(decimal? amount)
+{
+    if (amount is null)
+        return "$0.00";
+
+    return amount.Value.ToString("$0.00####");
+}
+
+static long ReadRowLongOrDefault(IDictionary<string, object?> row, string key, long defaultValue = 0) =>
+    TryReadRowLong(row, key, out var value) ? value : defaultValue;
+
+static decimal ReadRowDecimalOrDefault(IDictionary<string, object?> row, string key, decimal defaultValue = 0m) =>
+    TryReadRowDecimal(row, key, out var value) ? value : defaultValue;
+
+static string NormalizePipelineStatus(string? rawStatus, bool hasResultFile)
+{
+    var normalized = rawStatus?.Trim().ToLowerInvariant();
+    return normalized switch
+    {
+        "running" or "in_progress" => "in_progress",
+        "completed" => "completed",
+        "failed" or "fail" => "completed",
+        _ => hasResultFile ? "completed" : "in_progress"
+    };
+}
+
 static async Task<int> RunProviders(string[] args)
 {
     var subcommand = args.Length > 0 ? args[0] : "help";
@@ -1350,7 +1450,19 @@ static async Task<int> RunScorecards(string[] args)
 
     foreach (var scorecard in scorecards)
     {
-        Console.WriteLine($"{scorecard.GetValueOrDefault("provider")?.ToString(),-10} {scorecard.GetValueOrDefault("model")?.ToString(),-28} success_rate={scorecard.GetValueOrDefault("success_rate")?.ToString() ?? "0"} avg_ms={scorecard.GetValueOrDefault("avg_duration_ms")?.ToString() ?? "?"} p95_ms={scorecard.GetValueOrDefault("p95_duration_ms")?.ToString() ?? "?"} invocations={scorecard.GetValueOrDefault("invocation_count")?.ToString() ?? "0"}");
+        var knownCost = TryReadRowDecimal(scorecard, "estimated_known_cost_usd", out var parsedKnownCost)
+            ? parsedKnownCost
+            : (decimal?)null;
+        var pricingCoverage = scorecard.GetValueOrDefault("pricing_coverage")?.ToString() ?? "none";
+        Console.WriteLine(
+            $"{scorecard.GetValueOrDefault("provider")?.ToString(),-10} " +
+            $"{scorecard.GetValueOrDefault("model")?.ToString(),-28} " +
+            $"success_rate={scorecard.GetValueOrDefault("success_rate")?.ToString() ?? "0"} " +
+            $"avg_ms={scorecard.GetValueOrDefault("avg_duration_ms")?.ToString() ?? "?"} " +
+            $"p95_ms={scorecard.GetValueOrDefault("p95_duration_ms")?.ToString() ?? "?"} " +
+            $"invocations={scorecard.GetValueOrDefault("invocation_count")?.ToString() ?? "0"} " +
+            $"tokens={scorecard.GetValueOrDefault("total_tokens")?.ToString() ?? "0"} " +
+            $"est_cost={FormatUsd(knownCost)} ({pricingCoverage})");
     }
 
     return 0;
@@ -1978,6 +2090,22 @@ static async Task<int> ShowStatus(string[] args)
         return 1;
     }
 
+    var pipelineDir = ResolvePipelineOutputDir(args) ?? outputDir;
+    Dictionary<string, object?>? overview = null;
+    try
+    {
+        var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+        await workflowStore.SyncAsync();
+        var overviewResult = await WorkflowQueryService.ExecuteAsync(
+            pipelineDir,
+            new WorkflowQueryRequest("overview", Limit: 1));
+        overview = overviewResult.Rows.FirstOrDefault();
+    }
+    catch
+    {
+        // Best-effort status should still work from checkpoint/log files.
+    }
+
     var checkpointPath = Path.Combine(logsDir, "checkpoint.json");
     if (!File.Exists(checkpointPath))
     {
@@ -2017,8 +2145,11 @@ static async Task<int> ShowStatus(string[] args)
         Console.WriteLine($"  ✓ {node,-25} {statusText}");
     }
 
-    // Pipeline is done only if result.json exists (written when runner finishes)
-    if (File.Exists(Path.Combine(logsDir, "result.json")))
+    var pipelineStatus = NormalizePipelineStatus(
+        overview?.GetValueOrDefault("status")?.ToString(),
+        File.Exists(Path.Combine(logsDir, "result.json")));
+
+    if (string.Equals(pipelineStatus, "completed", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine();
         Console.WriteLine("Pipeline: completed");
@@ -2041,6 +2172,26 @@ static async Task<int> ShowStatus(string[] args)
         }
 
         Console.WriteLine("Pipeline: in progress");
+    }
+
+    if (overview is not null)
+    {
+        TryReadRowLong(overview, "wall_clock_runtime_ms", out var wallClockRuntimeMs);
+        TryReadRowLong(overview, "active_runtime_ms", out var activeRuntimeMs);
+        TryReadRowLong(overview, "total_tokens", out var totalTokens);
+        TryReadRowDecimal(overview, "estimated_known_cost_usd", out var knownCost);
+        var pricingCoverage = overview.GetValueOrDefault("pricing_coverage")?.ToString() ?? "none";
+        TryReadRowLong(overview, "fully_priced_provider_invocation_count", out var fullyPricedInvocations);
+        TryReadRowLong(overview, "partially_priced_provider_invocation_count", out var partiallyPricedInvocations);
+        TryReadRowLong(overview, "unpriced_provider_invocation_count", out var unpricedInvocations);
+
+        Console.WriteLine();
+        Console.WriteLine("Run metrics:");
+        Console.WriteLine($"  Wall clock runtime: {FormatDurationMs(wallClockRuntimeMs)}");
+        Console.WriteLine($"  Active runtime:     {FormatDurationMs(activeRuntimeMs)}");
+        Console.WriteLine($"  Total tokens:       {totalTokens}");
+        Console.WriteLine($"  Est. known cost:    {FormatUsd(knownCost)} ({pricingCoverage})");
+        Console.WriteLine($"  Pricing coverage:   full={fullyPricedInvocations} partial={partiallyPricedInvocations} none={unpricedInvocations}");
     }
 
     return 0;
@@ -2296,10 +2447,41 @@ static async Task<int> RunWeb(string[] args)
         var pipelineDir = globalMode ? DecodePipelineId(id) : ResolvePipelineDir(outputDir!, id);
         if (pipelineDir == null || !Directory.Exists(pipelineDir)) return Results.NotFound();
 
+        Dictionary<string, object?>? overview = null;
+        try
+        {
+            var workflowStore = WorkflowStoreFactory.CreateDefault(pipelineDir);
+            await SyncWorkflowStoreAsync(workflowStore);
+            var overviewResult = await WorkflowQueryService.ExecuteAsync(
+                pipelineDir,
+                new WorkflowQueryRequest("overview", Limit: 1));
+            overview = overviewResult.Rows.FirstOrDefault();
+        }
+        catch
+        {
+            // Best effort.
+        }
+
         var logsDir = Path.Combine(pipelineDir, "logs");
         var checkpointPath = Path.Combine(logsDir, "checkpoint.json");
         if (!File.Exists(checkpointPath))
-            return Results.Json(new { status = "not_started", nodes = Array.Empty<object>() });
+            return Results.Json(new
+            {
+                status = "not_started",
+                nodes = Array.Empty<object>(),
+                metrics = overview is null ? null : new
+                {
+                    wall_clock_runtime_ms = ReadRowLongOrDefault(overview, "wall_clock_runtime_ms"),
+                    active_runtime_ms = ReadRowLongOrDefault(overview, "active_runtime_ms"),
+                    total_tokens = ReadRowLongOrDefault(overview, "total_tokens"),
+                    estimated_known_cost_usd = ReadRowDecimalOrDefault(overview, "estimated_known_cost_usd"),
+                    estimated_total_cost_usd = ReadRowDecimalOrDefault(overview, "estimated_total_cost_usd"),
+                    pricing_coverage = overview.GetValueOrDefault("pricing_coverage")?.ToString() ?? "none",
+                    fully_priced_provider_invocation_count = ReadRowLongOrDefault(overview, "fully_priced_provider_invocation_count"),
+                    partially_priced_provider_invocation_count = ReadRowLongOrDefault(overview, "partially_priced_provider_invocation_count"),
+                    unpriced_provider_invocation_count = ReadRowLongOrDefault(overview, "unpriced_provider_invocation_count")
+                }
+            });
 
         var checkpoint = JsonDocument.Parse(await File.ReadAllTextAsync(checkpointPath));
         var root = checkpoint.RootElement;
@@ -2361,7 +2543,9 @@ static async Task<int> RunWeb(string[] args)
             nodes.Add(new { id = node, status, preferred_label = preferred, notes, current_iteration = inCurrentIteration });
         }
 
-        var pipelineStatus = File.Exists(Path.Combine(logsDir, "result.json")) ? "completed" : "in_progress";
+        var pipelineStatus = NormalizePipelineStatus(
+            overview?.GetValueOrDefault("status")?.ToString(),
+            File.Exists(Path.Combine(logsDir, "result.json")));
 
         // Check for pending gate
         string? pendingGate = null;
@@ -2376,7 +2560,19 @@ static async Task<int> RunWeb(string[] args)
             current_node = currentNode,
             pending_gate = pendingGate,
             iteration,
-            nodes
+            nodes,
+            metrics = overview is null ? null : new
+            {
+                wall_clock_runtime_ms = ReadRowLongOrDefault(overview, "wall_clock_runtime_ms"),
+                active_runtime_ms = ReadRowLongOrDefault(overview, "active_runtime_ms"),
+                total_tokens = ReadRowLongOrDefault(overview, "total_tokens"),
+                estimated_known_cost_usd = ReadRowDecimalOrDefault(overview, "estimated_known_cost_usd"),
+                estimated_total_cost_usd = ReadRowDecimalOrDefault(overview, "estimated_total_cost_usd"),
+                pricing_coverage = overview.GetValueOrDefault("pricing_coverage")?.ToString() ?? "none",
+                fully_priced_provider_invocation_count = ReadRowLongOrDefault(overview, "fully_priced_provider_invocation_count"),
+                partially_priced_provider_invocation_count = ReadRowLongOrDefault(overview, "partially_priced_provider_invocation_count"),
+                unpriced_provider_invocation_count = ReadRowLongOrDefault(overview, "unpriced_provider_invocation_count")
+            }
         });
     });
 
@@ -4484,9 +4680,26 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function formatOpsValue(value) {
+function formatOpsValue(value, key) {
   if (value === null || value === undefined || value === '') return '&mdash;';
+  if (key && key.endsWith('_usd')) return escapeHtml(formatUsd(value));
   return escapeHtml(String(value));
+}
+
+function formatRuntime(ms) {
+  if (!ms || ms <= 0) return '0s';
+  const totalSeconds = Math.round(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function formatUsd(value) {
+  const amount = Number(value || 0);
+  return `$${amount.toFixed(4).replace(/0+$/,'').replace(/\.$/,'.00')}`;
 }
 
 function renderOpsCard(title, queryResult, columns) {
@@ -4503,7 +4716,7 @@ function renderOpsCard(title, queryResult, columns) {
   rows.forEach(row => {
     html += '<tr>';
     columns.forEach(column => {
-      html += `<td>${formatOpsValue(row[column.key])}</td>`;
+      html += `<td>${formatOpsValue(row[column.key], column.key)}</td>`;
     });
     html += '</tr>';
   });
@@ -4587,6 +4800,10 @@ async function loadDetail(id) {
     if (status.pending_gate)
       html += ` &middot; <span style="color:var(--yellow)">Waiting on gate: ${status.pending_gate}</span>`;
     html += `</div>`;
+    if (status.metrics) {
+      const m = status.metrics;
+      html += `<div style="margin-bottom:10px;font-size:12px;color:var(--text2);">wall: <strong>${formatRuntime(m.wall_clock_runtime_ms)}</strong> &middot; active: <strong>${formatRuntime(m.active_runtime_ms)}</strong> &middot; tokens: <strong>${m.total_tokens || 0}</strong> &middot; est cost: <strong>${formatUsd(m.estimated_known_cost_usd)}</strong> <span style="opacity:0.8">(${escapeHtml(String(m.pricing_coverage || 'none'))})</span></div>`;
+    }
     if (status.nodes && status.nodes.length > 0) {
       html += `<div class="nodes-bar">`;
       status.nodes.forEach(n => {
@@ -4747,7 +4964,8 @@ async function loadDetail(id) {
   html += renderOpsCard('Model Scorecards', scorecards, [
     { key: 'model', label: 'Model' },
     { key: 'success_rate', label: 'Success' },
-    { key: 'avg_duration_ms', label: 'Avg ms' }
+    { key: 'estimated_known_cost_usd', label: 'Est $' },
+    { key: 'pricing_coverage', label: 'Coverage' }
   ]);
   html += renderOpsCard('Lease Ownership', leases, [
     { key: 'owner_pid', label: 'PID' },

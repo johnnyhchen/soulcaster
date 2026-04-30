@@ -312,7 +312,10 @@ internal static class WorkflowQueryService
                     avg_duration_ms,
                     p95_duration_ms,
                     total_tokens,
+                    estimated_known_cost_usd,
                     estimated_total_cost_usd
+                    ,
+                    pricing_coverage
                 FROM model_scorecards
                 WHERE ($provider IS NULL OR provider = $provider)
                   AND ($model IS NULL OR model = $model)

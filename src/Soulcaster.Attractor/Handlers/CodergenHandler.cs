@@ -467,6 +467,9 @@ public class CodergenHandler : INodeHandler
         var fallbackModels = ReadListAttribute(node, graph, stageClass, "fallback_models");
         var outputModalities = ResolveOutputModalities(node, graph, stageClass);
         var inputImagePaths = ResolveInputImagePaths(node, graph, context, logsRoot);
+        var inputImageDetail = ReadStringAttribute(node.RawAttributes, "input_image_detail") ??
+                               ReadGraphAttribute(graph.Attributes, "input_image_detail") ??
+                               ReadGraphAttribute(graph.Attributes, "default_input_image_detail");
         var inputDocumentPaths = ResolveInputDocumentPaths(node, graph, context, logsRoot);
         var inputAudioPaths = ResolveInputAudioPaths(node, graph, context, logsRoot);
 
@@ -491,6 +494,7 @@ public class CodergenHandler : INodeHandler
                                   ReadLongAttribute(node, graph, stageClass, "max_latency_ms"),
             OutputModalities: outputModalities.Count == 0 ? null : outputModalities,
             InputImagePaths: inputImagePaths.Count == 0 ? null : inputImagePaths,
+            InputImageDetail: string.IsNullOrWhiteSpace(inputImageDetail) ? null : inputImageDetail,
             InputDocumentPaths: inputDocumentPaths.Count == 0 ? null : inputDocumentPaths,
             InputAudioPaths: inputAudioPaths.Count == 0 ? null : inputAudioPaths,
             PreferredModel: ReadPolicyAttribute(node, graph, stageClass, "preferred_model"),
@@ -1432,6 +1436,7 @@ public class CodergenHandler : INodeHandler
             ["max_expected_latency_ms"] = options.MaxExpectedLatencyMs,
             ["output_modalities"] = options.OutputModalities?.Select(MapOutputModality).ToList(),
             ["input_image_paths"] = options.InputImagePaths,
+            ["input_image_detail"] = options.InputImageDetail,
             ["input_document_paths"] = options.InputDocumentPaths,
             ["input_audio_paths"] = options.InputAudioPaths,
             ["preferred_model"] = options.PreferredModel,

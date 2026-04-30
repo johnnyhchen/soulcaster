@@ -605,8 +605,22 @@ internal sealed class FileWorkflowStore : IWorkflowStore
                 decimal? estimatedOutputCost = modelInfo?.OutputCostPerMillion is decimal outputCostPerMillion
                     ? Math.Round(outputTokens / 1_000_000m * outputCostPerMillion, 6, MidpointRounding.AwayFromZero)
                     : null;
-                decimal? estimatedTotalCost = estimatedInputCost is decimal inputCost && estimatedOutputCost is decimal outputCost
-                    ? inputCost + outputCost
+                var hasInputComponent = inputTokens > 0;
+                var hasOutputComponent = outputTokens > 0;
+                var inputPriced = !hasInputComponent || estimatedInputCost is not null;
+                var outputPriced = !hasOutputComponent || estimatedOutputCost is not null;
+                var pricingCoverage = !hasInputComponent && !hasOutputComponent
+                    ? "none"
+                    : inputPriced && outputPriced
+                        ? "full"
+                        : estimatedInputCost is not null || estimatedOutputCost is not null
+                            ? "partial"
+                            : "none";
+                decimal? estimatedKnownCost = estimatedInputCost is null && estimatedOutputCost is null
+                    ? null
+                    : (estimatedInputCost ?? 0m) + (estimatedOutputCost ?? 0m);
+                decimal? estimatedTotalCost = pricingCoverage == "full" && estimatedKnownCost is decimal knownCost
+                    ? knownCost
                     : null;
 
                 return new ModelScorecardSnapshot(
@@ -627,7 +641,9 @@ internal sealed class FileWorkflowStore : IWorkflowStore
                     TotalTokens: totalTokens,
                     EstimatedInputCostUsd: estimatedInputCost,
                     EstimatedOutputCostUsd: estimatedOutputCost,
+                    EstimatedKnownCostUsd: estimatedKnownCost,
                     EstimatedTotalCostUsd: estimatedTotalCost,
+                    PricingCoverage: pricingCoverage,
                     FailureKinds: CountBy(invocations.Select(invocation => invocation.FailureKind)),
                     ProviderStates: CountBy(invocations.Select(invocation => invocation.ProviderState)),
                     VerificationStates: CountBy(invocations.Select(invocation => invocation.VerificationState)));
@@ -1399,7 +1415,9 @@ internal sealed class FileWorkflowStore : IWorkflowStore
         int TotalTokens,
         decimal? EstimatedInputCostUsd,
         decimal? EstimatedOutputCostUsd,
+        decimal? EstimatedKnownCostUsd,
         decimal? EstimatedTotalCostUsd,
+        string PricingCoverage,
         IReadOnlyDictionary<string, int> FailureKinds,
         IReadOnlyDictionary<string, int> ProviderStates,
         IReadOnlyDictionary<string, int> VerificationStates);

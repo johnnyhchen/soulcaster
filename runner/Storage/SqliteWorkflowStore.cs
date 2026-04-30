@@ -314,7 +314,9 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
                 total_tokens INTEGER,
                 estimated_input_cost_usd REAL,
                 estimated_output_cost_usd REAL,
+                estimated_known_cost_usd REAL,
                 estimated_total_cost_usd REAL,
+                pricing_coverage TEXT,
                 payload_json TEXT NOT NULL
             );
             """,
@@ -373,6 +375,8 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
         await EnsureColumnAsync(connection, "artifact_versions", "prompt_path", "TEXT", ct);
         await EnsureColumnAsync(connection, "artifact_versions", "prompt_sha256", "TEXT", ct);
         await EnsureColumnAsync(connection, "provider_invocations", "stage_status", "TEXT", ct);
+        await EnsureColumnAsync(connection, "model_scorecards", "estimated_known_cost_usd", "REAL", ct);
+        await EnsureColumnAsync(connection, "model_scorecards", "pricing_coverage", "TEXT", ct);
         await OperatorMutationStore.EnsureSchemaAsync(connection, ct);
         await EnsureIndexesAsync(connection, ct);
         await RecreateViewsAsync(connection, ct);
@@ -718,6 +722,86 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
             """,
             """
             CREATE VIEW run_overview AS
+            WITH
+            stage_start_events AS (
+                SELECT
+                    stage_attempt_id,
+                    node_id,
+                    sequence,
+                    julianday(timestamp_utc) AS start_jd
+                FROM run_events
+                WHERE stage_attempt_id IS NOT NULL
+                  AND event_type = 'stage_start'
+            ),
+            stage_intervals AS (
+                SELECT
+                    s.stage_attempt_id,
+                    s.start_jd,
+                    COALESCE(
+                        (
+                            SELECT MIN(julianday(e.timestamp_utc))
+                            FROM run_events e
+                            WHERE e.stage_attempt_id = s.stage_attempt_id
+                              AND e.event_type = 'stage_end'
+                        ),
+                        (
+                            SELECT MIN(julianday(e.timestamp_utc))
+                            FROM run_events e
+                            WHERE e.sequence > s.sequence
+                              AND (
+                                  (e.event_type = 'stage_start' AND e.node_id = s.node_id)
+                                  OR e.event_type IN ('run_started', 'run_finished', 'lease_acquired', 'lease_released')
+                              )
+                        ),
+                        (
+                            SELECT julianday(
+                                CASE
+                                    WHEN status IN ('in_progress', 'running') THEN CURRENT_TIMESTAMP
+                                    ELSE COALESCE(updated_at, CURRENT_TIMESTAMP)
+                                END)
+                            FROM runs
+                            LIMIT 1
+                        )
+                    ) AS end_jd
+                FROM stage_start_events s
+            ),
+            attempt_bounds AS (
+                SELECT
+                    start_jd,
+                    CASE
+                        WHEN COALESCE(end_jd, julianday(CURRENT_TIMESTAMP)) < start_jd THEN start_jd
+                        ELSE COALESCE(end_jd, julianday(CURRENT_TIMESTAMP))
+                    END AS end_jd
+                FROM stage_intervals
+                WHERE start_jd IS NOT NULL
+            ),
+            ordered_attempts AS (
+                SELECT
+                    start_jd,
+                    end_jd,
+                    MAX(end_jd) OVER (
+                        ORDER BY start_jd, end_jd
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                    ) AS prev_max_end_jd
+                FROM attempt_bounds
+            ),
+            merged_attempts AS (
+                SELECT
+                    start_jd,
+                    end_jd,
+                    SUM(CASE WHEN prev_max_end_jd IS NULL OR start_jd > prev_max_end_jd THEN 1 ELSE 0 END) OVER (
+                        ORDER BY start_jd, end_jd
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS grp
+                FROM ordered_attempts
+            ),
+            active_windows AS (
+                SELECT
+                    MIN(start_jd) AS start_jd,
+                    MAX(end_jd) AS end_jd
+                FROM merged_attempts
+                GROUP BY grp
+            )
             SELECT
                 r.run_id,
                 r.state_version,
@@ -730,6 +814,15 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
                 r.active_stage,
                 r.started_at,
                 r.updated_at,
+                CAST(ROUND(CASE
+                    WHEN r.started_at IS NULL OR TRIM(r.started_at) = '' THEN 0
+                    ELSE (julianday(
+                        CASE
+                            WHEN r.status IN ('in_progress', 'running') THEN CURRENT_TIMESTAMP
+                            ELSE COALESCE(r.updated_at, CURRENT_TIMESTAMP)
+                        END) - julianday(r.started_at)) * 86400000.0
+                    END, 0) AS INTEGER) AS wall_clock_runtime_ms,
+                CAST(ROUND(COALESCE((SELECT SUM((end_jd - start_jd) * 86400000.0) FROM active_windows), 0), 0) AS INTEGER) AS active_runtime_ms,
                 r.respawn_count,
                 r.event_count,
                 r.stage_attempt_count,
@@ -740,6 +833,18 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
                 COALESCE((SELECT COUNT(*) FROM gate_instances WHERE is_pending = 1), 0) AS pending_gate_count,
                 COALESCE((SELECT COUNT(*) FROM current_artifacts), 0) AS artifact_count,
                 COALESCE((SELECT COUNT(*) FROM provider_invocations), 0) AS provider_invocation_count,
+                COALESCE((SELECT SUM(total_tokens) FROM model_scorecards), 0) AS total_tokens,
+                ROUND(COALESCE((SELECT SUM(estimated_known_cost_usd) FROM model_scorecards), 0), 6) AS estimated_known_cost_usd,
+                ROUND(COALESCE((SELECT SUM(estimated_total_cost_usd) FROM model_scorecards), 0), 6) AS estimated_total_cost_usd,
+                COALESCE((SELECT SUM(invocation_count) FROM model_scorecards WHERE pricing_coverage = 'full'), 0) AS fully_priced_provider_invocation_count,
+                COALESCE((SELECT SUM(invocation_count) FROM model_scorecards WHERE pricing_coverage = 'partial'), 0) AS partially_priced_provider_invocation_count,
+                COALESCE((SELECT SUM(invocation_count) FROM model_scorecards WHERE pricing_coverage = 'none'), 0) AS unpriced_provider_invocation_count,
+                CASE
+                    WHEN COALESCE((SELECT SUM(invocation_count) FROM model_scorecards), 0) = 0 THEN 'none'
+                    WHEN COALESCE((SELECT SUM(invocation_count) FROM model_scorecards WHERE pricing_coverage = 'partial' OR pricing_coverage = 'none'), 0) = 0 THEN 'full'
+                    WHEN COALESCE((SELECT SUM(invocation_count) FROM model_scorecards WHERE pricing_coverage = 'full' OR pricing_coverage = 'partial'), 0) = 0 THEN 'none'
+                    ELSE 'partial'
+                END AS pricing_coverage,
                 COALESCE((SELECT COUNT(*) FROM operator_activity), 0) AS operator_activity_count,
                 (SELECT owner_pid FROM lease_ownership WHERE state = 'active' ORDER BY acquired_at DESC LIMIT 1) AS active_lease_owner_pid,
                 (SELECT acquired_at FROM lease_ownership WHERE state = 'active' ORDER BY acquired_at DESC LIMIT 1) AS active_lease_acquired_at
@@ -1282,7 +1387,9 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
                     total_tokens,
                     estimated_input_cost_usd,
                     estimated_output_cost_usd,
+                    estimated_known_cost_usd,
                     estimated_total_cost_usd,
+                    pricing_coverage,
                     payload_json
                 ) VALUES (
                     $model_scorecard_id,
@@ -1300,7 +1407,9 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
                     $total_tokens,
                     $estimated_input_cost_usd,
                     $estimated_output_cost_usd,
+                    $estimated_known_cost_usd,
                     $estimated_total_cost_usd,
+                    $pricing_coverage,
                     $payload_json
                 );
                 """;
@@ -1319,7 +1428,9 @@ internal sealed class SqliteWorkflowStore : IWorkflowStore
             AddValue(command, "$total_tokens", GetInt64(item, "total_tokens"));
             AddValue(command, "$estimated_input_cost_usd", GetDouble(item, "estimated_input_cost_usd"));
             AddValue(command, "$estimated_output_cost_usd", GetDouble(item, "estimated_output_cost_usd"));
+            AddValue(command, "$estimated_known_cost_usd", GetDouble(item, "estimated_known_cost_usd"));
             AddValue(command, "$estimated_total_cost_usd", GetDouble(item, "estimated_total_cost_usd"));
+            AddValue(command, "$pricing_coverage", GetString(item, "pricing_coverage"));
             AddValue(command, "$payload_json", item.GetRawText());
             await command.ExecuteNonQueryAsync(ct);
         }

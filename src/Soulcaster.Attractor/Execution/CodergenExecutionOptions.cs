@@ -19,6 +19,7 @@ public sealed record CodergenExecutionOptions(
     long? MaxExpectedLatencyMs = null,
     IReadOnlyList<ResponseModality>? OutputModalities = null,
     IReadOnlyList<string>? InputImagePaths = null,
+    string? InputImageDetail = null,
     IReadOnlyList<string>? InputDocumentPaths = null,
     IReadOnlyList<string>? InputAudioPaths = null,
     string? PreferredModel = null,

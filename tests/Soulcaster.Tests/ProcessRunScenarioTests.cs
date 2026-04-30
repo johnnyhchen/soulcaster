@@ -860,8 +860,26 @@ public class ProcessRunScenarioTests
             {
                 Nodes = new Dictionary<string, List<ScriptedResponsePlan>>(StringComparer.OrdinalIgnoreCase)
                 {
-                    ["draft"] = [new ScriptedResponsePlan { AssistantText = StatusJson(notes: "draft complete"), DelayMs = 40 }],
-                    ["finalize"] = [new ScriptedResponsePlan { AssistantText = StatusJson(notes: "finalize complete"), DelayMs = 10 }]
+                    ["draft"] =
+                    [
+                        new ScriptedResponsePlan
+                        {
+                            AssistantText = StatusJson(notes: "draft complete"),
+                            DelayMs = 40,
+                            InputTokens = 120,
+                            OutputTokens = 30
+                        }
+                    ],
+                    ["finalize"] =
+                    [
+                        new ScriptedResponsePlan
+                        {
+                            AssistantText = StatusJson(notes: "finalize complete"),
+                            DelayMs = 10,
+                            InputTokens = 80,
+                            OutputTokens = 20
+                        }
+                    ]
                 }
             });
 
@@ -892,30 +910,230 @@ public class ProcessRunScenarioTests
             Assert.Contains(entries, entry =>
                 entry.GetProperty("provider").GetString() == "openai" &&
                 entry.GetProperty("model").GetString() == "gpt-5.4" &&
-                entry.GetProperty("invocation_count").GetInt32() == 1);
+                entry.GetProperty("invocation_count").GetInt32() == 1 &&
+                entry.GetProperty("estimated_known_cost_usd").GetDecimal() > 0m &&
+                entry.GetProperty("pricing_coverage").GetString() == "full");
             Assert.Contains(entries, entry =>
                 entry.GetProperty("provider").GetString() == "openai" &&
                 entry.GetProperty("model").GetString() == "gpt-5.2" &&
-                entry.GetProperty("invocation_count").GetInt32() == 1);
+                entry.GetProperty("invocation_count").GetInt32() == 1 &&
+                entry.GetProperty("estimated_known_cost_usd").GetDecimal() > 0m &&
+                entry.GetProperty("pricing_coverage").GetString() == "full");
         }
 
-        var scorecardResult = await ProcessRunHarness.RunRunnerAsync(
+        var scorecardJsonResult = await ProcessRunHarness.RunRunnerAsync(
             ["scorecard", "--dir", runDir, "--json"],
             workingDirectory: runDir);
 
-        Assert.Equal(0, scorecardResult.ExitCode);
-        Assert.Contains("gpt-5.2", scorecardResult.Stdout);
-        Assert.Contains("gpt-5.4", scorecardResult.Stdout);
+        Assert.Equal(0, scorecardJsonResult.ExitCode);
+        Assert.Contains("gpt-5.2", scorecardJsonResult.Stdout);
+        Assert.Contains("gpt-5.4", scorecardJsonResult.Stdout);
+
+        var scorecardTextResult = await ProcessRunHarness.RunRunnerAsync(
+            ["scorecard", "--dir", runDir],
+            workingDirectory: runDir);
+
+        Assert.Equal(0, scorecardTextResult.ExitCode);
+        Assert.Contains("est_cost=$", scorecardTextResult.Stdout);
 
         var dbPath = Path.Combine(runDir, "store", "workflow.sqlite");
         Assert.Equal("2", await WaitForSqliteStringAsync(
             dbPath,
             "SELECT CAST(COUNT(*) AS TEXT) FROM model_scorecards WHERE provider = 'openai';",
             TimeSpan.FromSeconds(10)));
+        Assert.NotEqual("0", await WaitForSqliteStringAsync(
+            dbPath,
+            "SELECT CAST(estimated_known_cost_usd AS TEXT) FROM model_scorecards WHERE model = 'gpt-5.4' LIMIT 1;",
+            TimeSpan.FromSeconds(10)));
         Assert.Equal("gpt-5.2", await WaitForSqliteStringAsync(
             dbPath,
             "SELECT model FROM provider_invocations WHERE node_id = 'finalize' LIMIT 1;",
             TimeSpan.FromSeconds(10)));
+
+        var overviewResult = await ProcessRunHarness.RunRunnerAsync(
+            ["query", "overview", "--dir", runDir, "--json"],
+            workingDirectory: runDir);
+
+        Assert.Equal(0, overviewResult.ExitCode);
+        using (var overview = JsonDocument.Parse(overviewResult.Stdout))
+        {
+            var row = Assert.Single(overview.RootElement.GetProperty("rows").EnumerateArray());
+            Assert.True(row.GetProperty("wall_clock_runtime_ms").GetInt64() > 0);
+            Assert.True(row.GetProperty("active_runtime_ms").GetInt64() > 0);
+            Assert.True(row.GetProperty("total_tokens").GetInt64() > 0);
+            Assert.True(row.GetProperty("estimated_known_cost_usd").GetDecimal() > 0m);
+            Assert.Equal("full", row.GetProperty("pricing_coverage").GetString());
+        }
+    }
+
+    [Fact]
+    public async Task QueryOverview_ActiveRuntime_BoundsInterruptedAttemptAtNextLifecycleEvent()
+    {
+        using var workspace = ProcessRunHarness.CreateWorkspace("overview_active_runtime");
+        var runDir = workspace.WorkingDir("overview-active-runtime");
+        var logsDir = Path.Combine(runDir, "logs");
+        Directory.CreateDirectory(logsDir);
+
+        var manifest = new RunManifest
+        {
+            run_id = "run_active_runtime_resume",
+            state_version = 15,
+            graph_path = "tests/fixtures/overview-active-runtime.dot",
+            started_at = "2026-04-30T00:00:00.0000000+00:00",
+            updated_at = "2026-04-30T00:02:00.0000000+00:00",
+            active_stage = "done",
+            status = "completed",
+            resume_source = "resume",
+            auto_resume_policy = "on"
+        };
+        manifest.Save(Path.Combine(runDir, "run-manifest.json"));
+        File.WriteAllText(Path.Combine(logsDir, "result.json"), """{"status":"success"}""");
+
+        var events = new object[]
+        {
+            new { timestamp_utc = "2026-04-30T00:00:00.0000000+00:00", event_type = "lease_acquired" },
+            new { timestamp_utc = "2026-04-30T00:00:01.0000000+00:00", event_type = "run_started", status = "running" },
+            new { timestamp_utc = "2026-04-30T00:00:05.0000000+00:00", event_type = "stage_start", node_id = "work" },
+            new { timestamp_utc = "2026-04-30T00:00:15.0000000+00:00", event_type = "stage_end", node_id = "work", status = "success", duration_ms = 10000 },
+            new { timestamp_utc = "2026-04-30T00:00:16.0000000+00:00", event_type = "run_finished", status = "fail" },
+            new { timestamp_utc = "2026-04-30T00:00:17.0000000+00:00", event_type = "lease_released" },
+            new { timestamp_utc = "2026-04-30T00:01:00.0000000+00:00", event_type = "lease_acquired" },
+            new { timestamp_utc = "2026-04-30T00:01:01.0000000+00:00", event_type = "run_started", status = "running" },
+            new { timestamp_utc = "2026-04-30T00:01:05.0000000+00:00", event_type = "stage_start", node_id = "work" },
+            new { timestamp_utc = "2026-04-30T00:01:35.0000000+00:00", event_type = "lease_acquired" },
+            new { timestamp_utc = "2026-04-30T00:01:36.0000000+00:00", event_type = "run_started", status = "running" },
+            new { timestamp_utc = "2026-04-30T00:01:40.0000000+00:00", event_type = "stage_start", node_id = "work" },
+            new { timestamp_utc = "2026-04-30T00:01:55.0000000+00:00", event_type = "stage_end", node_id = "work", status = "success", duration_ms = 15000 },
+            new { timestamp_utc = "2026-04-30T00:01:58.0000000+00:00", event_type = "run_finished", status = "success" },
+            new { timestamp_utc = "2026-04-30T00:02:00.0000000+00:00", event_type = "lease_released" }
+        };
+
+        var eventsPath = Path.Combine(logsDir, "events.jsonl");
+        await using (var stream = File.Create(eventsPath))
+        await using (var writer = new StreamWriter(stream))
+        {
+            foreach (var evt in events)
+                await writer.WriteLineAsync(JsonSerializer.Serialize(evt));
+        }
+
+        var overviewResult = await ProcessRunHarness.RunRunnerAsync(
+            ["query", "overview", "--dir", runDir, "--json"],
+            workingDirectory: runDir);
+
+        Assert.Equal(0, overviewResult.ExitCode);
+        using var overview = JsonDocument.Parse(overviewResult.Stdout);
+        var row = Assert.Single(overview.RootElement.GetProperty("rows").EnumerateArray());
+        Assert.Equal(120000, row.GetProperty("wall_clock_runtime_ms").GetInt64());
+        Assert.Equal(55000, row.GetProperty("active_runtime_ms").GetInt64());
+        Assert.True(row.GetProperty("active_runtime_ms").GetInt64() < row.GetProperty("wall_clock_runtime_ms").GetInt64());
+    }
+
+    [Fact]
+    public async Task ProcessRun_StartAtOnCompletedRun_PreservesArtifactsAndResumesFromRequestedNode()
+    {
+        using var workspace = ProcessRunHarness.CreateWorkspace("start_at_completed");
+        var runDir = workspace.WorkingDir("start-at-completed");
+        var dotPath = WriteDot(
+            workspace,
+            "start-at-completed.dot",
+            """
+            digraph G {
+                goal = "Exercise start-at against an already completed run."
+
+                start [shape=Mdiamond]
+                draft [shape=box, label="Draft", provider="openai", model="gpt-5.4",
+                    prompt="Return valid stage status JSON indicating the draft stage completed successfully."]
+                finalize [shape=box, label="Finalize", provider="openai", model="gpt-5.4",
+                    prompt="Return valid stage status JSON indicating the final stage completed successfully."]
+                done [shape=Msquare]
+
+                start -> draft
+                draft -> finalize
+                finalize -> done
+            }
+            """);
+
+        var initialPlanPath = ProcessRunHarness.WritePlan(
+            workspace,
+            "start-at-initial-plan.json",
+            new ScriptedBackendPlan
+            {
+                Nodes = new Dictionary<string, List<ScriptedResponsePlan>>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["draft"] = [new ScriptedResponsePlan { AssistantText = StatusJson(notes: "draft initial success") }],
+                    ["finalize"] = [new ScriptedResponsePlan { AssistantText = StatusJson(notes: "finalize initial success") }]
+                }
+            });
+
+        var initialResult = await ProcessRunHarness.RunRunnerAsync(
+            [
+                "run",
+                dotPath,
+                "--backend", "scripted",
+                "--backend-script", initialPlanPath,
+                "--resume-from", runDir
+            ],
+            workingDirectory: runDir,
+            completionTimeout: TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, initialResult.ExitCode);
+        Assert.Equal("success", ReadString(ProcessRunHarness.ReadJsonObject(initialResult.ResultPath), "status"));
+
+        var draftStatusPath = Path.Combine(runDir, "logs", "draft", "status.json");
+        var finalizeStatusPath = Path.Combine(runDir, "logs", "finalize", "status.json");
+        Assert.True(File.Exists(draftStatusPath));
+        Assert.True(File.Exists(finalizeStatusPath));
+
+        var resumePlanPath = ProcessRunHarness.WritePlan(
+            workspace,
+            "start-at-resume-plan.json",
+            new ScriptedBackendPlan
+            {
+                Nodes = new Dictionary<string, List<ScriptedResponsePlan>>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["finalize"] = [new ScriptedResponsePlan { AssistantText = StatusJson(notes: "finalize rerun success") }]
+                }
+            });
+
+        var resumeResult = await ProcessRunHarness.RunRunnerAsync(
+            [
+                "run",
+                dotPath,
+                "--backend", "scripted",
+                "--backend-script", resumePlanPath,
+                "--resume-from", runDir,
+                "--start-at", "finalize"
+            ],
+            workingDirectory: runDir,
+            completionTimeout: TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, resumeResult.ExitCode);
+        Assert.Contains("Resume mode: resume", resumeResult.Stdout);
+        Assert.DoesNotContain("Starting fresh run (autoresume disabled).", resumeResult.Stdout, StringComparison.Ordinal);
+        Assert.True(File.Exists(draftStatusPath));
+        Assert.True(File.Exists(finalizeStatusPath));
+
+        var draftStatus = ProcessRunHarness.ReadJsonObject(draftStatusPath);
+        var finalizeStatus = ProcessRunHarness.ReadJsonObject(finalizeStatusPath);
+        Assert.Equal("draft initial success", ReadString(draftStatus, "notes"));
+        Assert.Equal("finalize rerun success", ReadString(finalizeStatus, "notes"));
+
+        var finalizePreviousPath = Path.Combine(runDir, "logs", "finalize", "status.previous.attempt-1.json");
+        Assert.True(File.Exists(finalizePreviousPath));
+        Assert.Equal("finalize initial success", ReadString(ProcessRunHarness.ReadJsonObject(finalizePreviousPath), "notes"));
+
+        var draftPreviousPath = Path.Combine(runDir, "logs", "draft", "status.previous.attempt-1.json");
+        Assert.False(File.Exists(draftPreviousPath));
+
+        using (var stageAttempts = JsonDocument.Parse(File.ReadAllText(Path.Combine(runDir, "store", "stage_attempts.json"))))
+        {
+            var attempts = stageAttempts.RootElement.EnumerateArray().Select(item => item.Clone()).ToList();
+            Assert.Equal(1, attempts.Count(item => item.GetProperty("node_id").GetString() == "draft"));
+            Assert.Equal(2, attempts.Count(item => item.GetProperty("node_id").GetString() == "finalize"));
+        }
+
+        var manifest = ProcessRunHarness.ReadJsonObject(Path.Combine(runDir, "run-manifest.json"));
+        Assert.Equal("start-at", ReadString(manifest, "resume_source"));
     }
 
     [Fact]

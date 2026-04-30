@@ -571,12 +571,12 @@ public class ModelCatalogTests
     }
 
     [Fact]
-    public void GetModelInfo_Gpt54_HasNoPublishedCostInfo()
+    public void GetModelInfo_Gpt54_HasPublishedCostInfo()
     {
         var info = ModelCatalog.GetModelInfo("gpt-5.4");
         Assert.NotNull(info);
-        Assert.Null(info.InputCostPerMillion);
-        Assert.Null(info.OutputCostPerMillion);
+        Assert.Equal(2.50m, info.InputCostPerMillion);
+        Assert.Equal(15.00m, info.OutputCostPerMillion);
     }
 
     [Fact]
@@ -590,6 +590,7 @@ public class ModelCatalogTests
         Assert.True(info.SupportsImageOutput);
         Assert.True(info.SupportsImageInput);
         Assert.False(info.SupportsTools);
+        Assert.Equal(30.00m, info.OutputCostPerMillion);
     }
 
     [Fact]

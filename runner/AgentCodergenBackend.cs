@@ -481,7 +481,7 @@ public class AgentCodergenBackend : ICodergenBackend, IDisposable, ISessionContr
             if (!File.Exists(inputImagePath))
                 throw new FileNotFoundException($"Leaf execution image input '{inputImagePath}' does not exist.", inputImagePath);
 
-            parts.Add(ContentPart.ImagePart(ImageData.FromFile(inputImagePath)));
+            parts.Add(ContentPart.ImagePart(ImageData.FromFile(inputImagePath, detail: options?.InputImageDetail)));
         }
 
         foreach (var inputDocumentPath in options?.InputDocumentPaths ?? Array.Empty<string>())
@@ -1795,6 +1795,9 @@ public sealed class ScriptedResponsePlan
     public string? ImageBase64 { get; init; }
     public string? ImageMediaType { get; init; }
     public string? ImageProviderToken { get; init; }
+    public int InputTokens { get; init; }
+    public int OutputTokens { get; init; }
+    public int? CacheReadTokens { get; init; }
     public int DelayMs { get; init; }
 }
 
@@ -1837,13 +1840,20 @@ internal sealed class ScriptedProviderAdapter : IProviderAdapter
 
         var responsePlan = ResolveNodePlan(request.Messages, out var transcript, out var nodeId);
         var assistantMessage = BuildAssistantMessage(responsePlan, transcript, nodeId, request);
+        var usage = responsePlan is null
+            ? Usage.Empty
+            : new Usage(
+                InputTokens: Math.Max(0, responsePlan.InputTokens),
+                OutputTokens: Math.Max(0, responsePlan.OutputTokens),
+                TotalTokens: Math.Max(0, responsePlan.InputTokens) + Math.Max(0, responsePlan.OutputTokens),
+                CacheReadTokens: responsePlan.CacheReadTokens is > 0 ? responsePlan.CacheReadTokens : null);
         return Task.FromResult(new Response(
             Id: Guid.NewGuid().ToString("N"),
             Model: request.Model,
             Provider: Name,
             Message: assistantMessage,
             FinishReason: FinishReason.Stop,
-            Usage: Usage.Empty));
+            Usage: usage));
     }
 
     public async IAsyncEnumerable<StreamEvent> StreamAsync(
