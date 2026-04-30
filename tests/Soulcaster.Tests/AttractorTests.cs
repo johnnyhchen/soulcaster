@@ -736,14 +736,15 @@ public class ConditionEvaluatorTests
     }
 
     [Fact]
-    public void Evaluate_OutcomeEquals_UsesCustomOutcomeFromContext()
+    public void Evaluate_OutcomeEquals_IgnoresStaleCustomOutcomeInContext()
     {
         var outcome = new Outcome(OutcomeStatus.Success);
         var ctx = new PipelineContext();
         ctx.Set("outcome", "needs_dod");
 
-        Assert.True(ConditionEvaluator.Evaluate("outcome=needs_dod", outcome, ctx));
-        Assert.False(ConditionEvaluator.Evaluate("outcome=success", outcome, ctx));
+        Assert.True(ConditionEvaluator.Evaluate("outcome=success", outcome, ctx));
+        Assert.False(ConditionEvaluator.Evaluate("outcome=needs_dod", outcome, ctx));
+        Assert.True(ConditionEvaluator.Evaluate("context.outcome=needs_dod", outcome, ctx));
     }
 
     [Fact]

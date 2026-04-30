@@ -60,9 +60,7 @@ public static class ConditionEvaluator
     {
         return variable.ToLowerInvariant() switch
         {
-            "outcome" => !string.IsNullOrWhiteSpace(context.Get("outcome"))
-                ? context.Get("outcome")
-                : outcome.Status.ToString().ToLowerInvariant(),
+            "outcome" => outcome.Status.ToString().ToLowerInvariant(),
             "preferred_label" => outcome.PreferredLabel,
             _ when variable.StartsWith("context.", StringComparison.OrdinalIgnoreCase) =>
                 context.Get(variable.Substring("context.".Length)),
