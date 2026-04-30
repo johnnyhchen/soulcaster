@@ -1,0 +1,99 @@
+digraph G {
+    goal = "Generate a short manga-style image sequence while preventing character drift."
+    allow_force_advance = "false"
+    operator_retry_stage_budget = "1"
+
+    start [shape=Mdiamond, label="Start"]
+
+    build_identity_bible [shape=box, label="Build Identity Bible",
+        provider="openai", model="gpt-5.4",
+        prompt="Write a concise identity bible for a black-and-white manga sequence about one recurring protagonist. The protagonist is Mina Vale, a 19-year-old bicycle courier with a sharp triangular bob haircut, a small lightning-bolt scar under her left eye, a cropped white delivery jacket with two black shoulder stripes, fingerless gloves, and a square canvas satchel worn cross-body. Include: 1) immutable identity traits that must never change, 2) clothing and prop invariants that must stay consistent across all frames, 3) a short visual style spec for clean manga inks and screentones, and 4) three scene briefs for frame 1, frame 2, and frame 3. Keep it production-oriented and explicit."];
+
+    render_anchor_sheet [shape=box, label="Render Anchor Sheet",
+        provider="gemini", model="gemini-3.1-flash-image-preview",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/build_identity_bible/response.md",
+        timeout="5m",
+        max_retry="2",
+        prompt="Create a black-and-white manga character reference sheet for Mina Vale using the attached identity bible. Show a front portrait, three-quarter portrait, and full-body standing pose on a neutral background. Keep the lightning-bolt scar under her left eye, the triangular bob haircut, the cropped white delivery jacket with two black shoulder stripes, fingerless gloves, and the square canvas satchel exactly consistent. Return valid stage status JSON."];
+
+    frame_01 [shape=box, label="Frame 1",
+        provider="gemini", model="gemini-3.1-flash-image-preview",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/build_identity_bible/response.md",
+        input_images="logs/render_anchor_sheet/generated/image-1.jpg",
+        input_image_detail="high",
+        timeout="5m",
+        max_retry="2",
+        prompt="Using the attached identity bible and anchor sheet, render frame 1 of the manga sequence: Mina Vale is coasting her bicycle through a rainy alley at dusk, glancing over her shoulder after hearing a noise. Black-and-white manga inks, cinematic panel composition, wet reflections, clean screentones. Preserve every immutable identity and wardrobe detail from the identity bible exactly. The cross-body satchel must stay square and boxy, never rounded or backpack-like. Correction checklist from the last failed audit, if any: ${context.frame_01_feedback}. If that checklist is non-empty, treat every item as mandatory correction feedback while preserving the scene. Return valid stage status JSON."];
+
+    audit_frame_01 [shape=box, label="Audit Frame 1",
+        provider="openai", model="gpt-5.4",
+        execution_lane="multimodal_leaf",
+        input_documents="logs/build_identity_bible/response.md",
+        input_images="logs/render_anchor_sheet/generated/image-1.jpg,logs/frame_01/generated/image-1.jpg",
+        input_image_detail="high",
+        prompt="You are auditing consistency between the character anchor sheet and frame 1. Return valid stage status JSON. Approve only if Mina Vale is clearly the same person and still has all immutable traits from the identity bible: triangular bob haircut, lightning-bolt scar under the left eye, cropped white delivery jacket with two black shoulder stripes, fingerless gloves, and square cross-body satchel. Fail if the satchel becomes rounded, soft, backpack-like, or otherwise stops matching the square bag silhouette from the anchor sheet. If any identity or wardrobe drift is visible, set outcome to fail, explain the mismatch in notes, and set context_updates.frame_01_feedback to a terse semicolon-separated correction checklist. If you approve the frame, set context_updates.frame_01_feedback to an empty string."];
+
+    frame_02 [shape=box, label="Frame 2",
+        provider="gemini", model="gemini-3.1-flash-image-preview",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/build_identity_bible/response.md",
+        input_images="logs/render_anchor_sheet/generated/image-1.jpg,logs/frame_01/generated/image-1.jpg",
+        input_image_detail="high",
+        timeout="5m",
+        max_retry="2",
+        prompt="Using the anchor sheet as the dominant identity reference and the approved prior frame as a continuity reference, render frame 2 of the manga sequence: Mina Vale crouches behind a vending machine, clutching the same satchel while scanning the alley exit. Match the same face, scar placement, haircut, jacket stripes, gloves, and satchel design from the references. Change only the pose, camera angle, and immediate scene action. Correction checklist from the last failed audit, if any: ${context.frame_02_feedback}. If that checklist is non-empty, treat every item as mandatory correction feedback while preserving the scene. Return valid stage status JSON."];
+
+    audit_frame_02 [shape=box, label="Audit Frame 2",
+        provider="openai", model="gpt-5.4",
+        execution_lane="multimodal_leaf",
+        input_documents="logs/build_identity_bible/response.md",
+        input_images="logs/render_anchor_sheet/generated/image-1.jpg,logs/frame_01/generated/image-1.jpg,logs/frame_02/generated/image-1.jpg",
+        input_image_detail="high",
+        prompt="You are auditing consistency for frame 2. Return valid stage status JSON. Approve only if frame 2 preserves Mina Vale's identity and wardrobe from both the anchor sheet and frame 1. Fail if the face shape, scar placement, haircut, jacket stripes, gloves, or satchel materially drift, or if the art style shifts away from black-and-white manga inks. If you fail the frame, set context_updates.frame_02_feedback to a terse semicolon-separated correction checklist. If you approve the frame, set context_updates.frame_02_feedback to an empty string."];
+
+    frame_03 [shape=box, label="Frame 3",
+        provider="gemini", model="gemini-3.1-flash-image-preview",
+        execution_lane="multimodal_leaf",
+        output_modalities="text,image",
+        input_documents="logs/build_identity_bible/response.md",
+        input_images="logs/render_anchor_sheet/generated/image-1.jpg,logs/frame_02/generated/image-1.jpg,logs/frame_01/generated/image-1.jpg",
+        input_image_detail="high",
+        timeout="5m",
+        max_retry="2",
+        prompt="Using the anchor sheet as the dominant identity reference and the prior approved frames as continuity references, render frame 3 of the manga sequence: Mina Vale emerges from cover and stares upward as a delivery drone spotlight cuts through the rain. Preserve the same identity, outfit, scar, haircut, gloves, and satchel from the references. Keep Mina's face and scar placement locked to the anchor sheet. Change only the action beat and composition. Correction checklist from the last failed audit, if any: ${context.frame_03_feedback}. If that checklist is non-empty, treat every item as mandatory correction feedback while preserving the scene. Return valid stage status JSON."];
+
+    audit_frame_03 [shape=box, label="Audit Frame 3",
+        provider="openai", model="gpt-5.4",
+        execution_lane="multimodal_leaf",
+        input_documents="logs/build_identity_bible/response.md",
+        input_images="logs/render_anchor_sheet/generated/image-1.jpg,logs/frame_02/generated/image-1.jpg,logs/frame_03/generated/image-1.jpg",
+        input_image_detail="high",
+        prompt="You are auditing consistency for frame 3. Return valid stage status JSON. Approve only if frame 3 still depicts Mina Vale with the same identity and wardrobe established by the anchor sheet and prior frames. Fail on any meaningful drift in facial identity, scar position, haircut silhouette, jacket stripes, gloves, satchel, or manga rendering style. If you fail the frame, set context_updates.frame_03_feedback to a terse semicolon-separated correction checklist. If you approve the frame, set context_updates.frame_03_feedback to an empty string."];
+
+    build_manifest [shape=box, label="Build Manifest",
+        provider="openai", model="gpt-5.4",
+        execution_lane="leaf",
+        input_documents="logs/build_identity_bible/response.md",
+        prompt="Write a short markdown manifest in the response body. Use these exact final approved artifact paths and do not invent alternative filenames: `logs/render_anchor_sheet/generated/image-1.jpg`, `logs/frame_01/generated/image-1.jpg`, `logs/frame_02/generated/image-1.jpg`, and `logs/frame_03/generated/image-1.jpg`. Then summarize the anti-drift strategy used in this run in 4 bullets. Return valid stage status JSON and place the markdown manifest after the JSON."];
+
+    done [shape=Msquare, label="Done"]
+
+    start -> build_identity_bible
+    build_identity_bible -> render_anchor_sheet
+    render_anchor_sheet -> frame_01
+    frame_01 -> audit_frame_01
+    audit_frame_01 -> frame_01 [condition="outcome=fail", label="redo frame 1"]
+    audit_frame_01 -> frame_02 [condition="outcome=success"]
+    frame_02 -> audit_frame_02
+    audit_frame_02 -> frame_02 [condition="outcome=fail", label="redo frame 2"]
+    audit_frame_02 -> frame_03 [condition="outcome=success"]
+    frame_03 -> audit_frame_03
+    audit_frame_03 -> frame_03 [condition="outcome=fail", label="redo frame 3"]
+    audit_frame_03 -> build_manifest [condition="outcome=success"]
+    build_manifest -> done
+}
